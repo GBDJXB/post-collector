@@ -1,0 +1,11 @@
+# 运行时数据根目录（内容永不入库，见 .gitignore）
+
+本目录只存放运行时产物，全部被 .gitignore 忽略，仅保留本占位文件：
+
+    data/db/          PostgreSQL 数据目录（docker-compose 的 db 服务）
+    data/media/       内容寻址媒体本体 ab/cd/<sha256>，热层
+    data/cold/        冷层本体（可指向 NAS 挂载）
+    data/quarantine/  L2 匿名提报隔离区，必须与 media 物理分离，按 TTL 清理
+    data/backup/      备份目标（可指向 NAS）
+
+子目录由应用与 docker compose 在启动时创建；**不要**把任何需要版本管理的东西放进来。

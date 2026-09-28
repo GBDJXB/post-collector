@@ -1,0 +1,48 @@
+# 行尾统一策略
+#
+# 背景：Windows 上的 Git 安装常把 core.autocrlf 设为 true，会让工作区在检出时
+# 变成 CRLF。本项目跑在 Linux 容器里，代码、SQL 与配置一律 LF 最省事。
+# 属性文件的优先级高于 core.autocrlf，因此下面这行足以覆盖本机设置。
+* text=auto eol=lf
+
+# 二进制类型：显式声明，避免被当作文本做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.avif binary
+*.heic binary
+*.ico binary
+*.mp4 binary
+*.webm binary
+*.mp3 binary
+*.ogg binary
+*.wav binary
+*.flac binary
+*.pdf binary
+*.onnx binary
+*.safetensors binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.bin binary
+*.gguf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.7z binary
+
+# 对行尾敏感的文本类型：显式标注，即使将来有人改了上面的通配也不会波及
+*.py text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+Dockerfile text eol=lf
+Makefile text eol=lf

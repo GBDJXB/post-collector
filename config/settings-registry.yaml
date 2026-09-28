@@ -1,0 +1,133 @@
+# ---------------------------------------------------------------------------
+# config/settings-registry.yaml —— 设置项声明式注册表
+#
+# 这是「设置页 / 校验 / 审计 / 文档」四者的唯一数据源（DESIGN §6.2.1）：
+# 新增一个设置项只需在本文件加一段声明，**不需要改前端代码**。
+#
+# 每个注册项必须包含的字段及其存在理由（§6.2.1）：
+#   key/type/range/default  校验与默认值，让越界输入在保存前被拦住
+#   label/help              大白话名称与说明，普通用户的唯一信息来源
+#   impact                  改大/改小分别会发生什么（最有价值也最易漏的一项）
+#   dangerous               是否二次确认；危险项在界面上必须视觉可区分
+#   cost                    是否产生费用：none | api | storage
+#   restart_required        改完就生效，还是必须重启
+#   recompute               改后哪些派生数据需要重算，用于主动提示
+#   requires                依赖的其他设置项，防止无效组合
+#
+# 加载器与校验器见 src/pc/config.py（骨架阶段为签名占位）。
+# ---------------------------------------------------------------------------
+
+schema_version: 1
+
+settings:
+
+  - key: dedup.near_duplicate_distance
+    label: 相似图片判定严格度
+    help: 数字越小越严格，只把几乎一样的图算作重复；越大越宽松，会把相似但不相同的图归为一组。
+    default: 6
+    type: int
+    range: [0, 20]
+    unit: 汉明距离
+    impact: 调大 → 更多图被当作重复并折叠显示；调小 → 同一张图的不同版本可能重复出现在结果里
+    cost: none
+    restart_required: false
+    dangerous: false
+    recompute: dedup
+    requires: []
+    note: 底层是 pHash/dHash/aHash 三者的投票结果，见 DESIGN §3.6。
+
+  - key: ai.involvement
+    label: AI 自动分类的参与程度
+    help: 决定系统在多大程度上自动帮你判断内容和打标签。选「完全不参与」时不会下载或加载任何模型，所有内容都进待人工分类队列，由你自己判断该不该存、该归到哪个分类。
+    default: local_only
+    type: enum
+    values: [off, local_only, assist, advisory_auto]
+    value_labels:
+      off: 完全不参与（纯手动）
+      local_only: 仅本机模型（推荐）
+      assist: 本机模型 + 云端给出建议（需人工确认）
+      advisory_auto: 本机模型 + 云端建议自动采信（仅高可信时）
+    impact: 调低 → 更少自动判断、更多人工整理、隐私更好；调高 → 更省人力、可能引入误判与外发
+    cost: api
+    restart_required: false
+    dangerous: false
+    recompute: classify
+    requires: []
+    note: 切到 off 会停止使用模型，但不会删除已有的人工与自动标签。骨架阶段尚未接线模型，两档行为相同。
+
+  - key: retention.max_total_bytes
+    label: 内容库最大占用
+    help: 超过这个大小后，系统会按「最没用的先删」的顺序自动清理。任何时候都会先给你一份预览报告，确认后才真正删除。
+    default: 214748364800
+    type: bytes
+    range: [1073741824, null]
+    unit: 字节
+    impact: 调小 → 更早触发清理；设得比当前占用量小会立刻触发一轮 dry-run
+    cost: none
+    restart_required: false
+    dangerous: true
+    dry_run_first: true
+    recompute: retention
+    requires: []
+    note: 默认 200 GB。有人工 tag 的内容默认豁免滚动删除，见 DESIGN §7.5。
+
+  - key: search.default_page_size
+    label: 检索结果每页条数
+    help: 打开检索页时一次显示多少条结果。条数越多，单次加载越慢，但在手机上翻页次数更少。
+    default: 40
+    type: int
+    range: [10, 200]
+    unit: 条
+    impact: 调大 → 单页信息更多但加载更慢；调小 → 翻页更频繁
+    cost: none
+    restart_required: false
+    dangerous: false
+    recompute: null
+    requires: []
+    note: 仅影响展示，不影响检索本身。
+
+  - key: inbox.enabled
+    label: 开放匿名提报入口
+    help: 打开后，任何拿到链接的人都可以投稿，内容会先进隔离区等你审查，审查通过前不会出现在任何检索结果里，也不会下载到内容库。
+    default: false
+    type: bool
+    impact: 打开 → 可以接收匿名投稿，但需要你定期审查，并承担被滥用的风险；关闭 → 无法匿名投稿
+    cost: storage
+    restart_required: false
+    dangerous: true
+    recompute: null
+    requires: []
+    note: 建议先用 L1 指定转发用户的方式收集内容，确认审查节奏后再开放。见 DESIGN §6.1。
+
+  - key: privacy.local_only_mode
+    label: 全局仅本地模式
+    help: 打开时，任何内容都不会被发送到这台设备以外的地方。关掉它并不会让系统自动外发内容，只是解除了这道总闸。
+    default: true
+    type: bool
+    impact: 关闭 → 在外发功能可用时允许进入待审流程；打开 → 一律只在本机处理
+    cost: none
+    restart_required: false
+    dangerous: true
+    recompute: null
+    requires: []
+    note: 骨架与 MVP 阶段不存在外发代码路径，本开关当前无消费方，仅为数据模型与后续阶段保留。
+
+# ---------------------------------------------------------------------------
+# 阶段 2 才会启用的设置项（此处只作声明示例，不生效）
+#
+# 说明：MVP 阶段「不写外发代码路径」（DESIGN §8.1），因此这里不注册任何
+# 「允许外发」类开关 —— 注册一个没有实现的开关只会制造能力错觉。
+# 阶段 2 引入外发网关（DESIGN §6.3）时，按下面的形态追加：
+#
+#   - key: ai.egress_enabled
+#     label: 允许把内容发送到外部 AI 服务
+#     help: 关闭时所有内容只在本机处理，不会离开这台设备。开启后仍需逐批审阅放行，不会自动外发。
+#     default: false
+#     type: bool
+#     impact: 开启 → 可以使用云端模型提升难例质量；关闭 → 完全本地，隐私最好
+#     cost: api
+#     restart_required: false
+#     dangerous: true
+#     requires: [ai.provider_policy_registered]   # 未登记服务商策略则拒绝外发
+#     note: 仅当 ai.involvement 为 assist 或 advisory_auto 时才可能被实际使用。
+# ---------------------------------------------------------------------------

@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# 单机部署编排（DESIGN §10 推荐默认架构的起点）
+#
+# 本阶段只启两个服务：db 与 app。
+# 骨架内尚不存在 worker / sync / retention 的可执行入口，因此它们以
+# 「注释 + 待加入」的形式列在文件末尾，而不是写成会立即崩溃的容器。
+#
+# 访问面：只绑定 127.0.0.1，远程访问请用 Tailscale / 隧道，不要开公网端口。
+# 变量覆盖：复制 .env.example 为 .env（.env 不入库）。
+# ---------------------------------------------------------------------------
+
+name: post-collector
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pc}
+      POSTGRES_USER: ${POSTGRES_USER:-pc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      # 中文检索需要 pg_trgm（创建扩展）；zhparser / pg_bigm 的可用性待核实
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - ./data/db:/var/lib/postgresql/data
+      # 迁移脚本挂进来，便于手动 psql 应用（本阶段尚未执行过）
+      - ./migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pc} -d ${POSTGRES_DB:-pc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 默认不对外暴露端口；需要本机 psql 调试时手动取消注释
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PC__DB__DSN: ${PC__DB__DSN:-postgresql://pc:change-me@db:5432/pc}
+      PC__PATHS__MEDIA_ROOT: /data/media
+      PC__PATHS__COLD_ROOT: /data/cold
+      PC__PATHS__QUARANTINE_ROOT: /data/quarantine
+      PC__AI__INVOLVEMENT: ${PC__AI__INVOLVEMENT:-local_only}
+      PC__RETENTION__MAX_TOTAL_BYTES: ${PC__RETENTION__MAX_TOTAL_BYTES:-214748364800}
+      PC__INBOX__ENABLED: ${PC__INBOX__ENABLED:-false}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data/media:/data/media
+      # 冷层与隔离区在对应模块加入后再开放挂载（见 DESIGN §7.5、§6.1）
+      # - ./data/cold:/data/cold
+      # - ./data/quarantine:/data/quarantine
+    ports:
+      - "127.0.0.1:8080:8080"
+
+# ---------------------------------------------------------------------------
+# 待加入的服务（随实现阶段推进，每一行都对应一个必须先存在的模块）
+#
+#   worker      python -m pc.jobs.worker     任务队列消费者（§2.3）
+#   sync        python -m pc.jobs.sync       每来源独立节拍的调度器（§2.3）
+#   retention   python -m pc.jobs.retention  保留策略执行器，默认 dry-run（§7.5）
+#
+# 届时需要一并启用的卷：
+#   ./data/cold       → /data/cold          冷层本体（可指向 NAS 挂载）
+#   ./data/quarantine → /data/quarantine    L2 提报隔离区，与主存储物理分离
+#   ./data/backup     → /data/backup        备份目标（可指向 NAS）
+#   ./models          → /app/models:ro      本地模型权重（阶段 2 起）
+#
+# 阶段 2 才考虑加入的组件：meili（Meilisearch）、minio（MinIO）。
+# 按 DESIGN §8.2 的判断，10 万条量级下不需要 Qdrant / OpenSearch。
+# ---------------------------------------------------------------------------

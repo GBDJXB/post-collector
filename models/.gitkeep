@@ -1,0 +1,14 @@
+# 本地模型权重根目录（内容永不入库，见 .gitignore）
+
+阶段 1 起按 Profile 自动下载并校验哈希的本地模型放在这里：
+
+    models/tagger/       WD 系 tagger（二次元图像标签，ONNX/PyTorch）
+    models/nsfw/         NSFW 分类器
+    models/ocr/          RapidOCR / PaddleOCR
+    models/embed/        CLIP / SigLIP 系图像 embedding（阶段 2）
+
+约定（DESIGN §6.2.3、§7.1）：
+  * 只用可信来源 + 固定 revision，下载后校验哈希；
+  * 界面必须显示下载进度、体积与**许可证**，许可证不允许的用途不得启用；
+  * 首次启动向导的三个档位（省资源 / 均衡 / 高质量）映射到这里的哪套权重，
+    由 config/app.yaml 的 models.profile 决定。

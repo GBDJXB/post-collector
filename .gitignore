@@ -1,0 +1,111 @@
+# ---------------------------------------------------------------------------
+# post-collector .gitignore
+#
+# 原则：只跟踪「源代码 / 声明式配置 / 文档」，运行时产物与密钥一律不入库。
+# 显式不忽略的项见文件末尾（uv.lock 必须提交）。
+# ---------------------------------------------------------------------------
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+
+# --- 测试与静态检查缓存 ---------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# --- 密钥与环境（.env.example 例外，见下） --------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+master.key
+credentials.json
+
+# --- 本地覆盖配置（同一设置只应有一个来源，见 DESIGN §6.2） ---------------
+config/*.local.yaml
+config/app.local.yaml
+config/settings-registry.local.yaml
+
+# --- 运行时数据（PostgreSQL 卷、媒体、冷层、隔离区、备份） ----------------
+# data/ 下永远是运行时产物，绝不入库；仅保留 .gitkeep 占位
+data/**
+!data/.gitkeep
+
+# --- 本地模型权重（体积大、需校验来源与许可证） --------------------------
+models/**
+!models/.gitkeep
+*.onnx
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.tflite
+*.gguf
+
+# --- 日志与临时文件 -------------------------------------------------------
+logs/
+*.log
+*.log.*
+tmp/
+temp/
+*.tmp
+.cache/
+
+# --- 前端构建产物（阶段 2 若引入前端时使用） ------------------------------
+node_modules/
+.next/
+out/
+.nuxt/
+svelte-kit/
+
+# --- 操作系统与 IDE -------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 打包与构建缓存 -------------------------------------------------------
+*.tar
+*.tar.gz
+*.zip
+
+# ---------------------------------------------------------------------------
+# 显式「不」忽略（提醒：这些必须入库）
+#   uv.lock                     部署可复现的前提，首次 `uv sync` 后提交
+#   config/app.yaml             L2 开发配置，带注释与默认值
+#   config/settings-registry.yaml  设置项声明式注册表
+#   .env.example                环境变量样例（真实 .env 被忽略）
+#   AGENTS.md                   面向 AI coding agent 的项目入口与边界约束
+#   README.md                   面向使用者的手册
+#   DESIGN.md                   设计基线
+# ---------------------------------------------------------------------------

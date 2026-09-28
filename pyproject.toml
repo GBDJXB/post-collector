@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "post-collector"
+version = "0.0.1"
+description = "面向个人授权来源的内容采集、分类与检索系统（骨架阶段）"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "root" }]
+keywords = ["archive", "collector", "tagger", "search"]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+# 依赖清单对应 DESIGN §8.1「最适合 MVP」的选型。
+# 注意：不引入 ORM —— 迁移与查询走顺序 SQL（见 migrations/）。
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pyyaml>=6.0",
+  "psycopg[binary]>=3.2",
+]
+
+# 开发依赖使用 PEP 735 的 dependency-groups：`uv sync` 会默认装上它们，
+# 而 Dockerfile 用的 `uv sync --no-dev` 只装运行时依赖。
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+  "ruff>=0.7",
+]
+
+[project.scripts]
+pc = "pc.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+exclude = [".venv", "data", "models", "migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+  "E501",   # 行长由 formatter 负责
+  "RUF001", # 中文注释里的全角标点
+  "RUF002",
+  "RUF003",
+]
+
+[tool.pytest.ini_options]
+# 测试目录将在实现阶段创建；配置先就位，避免后续再改。
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "integration: 需要真实 PostgreSQL / 外部服务的测试（默认通过环境变量跳过）",
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+strict = false
+warn_unused_ignores = true
