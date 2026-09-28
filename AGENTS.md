@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表、数据库建表脚本与健康检查接口，**没有任何业务实现，也没有测试**。
+当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实建起**（PostgreSQL 16.15，32 张表，宿主侧与容器侧两条路径都验证过），测试套件已建立并覆盖数据库适配层与 schema 红线；**但业务功能仍未实现**。
 
 设计事实源是 [`DESIGN.md`](DESIGN.md)。它是只读基线：改动实现前先读对应章节；若实现结论与它冲突，修改 `DESIGN.md` 并同步其附录 C 的变更记录，不要只在代码里悄悄偏离。
 
@@ -20,13 +20,14 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 操作 | 命令 | 说明 |
 | --- | --- | --- |
 | 安装依赖 | `uv sync` | 会一并装上 dev 组（pytest / ruff / httpx）；只要运行时用 `uv sync --no-dev`。生成 `uv.lock`，必须提交 |
-| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`） |
+| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`）。体检含只读「数据库」段，**数据库不可达不影响退出码** |
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
-| 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed |
+| 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | 测试目录尚未创建；`[tool.pytest.ini_options]` 已就位。注意当前 starlette 会对 `httpx` 版的 TestClient 报弃用告警，写测试时按提示换 `httpx2` |
-| 建表 | `psql "$PC__DB__DSN" -v ON_ERROR_STOP=1 -f migrations/0001_init.sql` | 尚未在真实 PostgreSQL 上执行过 |
-| 起数据库 | `docker compose up -d db` | 需要 Docker；开发机当前未安装，路径未验证 |
+| 运行测试 | `uv run pytest` | `tests/` 已建立。单元测试随时可跑；标了 `integration` 的需要真实数据库，连接串取 `PC_TEST_DSN`（宿主机）或 `PC__DB_DSN`（容器内），**取不到则跳过**。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 起数据库 | `docker compose up -d db` | 需要 Docker Desktop（已安装并验证）。`db` 只绑 `127.0.0.1:5432`；容器内互访走服务名 `db`，宿主侧工具用 `.env` 的 `PC_TEST_DSN` |
+| 建表 / 应用迁移 | `uv run pc db apply` | **整篇单事务执行，失败整体回滚**；已应用则短路并补记结构指纹。等价路径（容器内，需要 psql）：`docker compose exec -T db psql -U pc -d pc -v ON_ERROR_STOP=1 -f /migrations/0001_init.sql`。已在 PostgreSQL 16.15 上真实执行成功 |
+| 校验库结构 | `uv run pc db status` | 只读：表数、`pg_trgm`、记账版本、结构指纹是否漂移；结构不符时退出码 2 |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -45,14 +46,16 @@ post-collector/
 │   ├── app.yaml                  L2 开发配置 + 首次启动播种用的 defaults 段
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
-│   └── 0001_init.sql             核心建表脚本（32 张表 + 索引/约束）
-├── data/                         运行时产物：PG 数据、媒体、冷层、隔离区、备份
+│   └── 0001_init.sql             核心建表脚本（32 张表 + 索引/约束；已真实执行并冻结）
+├── data/                         运行时产物：PG 数据（data/db）、媒体、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
+├── tests/                        conftest（集成测试开关）+ 适配器单元测试 + schema 集成测试
 └── src/pc/
     ├── domain.py                 状态枚举与跨层数据结构（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
     ├── config.py                 注册表加载与分层解析（签名就位，实现留空）
-    ├── cli.py                    doctor 可运行；config show 为占位
+    ├── cli.py                    doctor / db 已接线；config show 为占位
+    ├── adapters/                 适配器实现（postgres.py：连接串解析、迁移应用、schema 校验）
     └── api/                      FastAPI 工厂与路由
 ```
 
@@ -61,8 +64,9 @@ post-collector/
 | `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定，无实现 |
 | `src/pc/domain.py` | 状态取值与传输结构；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析与快照 | 待实现 |
-| `src/pc/cli.py` | `doctor`（真实可用）、`config show`（占位，退出码 2/3） | 部分可用 |
-| `tests/` | 单元与集成测试（`integration` marker 需真实数据库） | 尚未创建 |
+| `src/pc/adapters/` | PostgreSQL：DSN 解析、迁移应用、schema 校验（`pc db apply/status`） | 首个适配器，可用 |
+| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status`（可用）、`config show`（占位，退出码 2/3） | 部分可用 |
+| `tests/` | 适配器单元测试 + schema 集成测试（`integration` marker 需真实数据库，连不上则跳过） | 32 条，全绿 |
 
 ## 边界约束
 
@@ -82,9 +86,11 @@ post-collector/
 
 **迁移与数据**
 
-- `migrations/` 下按序号追加 SQL，不修改已应用的版本。
-- `user` 表因 PostgreSQL 保留字落地为 `app_user`；`before`/`after` 落地为 `before_state`/`after_state`。全部偏差写在 `0001_init.sql` 文件头。
-- 执行迁移请整条语句执行（`psql -f`）；不要用 `text.split(';')` 之类的方式切分语句，文件内既有分号又有相邻字面量拼接。
+- `migrations/` 下按序号追加 SQL，不修改已应用的版本。`0001_init.sql` 已于 2026-09-28 在 PostgreSQL 16.15 上执行成功并**冻结**：后续任何结构改动一律以 `0002_*.sql` 追加。
+- 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`（最后这条是 0001 首次真实执行时才暴露的）。全部偏差都写在 `0001_init.sql` 文件头。
+- 执行迁移请**整条语句执行**，两条等价路径：`uv run pc db apply`（纯 Python，单事务、失败整体回滚）与容器内 `psql -f`。不要用 `text.split(';')` 之类的方式切分语句，文件内既有分号又有相邻字面量拼接。
+- 连接串分两处且不可混用：容器内用 `PC__DB__DSN`（主机名是服务名 `db`），宿主机侧用 `.env` 的 `PC_TEST_DSN`（主机名 `localhost`），两者密码必须一致。`pc db` 在宿主机上刻意忽略 `.env` 里的 `PC__DB__DSN`，因为它指向容器网络。
+- 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移。
 - 派生数据（索引、向量、标签、caption）一律可重建；`PostgreSQL` 与媒体目录是唯一需要认真备份的东西。
 
 **文档与提交**
@@ -140,4 +146,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、测试套件、备份脚本。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本。测试套件已建立，但目前只覆盖数据库适配层与 schema 红线，**没有业务逻辑测试**（因为还没有业务逻辑）。

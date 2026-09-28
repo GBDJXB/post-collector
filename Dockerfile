@@ -21,6 +21,9 @@ COPY pyproject.toml README.md ./
 RUN uv sync --no-dev --no-install-project
 
 COPY src ./src
+# 迁移脚本随镜像分发：这样容器内没有 psql 客户端也能 `pc db apply`
+# （migrations 属于可部署产物，不是只在开发机上存在的东西）
+COPY migrations ./migrations
 RUN uv sync --no-dev
 
 # 运行时目录（compose 会以卷覆盖挂载，见 docker-compose.yml）

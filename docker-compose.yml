@@ -23,16 +23,18 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - ./data/db:/var/lib/postgresql/data
-      # 迁移脚本挂进来，便于手动 psql 应用（本阶段尚未执行过）
+      # 迁移脚本挂进来，便于在容器内用 psql 应用；宿主侧也可以直接 `uv run pc db apply`
+      # 0001 已在 PostgreSQL 16.15 上执行成功，见 migrations/0001_init.sql 文件头的修订记录
       - ./migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pc} -d ${POSTGRES_DB:-pc}"]
       interval: 10s
       timeout: 5s
       retries: 10
-    # 默认不对外暴露端口；需要本机 psql 调试时手动取消注释
-    # ports:
-    #   - "127.0.0.1:5432:5432"
+    # 只绑本机：宿主机侧的 `pc db status` / `pc db apply` 与集成测试需要连库。
+    # 容器内互访仍走服务名 db:5432，不受此映射影响；公网与内网其它机器依然连不上。
+    ports:
+      - "127.0.0.1:5432:5432"
 
   app:
     build:

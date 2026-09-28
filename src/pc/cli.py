@@ -5,11 +5,12 @@
 「这个值为什么是这样」。
 
 本模块**只依赖标准库**：在还没执行 ``uv sync`` 的环境里，``pc doctor``
-也应当能跑起来并告诉你缺了什么。
+也应当能跑起来并告诉你缺了什么。数据库相关子命令才按需 import adapters 层。
 
 退出码约定：
     0  成功
-    2  环境问题（缺依赖、缺配置文件）—— 提示里会给出可操作的动作
+    2  环境问题（缺依赖、缺配置文件、数据库不可达、库结构与迁移不一致）
+       —— 提示里会给出可操作的动作
     3  功能尚未实现（骨架阶段已知的未完成项）
     1  argparse 用法错误（由 argparse 自行返回）
 """
@@ -45,7 +46,7 @@ _EXPECTED_FILES: tuple[str, ...] = (
 _REQUIRED_DEPS: dict[str, str] = {
     "fastapi": "Web API（api/app.py）",
     "yaml": "设置项注册表解析（config.py）",
-    "psycopg": "PostgreSQL 访问（实现阶段）",
+    "psycopg": "PostgreSQL 访问（adapters/postgres.py、pc db）",
     "pydantic": "数据校验（实现阶段）",
 }
 
@@ -122,6 +123,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if not ok:
             missing_deps.append(module)
     print()
+    print("[数据库]（只读探测；不可达不影响本次体检结论）")
+    _doctor_database_section()
+    print()
     print("[运行时目录]（运行时产物，已被 .gitignore 忽略）")
     for rel in _RUNTIME_DIRS:
         exists = (root / rel).is_dir()
@@ -164,10 +168,142 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_database_section() -> None:
+    """doctor 的数据库段：只报告状态，**绝不因数据库问题改变退出码**。
+
+    README 承诺过「体检命令不依赖数据库」，而 ``/healthz`` 也刻意不校验数据库
+    （避免把依赖故障误报成进程死亡）。这里保持一致：数据库只是体检报告的一行，
+    不是体检的判据。
+    """
+    try:
+        from pc.adapters import postgres as pg
+    except Exception as exc:  # pragma: no cover - 适配器层不可导入时的兜底
+        print(f"  · 适配器不可用：{exc}")
+        return
+
+    if not pg.psycopg_available():
+        print("  · 缺少依赖 psycopg，跳过（运行 uv sync 后可见）")
+        return
+
+    resolved = pg.resolve_dsn(None)
+    print(f"  · 连接串 {pg.mask_dsn(resolved.dsn)}（{resolved.source}）")
+    try:
+        with pg.connect(resolved.dsn, connect_timeout=3) as conn:
+            status = pg.database_status(conn)
+    except pg.DatabaseError as exc:
+        detail = str(exc).splitlines()[0]
+        print(f"  · 不可达：{detail}")
+        print("    提示：docker compose up -d db；宿主机侧连接串见 .env 的 PC_TEST_DSN")
+        return
+
+    applied = "已应用" if status["migration_version"] else "未应用"
+    print(
+        f"  ✓ 可达：server {status['server_version']}，表 {len(status['tables'])} 张，"
+        f"迁移 0001 {applied}"
+    )
+
+
+def cmd_db_status(args: argparse.Namespace) -> int:
+    """只读报告「库里的结构是否与迁移一致」（不改任何东西）。"""
+    from pc.adapters import postgres as pg
+
+    resolved = pg.resolve_dsn(args.dsn)
+    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    print(f"  {resolved.explain()}")
+
+    if not pg.psycopg_available():
+        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
+        return 2
+
+    path = args.file or pg.DEFAULT_MIGRATION_FILE
+    try:
+        with pg.connect(resolved.dsn) as conn:
+            status = pg.database_status(conn, path)
+    except pg.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    print(f"  服务器 {status['server_version']} / 库 {status['database']} / 用户 {status['user']}")
+    print(f"  pg_trgm：{'已安装' if status['pg_trgm'] else '缺失'}")
+    print(f"  表：{len(status['tables'])} 张（预期 {len(pg.EXPECTED_TABLES)} 张）")
+    if status["migration_version"]:
+        print(f"  迁移记账：version {status['migration_version']} 已应用")
+    else:
+        print(f"  迁移记账：version {pg.MIGRATION_VERSION} 未应用（库状态：{status['state']}）")
+
+    if not status["migration_file_present"]:
+        print(f"  结构指纹：无法比对（找不到迁移文件 {path}）")
+    elif not status["checksum_recorded"]:
+        print("  结构指纹：未记录（可用 `pc db apply` 补记，之后即可发现文件被改动）")
+    elif status["checksum_drift"]:
+        print("  结构指纹：与文件不一致（漂移）")
+    else:
+        print("  结构指纹：与文件一致")
+
+    if not status["migration_file_present"]:
+        print(f"  ✗ 找不到迁移文件：{path}")
+        print("     用 --file 指定路径，或确认在仓库根目录运行（容器内路径是 /app/migrations/）")
+    if status["missing_tables"]:
+        print(f"  ✗ 缺少表：{', '.join(status['missing_tables'])}")
+    if status["deferred_present"]:
+        print(f"  ✗ 出现本阶段必须缺席的表：{', '.join(status['deferred_present'])}")
+        print("     这三张表属阶段 2（向量与外发），出现即触碰「无外发」红线，见 DESIGN §8.1")
+    if status["unexpected_tables"]:
+        print(f"  · 计划外的表：{', '.join(status['unexpected_tables'])}")
+    if status["checksum_drift"]:
+        print("  · 迁移文件在应用之后被改过（结构指纹变化）。本工具不会自动改数据库；")
+        print("    若改动确有必要，请以新迁移追加，而不是改已应用的版本。")
+
+    if status["ok"]:
+        print("结论：结构就绪，与 migrations/0001_init.sql 一致。")
+        return 0
+    print("结论：结构未就绪，见上面的 ✗ 项。", file=sys.stderr)
+    return 2
+
+
+def cmd_db_apply(args: argparse.Namespace) -> int:
+    """应用迁移：整篇在单事务内执行，失败整体回滚；已应用则安全短路。"""
+    from pc.adapters import postgres as pg
+
+    resolved = pg.resolve_dsn(args.dsn)
+    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    print(f"  {resolved.explain()}")
+
+    if not pg.psycopg_available():
+        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
+        return 2
+
+    path = args.file or pg.DEFAULT_MIGRATION_FILE
+    try:
+        with pg.connect(resolved.dsn) as conn:
+            result = pg.apply_migration(conn, path)
+    except pg.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    fingerprint = str(result.get("checksum", ""))[:12]
+    reason = result["reason"]
+    if reason == "applied":
+        print(f"  ✓ 已应用 {Path(path).name}（结构指纹 {fingerprint}…）")
+        print(f"    共 {len(pg.EXPECTED_TABLES)} 张表；可用 `pc db status` 复核。")
+        return 0
+    if reason == "already_applied":
+        print("  · 迁移已应用，本次未改动数据库。")
+        if result.get("checksum_recorded"):
+            print(f"    顺带补记了结构指纹（{fingerprint}…），用于日后发现文件被改动。")
+        return 0
+
+    print("  ! 迁移已应用，但文件与记账的结构指纹不一致：", file=sys.stderr)
+    recorded = str(result.get("checksum_recorded_value") or "")[:12]
+    print(f"    记账 {recorded}… / 现在 {fingerprint}…", file=sys.stderr)
+    print("    没有改动数据库。请确认改动是否应以新迁移追加。", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc",
-        description="post-collector 命令行（骨架阶段，仅 doctor 与 config show 已接线）",
+        description="post-collector 命令行（骨架阶段；doctor、config show、db 已接线）",
     )
     parser.add_argument("--version", action="version", version=f"post-collector {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -181,6 +317,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = p_config_sub.add_parser("show", help="显示设置项及其来源")
     p_show.add_argument("--explain", action="store_true", help="附带含义与影响的解释")
     p_show.set_defaults(func=cmd_config_show)
+
+    p_db = sub.add_parser("db", help="数据库：应用迁移与查看结构状态")
+    p_db_sub = p_db.add_subparsers(dest="db_command", required=True)
+
+    p_db_apply = p_db_sub.add_parser(
+        "apply", help="应用迁移（整篇单事务执行；已应用则安全短路）"
+    )
+    p_db_apply.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
+    p_db_apply.add_argument("--file", help="迁移文件路径（默认 migrations/0001_init.sql）")
+    p_db_apply.set_defaults(func=cmd_db_apply)
+
+    p_db_status = p_db_sub.add_parser("status", help="只读报告库结构与迁移是否一致")
+    p_db_status.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
+    p_db_status.add_argument("--file", help="迁移文件路径（默认 migrations/0001_init.sql）")
+    p_db_status.set_defaults(func=cmd_db_status)
 
     return parser
 

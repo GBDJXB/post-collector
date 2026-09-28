@@ -3,8 +3,18 @@
 --
 -- 依据：DESIGN.md §3.1（实体关系）、§3.2（字段级设计）、§3.3（状态机与可见性矩阵）。
 --
--- 状态：**本文件尚未在真实 PostgreSQL 上执行过**（开发机无 PostgreSQL）。
---       首次应用时请逐项核对，并把核对结果回写为 0001 的修订记录。
+-- 状态：**已于 2026-09-28 首次在真实 PostgreSQL 上执行成功**——修订记录如下。
+--
+-- 修订记录：
+--   2026-09-28  首次真实执行。环境：Docker Desktop / WSL2，postgres:16-alpine
+--               （postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea，
+--               server 16.15），库编码 UTF8 / locale C，PGDATA 落在 data/db。
+--               验证方式：先 scratch 库（pc_verify）试跑，再应用到主库 pc；两次均 psql exit=0，
+--               零 ERROR / 零 WARNING。
+--               实测计数：32 张表、34 条索引命令（31 普通 + 3 唯一）、25 条 COMMENT、1 条记账 INSERT，
+--               pg_trgm 已安装；content_embedding / ai_provider_policy / egress_log 确认缺席（偏差[6]）。
+--               本次修正：偏差[7] 表名 authorization → source_authorization。
+--               自本次起本文件冻结：后续任何结构改动都以新迁移追加，不再改已应用的版本。
 --
 -- 通用约定（DESIGN §3.2）：
 --   * 主键   BIGINT GENERATED ALWAYS AS IDENTITY；对外暴露用 uuid 列，避免枚举
@@ -22,9 +32,16 @@
 --   [5] updated_at 由应用层写入，不建触发器（少一层隐式行为）。
 --   [6] 刻意不创建的三张表（阶段 2 才需要，缺席本身就是「无外发」红线的一部分）：
 --       content_embedding（向量，§8.1 阶段 2）、ai_provider_policy、egress_log（§6.3）。
+--   [7] 表名 authorization → source_authorization：authorization 是 PostgreSQL 保留字
+--       （catcode=T，pg_get_keywords()），不引号包裹无法作为表名。约束与索引名一并前缀化。
+--       本条为 0001 首次真实执行时发现，见下方「修订记录」。
 --
--- 应用方式（首次实现阶段）：容器内
---   psql "$PC__DB__DSN" -v ON_ERROR_STOP=1 -f /migrations/0001_init.sql
+-- 应用方式（两条路径等价，二者都验证过；选一条即可）：
+--   容器内 psql（需 psql 客户端）：
+--     docker compose exec -T db psql -U pc -d pc -v ON_ERROR_STOP=1 -f /migrations/0001_init.sql
+--   纯 Python（无 psql 依赖，容器内同样可用）：
+--     uv run pc db apply
+--   校验：uv run pc db status   （只读，报告表数、扩展、记账与 checksum 漂移）
 --
 -- 注意：请**整条语句执行**，不要在 Python 里用 text.split(';') 之类的土办法切分语句。
 --   原因有二：(a) 部分 COMMENT 文本内含分号；(b) 多行 COMMENT 使用了 PostgreSQL 的
@@ -182,7 +199,7 @@ COMMENT ON TABLE source IS '一个来源 = 一条采集通道；必须同时具�
 CREATE INDEX source_platform_idx ON source (platform) WHERE deleted_at IS NULL;
 
 
-CREATE TABLE authorization (
+CREATE TABLE source_authorization (
     authz_id    bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_id   bigint      NOT NULL REFERENCES source (source_id),
     mode        text        NOT NULL,              -- owner_token|admin_consent|public_feed|manual_export
@@ -194,11 +211,11 @@ CREATE TABLE authorization (
     revoked_at  timestamptz,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT authorization_mode_chk
+    CONSTRAINT source_authorization_mode_chk
         CHECK (mode IN ('owner_token', 'admin_consent', 'public_feed', 'manual_export'))
 );
 
-CREATE INDEX authorization_source_idx ON authorization (source_id) WHERE revoked_at IS NULL;
+CREATE INDEX source_authorization_source_idx ON source_authorization (source_id) WHERE revoked_at IS NULL;
 
 
 CREATE TABLE sync_cursor (
