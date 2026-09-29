@@ -42,7 +42,10 @@ def scratch_db(db_path: Path) -> Iterator[Any]:
 
 @pytest.fixture(scope="module")
 def applied_schema(scratch_db: Any) -> Any:
-    """在临时库里应用 0001，返回已应用迁移的连接。"""
-    result = db.apply_migration(scratch_db, db.DEFAULT_MIGRATION_FILE)
-    assert result["applied"] is True, f"临时库应处于干净状态，实际结果：{result}"
+    """在临时库里应用全部迁移，返回已应用迁移的连接。"""
+    result = db.apply_migration(scratch_db)
+    assert result["applied"] == sorted(db.applied_versions(scratch_db)), (
+        f"临时库应处于干净状态并应用全部版本，实际结果：{result}"
+    )
+    assert result["drifted"] == [], f"干净库不该有漂移：{result}"
     return scratch_db

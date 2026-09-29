@@ -23,12 +23,16 @@ from pc.adapters import sqlite as db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: 源码根目录下的迁移文件，用来核对 ``EXPECTED_TABLES``
-MIGRATION_FILE = REPO_ROOT / db.DEFAULT_MIGRATION_FILE
+#: 迁移目录，用来核对 ``EXPECTED_TABLES``（必须扫**全部**版本，而不只是 0001）
+MIGRATIONS_DIR = REPO_ROOT / db.DEFAULT_MIGRATIONS_DIR
 
 
 def _read_migration() -> str:
-    return MIGRATION_FILE.read_text(encoding="utf-8")
+    """把迁移目录里所有 ``.sql`` 按序拼起来，供"声明的表集合"这类断言使用。"""
+    return "\n".join(
+        migration.path.read_text(encoding="utf-8")
+        for migration in db.discover_migrations(MIGRATIONS_DIR)
+    )
 
 
 class TestReadEnvFile:

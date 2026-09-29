@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/0001_init.sql`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层、SQLite 行为契约与 schema 红线，**128 条、0.5 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
+当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层、SQLite 行为契约、迁移器与 schema 红线，**143 条、0.5 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,9 +26,9 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **128 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.5 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
-| 建库 / 应用迁移 | `uv run pc db apply [--path PATH]` | **整篇在单个显式事务内执行**（`BEGIN IMMEDIATE` … `COMMIT`），失败整体回滚；已应用则短路并补记结构指纹。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
-| 校验库结构 | `uv run pc db status [--path PATH]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、记账版本与结构指纹漂移；结构不符时退出码 2 |
+| 运行测试 | `uv run pytest` | **143 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.5 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR]` | **按文件名序号应用 `migrations/sqlite/` 下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
+| 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
 | 重建检索索引 | `uv run pc db reindex` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段 |
 | 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
@@ -53,6 +53,7 @@ post-collector/
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
 │   ├── sqlite/0001_init.sql      **权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器
+│   ├── sqlite/0002_*.sql         后续迁移（按序号连续追加，见 migrations/README.md）
 │   └── README.md                 执行语义、方言历史与写迁移的规矩
 ├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
@@ -73,7 +74,7 @@ post-collector/
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照 | 可用（单元测试覆盖） |
 | `src/pc/adapters/` | SQLite：路径解析、PRAGMA 基线、迁移应用、结构校验、备份与 FTS5 重建、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
 | `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
-| `tests/` | 适配器单测 + SQLite 行为契约 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 128 条，0.5 秒全绿 |
+| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 143 条，0.5 秒全绿 |
 
 ## 边界约束
 
@@ -93,10 +94,10 @@ post-collector/
 
 **迁移与数据**
 
-- `migrations/sqlite/` 下按序号追加 SQL，不修改已应用的版本。权威脚本是 `0001_init.sql`（34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器），后续结构改动一律以 `0002_*.sql` 追加，并同步更新 `pc.adapters.sqlite.EXPECTED_TABLES`（否则新表会被 `pc db status` 报成"计划外的表"）。**PostgreSQL 版的建表脚本已经随 PG 路径一起删除**（记在 git 历史与 `migrations/README.md` 的方言对照表里），本项目现在只有一套 schema。
+- `migrations/sqlite/` 下的文件**按序号从 1 连续编号**（`0001_init.sql`、`0002_content_hash_not_unique.sql`…），适配器按序应用**整个目录**。**已应用的版本不可修改**：任何结构改动都以新文件追加，并同步更新 `pc.adapters.sqlite.EXPECTED_TABLES`（新表时）与 `tests/test_schema_integration.py` 的 `EXPECTED_MIGRATION_NAMES`（新版本时）——两处都是刻意的强制提醒。改已应用文件的 DDL 会让结构指纹漂移，`pc db status` 会报出来（**只报告、不覆盖**）。**PostgreSQL 版的建表脚本已经随 PG 路径一起删除**（记在 git 历史与 `migrations/README.md` 的方言对照表里），本项目现在只有一套 schema。
 - 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`。这三处改名沿用 PG 时期的决定，理由与全部偏差记录留在 git 历史与 `migrations/README.md` 里。
 - **迁移文件里不得出现 `PRAGMA`**：PRAGMA 基线（`journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout=5000`、`synchronous=NORMAL`、`temp_store=MEMORY`）由 `pc.adapters.sqlite.connect()` 在建立连接时执行。`journal_mode` 在事务内无法切换，写进 `.sql` 会直接报错——适配器会拒绝这种迁移文件（`split_statements` 里拦）。
-- 执行迁移是**整篇单事务**：语句用 `sqlite3.complete_statement()` 切分（**不要**用 `text.split(';')`，字符串字面量与注释里都可能有分号），在 `BEGIN IMMEDIATE` 内逐条执行，成功才写记账行并提交，失败整体回滚。适配器刻意用 `isolation_level=None` 自己管事务——Python 3.12 起 DDL 不再隐式开启事务，依赖隐式机制会让 `CREATE TABLE` 落到自动提交里，"失败整体回滚"当场失效。
+- 执行迁移是**逐文件事务**：语句用 `sqlite3.complete_statement()` 切分（**不要**用 `text.split(';')`，字符串字面量与注释里都可能有分号），每个文件在它自己的 `BEGIN IMMEDIATE` 内整篇执行，成功才写该版本的记账行并提交；某个文件失败只回滚它自己，**已成功的版本保持已应用**。适配器刻意用 `isolation_level=None` 自己管事务——Python 3.12 起 DDL 不再隐式开启事务，依赖隐式机制会让 `CREATE TABLE` 落到自动提交里，"失败整体回滚"当场失效。记账表 `schema_migration` 由适配器兜底创建（它不计入业务表，所以"只有它"仍是干净库）。
 - **`foreign_keys` 默认关闭，任何一处漏设都会让外键静默失效**，因此数据库访问必须收敛在 `pc.adapters.sqlite`：业务代码不得自己 `sqlite3.connect()`。另外 `sqlite3.Connection` 的 `with` 协议管的是**事务**而不是关闭连接，一律用 `db.open_db()`。
 - 数据库位置优先级：`--path` > 环境变量 `PC__DB__PATH` > 环境变量 `PC_DATA_ROOT`（→ `<root>/pc.sqlite3`）> `.env` 里的同名两项 > `config/app.yaml` 的 `db.path`/`db.data_root` > 平台默认用户数据目录。**进程环境整层高于 `.env` 整层**——这条曾经写错（两层按同一个键混着查，导致 `.env` 压过环境变量），现在有回归测试钉着。
 - 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移，**只报告不覆盖**。

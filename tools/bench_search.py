@@ -89,7 +89,7 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
     """造一个合成库；返回耗时与体积统计。"""
     conn = db.connect(path)
     started = time.perf_counter()
-    db.apply_migration(conn, db.DEFAULT_MIGRATION_FILE)
+    db.apply_migration(conn)
     migrated = time.perf_counter()
 
     tag_ids: list[int] = []

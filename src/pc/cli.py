@@ -378,11 +378,17 @@ def _doctor_database_section() -> None:
         print(f"  · 打不开：{str(exc).splitlines()[0]}")
         return
 
-    applied = "已应用" if status["migration_version"] else "未应用"
+    applied = "、".join(str(v) for v in status["migrations_applied"]) or "无"
     print(
         f"  ✓ SQLite {status['sqlite_version']}，表 {len(status['tables'])} 张，"
-        f"迁移 0001 {applied}"
+        f"迁移记账 version {applied}"
     )
+    if status["migrations_missing"]:
+        print(
+            "  · 有未应用的迁移版本："
+            + "、".join(str(v) for v in status["migrations_missing"])
+            + "（跑 `pc db apply`）"
+        )
     print(
         f"  · journal_mode={status['journal_mode']}"
         f"  foreign_keys={'ON' if status['foreign_keys'] else 'OFF'}"
@@ -412,10 +418,10 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         )
         return 2
 
-    path = args.file or db.DEFAULT_MIGRATION_FILE
+    directory = args.dir or db.DEFAULT_MIGRATIONS_DIR
     try:
         with db.open_db(resolved.path, expect_exists=True) as conn:
-            status = db.database_status(conn, path)
+            status = db.database_status(conn, directory)
     except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
@@ -429,23 +435,47 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         f"（{'、'.join(status['fts_tables']) or '无'}）"
     )
     print(f"  表：{len(status['tables'])} 张（预期 {len(db.EXPECTED_TABLES)} 张）")
-    if status["migration_version"]:
-        print(f"  迁移记账：version {status['migration_version']} 已应用")
-    else:
-        print(f"  迁移记账：version {db.MIGRATION_VERSION} 未应用（库状态：{status['state']}）")
 
-    if not status["migration_file_present"]:
-        print(f"  结构指纹：无法比对（找不到迁移文件 {path}）")
-    elif not status["checksum_recorded"]:
-        print("  结构指纹：未记录（可用 `pc db apply` 补记，之后即可发现文件被改动）")
+    applied = status["migrations_applied"]
+    expected = status["migrations_expected"]
+    if applied:
+        print(f"  迁移记账：已应用 version {'、'.join(str(v) for v in applied)}")
+    else:
+        print(f"  迁移记账：一条都没有（库状态：{status['state']}）")
+    if expected:
+        print(
+            f"  迁移目录：{directory.as_posix()} 共 {len(expected)} 个版本"
+            f"（最新 {expected[-1]}）"
+        )
+    if status["migrations_missing"]:
+        print(
+            "  ✗ 未应用的版本："
+            + "、".join(str(v) for v in status["migrations_missing"])
+            + "（跑 `pc db apply` 应用）"
+        )
+    if status["migrations_unknown"]:
+        print(
+            "  ✗ 库里的版本比迁移目录更新："
+            + "、".join(str(v) for v in status["migrations_unknown"])
+            + "（这个程序可能比库旧，请升级后再操作）"
+        )
+
+    if not status["migrations_dir_present"]:
+        print(f"  结构指纹：无法比对（找不到迁移目录 {directory}）")
+    elif status["checksum_unrecorded_versions"]:
+        print(
+            "  结构指纹：部分版本未记录"
+            f"（{'、'.join(str(v) for v in status['checksum_unrecorded_versions'])}）；"
+            "可用 `pc db apply` 补记，之后即可发现文件被改动"
+        )
     elif status["checksum_drift"]:
         print("  结构指纹：与文件不一致（漂移）")
     else:
         print("  结构指纹：与文件一致")
 
-    if not status["migration_file_present"]:
-        print(f"  ✗ 找不到迁移文件：{path}")
-        print("     用 --file 指定路径，或确认在仓库根目录运行")
+    if not status["migrations_dir_present"]:
+        print(f"  ✗ 找不到迁移目录：{directory}")
+        print("     用 --dir 指定路径，或确认在仓库根目录运行")
     if status["missing_tables"]:
         print(f"  ✗ 缺少表：{', '.join(status['missing_tables'])}")
     if status["deferred_present"]:
@@ -463,53 +493,63 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     if not status["foreign_keys"]:
         print("  ✗ foreign_keys 未开启：外键约束会静默失效，见 DESIGN §3.2")
     if status["checksum_drift"]:
-        print("  · 迁移文件在应用之后被改过（结构指纹变化）。本工具不会自动改数据库；")
+        print(
+            "  · 已应用的迁移文件在应用之后被改过（结构指纹变化，涉及 version "
+            + "、".join(str(v) for v in status["checksum_drift_versions"])
+            + "）。本工具不会自动改数据库；"
+        )
         print("    若改动确有必要，请以新迁移追加，而不是改已应用的版本。")
 
     if status["ok"]:
-        print(f"结论：结构就绪，与 {db.DEFAULT_MIGRATION_FILE.as_posix()} 一致。")
+        print(f"结论：结构就绪，与 {directory.as_posix()} 的迁移一致。")
         return 0
     print("结论：结构未就绪，见上面的 ✗ 项。", file=sys.stderr)
     return 2
 
 
 def cmd_db_apply(args: argparse.Namespace) -> int:
-    """应用迁移：整篇在单事务内执行，失败整体回滚；已应用则安全短路。"""
+    """应用迁移：逐个文件在各自的事务内执行，失败只回滚该文件。"""
     from pc.adapters import sqlite as db
 
     resolved = db.resolve_db_path(args.path)
     print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
-    path = args.file or db.DEFAULT_MIGRATION_FILE
+    directory = args.dir or db.DEFAULT_MIGRATIONS_DIR
     try:
         with db.open_db(resolved.path) as conn:
-            result = db.apply_migration(conn, path)
+            result = db.apply_migration(conn, directory)
     except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
 
-    fingerprint = str(result.get("checksum", ""))[:12]
-    reason = result["reason"]
-    if reason == "applied":
-        statements = result.get("statements", 0)
-        print(f"  ✓ 已应用 {Path(path).name}（结构指纹 {fingerprint}…，{statements} 条语句）")
+    applied = result["applied"]
+    if applied:
+        print(
+            f"  ✓ 已应用 version {'、'.join(str(v) for v in applied)}"
+            f"（共 {result['statements']} 条语句，每个版本一个事务）"
+        )
         print(
             f"    共 {len(db.EXPECTED_TABLES)} 张表 + "
             f"{len(db.FTS_VIRTUAL_TABLES)} 个 FTS5 索引；可用 `pc db status` 复核。"
         )
-        return 0
-    if reason == "already_applied":
-        print("  · 迁移已应用，本次未改动数据库。")
-        if result.get("checksum_recorded"):
-            print(f"    顺带补记了结构指纹（{fingerprint}…），用于日后发现文件被改动。")
-        return 0
-
-    print("  ! 迁移已应用，但文件与记账的结构指纹不一致：", file=sys.stderr)
-    recorded = str(result.get("checksum_recorded_value") or "")[:12]
-    print(f"    记账 {recorded}… / 现在 {fingerprint}…", file=sys.stderr)
-    print("    没有改动数据库。请确认改动是否应以新迁移追加。", file=sys.stderr)
-    return 2
+    else:
+        print("  · 迁移已是最新，本次未改动数据库。")
+    if result["checksum_backfilled"]:
+        print(
+            "    顺带补记了结构指纹（version "
+            + "、".join(str(v) for v in result["checksum_backfilled"])
+            + "），用于日后发现文件被改动。"
+        )
+    if result["drifted"]:
+        print(
+            "  ! 已应用的版本与文件内容不一致（结构指纹漂移）：version "
+            + "、".join(str(v) for v in result["drifted"]),
+            file=sys.stderr,
+        )
+        print("    没有改动数据库。请确认改动是否应以新迁移追加。", file=sys.stderr)
+        return 2
+    return 0
 
 
 def cmd_db_backup(args: argparse.Namespace) -> int:
@@ -598,18 +638,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_sub = p_db.add_subparsers(dest="db_command", required=True)
 
     db_path_help = "显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析"
-    file_help = "迁移文件路径（默认 migrations/sqlite/0001_init.sql）"
+    migrations_dir_help = "迁移目录（默认 migrations/sqlite；按文件名序号顺序应用全部 .sql）"
 
     p_db_apply = p_db_sub.add_parser(
-        "apply", help="应用迁移（整篇单事务执行；已应用则安全短路）"
+        "apply", help="应用迁移（逐个文件各自一个事务；已应用则安全短路）"
     )
     p_db_apply.add_argument("--path", help=db_path_help)
-    p_db_apply.add_argument("--file", help=file_help)
+    p_db_apply.add_argument("--dir", help=migrations_dir_help)
     p_db_apply.set_defaults(func=cmd_db_apply)
 
     p_db_status = p_db_sub.add_parser("status", help="只读报告库结构与迁移是否一致")
     p_db_status.add_argument("--path", help=db_path_help)
-    p_db_status.add_argument("--file", help=file_help)
+    p_db_status.add_argument("--dir", help=migrations_dir_help)
     p_db_status.set_defaults(func=cmd_db_status)
 
     p_db_backup = p_db_sub.add_parser(

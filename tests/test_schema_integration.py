@@ -1,4 +1,4 @@
-"""schema 结构红线测试：在临时 SQLite 库里应用 0001，断言结构与两条红线。
+"""schema 结构红线测试：在临时 SQLite 库里应用全部迁移，断言结构与两条红线。
 
 存储引擎从 PostgreSQL 换成 SQLite 之后，本文件不再需要任何外部服务，因此也
 不再打 ``integration`` marker（见 ``tests/conftest.py`` 的说明）。探测手法从
@@ -20,9 +20,12 @@ from pc.adapters import sqlite as db
 #: 明确改一次，而不是让「多出来一张表」悄悄通过 inventory 断言。
 EXPECTED_TABLE_COUNT = 34
 
-#: 迁移记账里记录的文件名。SQLite 版记的是 ``Path.name``（含扩展名），
-#: 与 PG 版记的 ``0001_init``（不带扩展名）不同——这是实现事实，不是断言放宽。
-EXPECTED_MIGRATION_NAME = "0001_init.sql"
+#: 迁移记账里记录的文件名（``Path.name``，含扩展名）。
+#: 形如 ``{version: name}``：新增迁移时在这里加一行，同时也是「有人确认过」的痕迹。
+EXPECTED_MIGRATION_NAMES = {
+    1: "0001_init.sql",
+    2: "0002_content_hash_not_unique.sql",
+}
 
 
 def _object_sql(conn: Any, name: str, kind: str) -> str:
@@ -89,12 +92,19 @@ def test_fts5_virtual_tables_are_installed_and_queryable(applied_schema: Any) ->
 
 
 def test_migration_bookkeeping_and_checksum(applied_schema: Any) -> None:
-    rows = applied_schema.execute("SELECT version, name, checksum FROM schema_migration").fetchall()
-    assert len(rows) == 1, f"记账表应只有一条记录，实际 {len(rows)} 条"
-    version, name, checksum = rows[0]
-    assert version == db.MIGRATION_VERSION
-    assert name == EXPECTED_MIGRATION_NAME
-    assert checksum == db.migration_checksum(db.DEFAULT_MIGRATION_FILE.read_text(encoding="utf-8"))
+    rows = applied_schema.execute(
+        "SELECT version, name, checksum FROM schema_migration ORDER BY version"
+    ).fetchall()
+    assert [int(row[0]) for row in rows] == sorted(EXPECTED_MIGRATION_NAMES), (
+        f"记账的版本号与预期不符：实际 {[int(r[0]) for r in rows]}"
+    )
+    for version, name, checksum in rows:
+        version = int(version)
+        assert str(name) == EXPECTED_MIGRATION_NAMES[version], f"version {version} 的文件名不符"
+        path = db.DEFAULT_MIGRATIONS_DIR / str(name)
+        assert checksum == db.migration_checksum(path.read_text(encoding="utf-8")), (
+            f"version {version} 的结构指纹与文件不一致"
+        )
 
 
 def test_red_line_constraints_present(applied_schema: Any) -> None:
@@ -118,8 +128,14 @@ def test_red_line_constraints_present(applied_schema: Any) -> None:
     assert "submission_tier IN (0, 1, 2)" in content_sql
 
 
-def test_content_hash_index_is_partial(applied_schema: Any) -> None:
-    """软删后可重新导入同一内容：唯一索引必须排除 deleted_at 非空的行。"""
+def test_content_hash_index_is_partial_but_not_unique(applied_schema: Any) -> None:
+    """``content_hash`` 上是**部分**索引，但**不是唯一**索引。
+
+    v3.1 的 0002 迁移刻意把唯一性去掉了：``content_item.message_id`` 是 NOT NULL，
+    同一段文本出现在两条消息里必须能落两行；文本的精确重复交给 `dup_group_id` /
+    `canonical_id` 归组（DESIGN §3.6、§3.8）。部分条件仍然要求排除已软删的行，
+    这样"软删后可重新导入"依旧成立。
+    """
     candidates = {
         name: sql
         for name, sql in _index_sqls(applied_schema, "content_item").items()
@@ -127,7 +143,9 @@ def test_content_hash_index_is_partial(applied_schema: Any) -> None:
     }
     assert len(candidates) == 1, f"应恰好有一个 content_hash 索引，实际 {sorted(candidates)}"
     index_sql = next(iter(candidates.values()))
-    assert index_sql.startswith("CREATE UNIQUE INDEX")
+    assert not index_sql.startswith("CREATE UNIQUE INDEX"), (
+        "content_hash 不能是唯一索引：同文本跨消息必须能共存（0002 迁移）"
+    )
     assert "WHERE content_hash IS NOT NULL AND deleted_at IS NULL" in index_sql
 
 
@@ -158,19 +176,23 @@ def test_inbox_item_has_no_path_to_content_item(applied_schema: Any) -> None:
 
 
 def test_apply_migration_is_idempotent(applied_schema: Any) -> None:
-    result = db.apply_migration(applied_schema, db.DEFAULT_MIGRATION_FILE)
-    assert result["applied"] is False
-    assert result["reason"] == "already_applied"
+    result = db.apply_migration(applied_schema)
+    assert result["applied"] == [], f"已应用的库不该再应用任何版本：{result}"
+    assert result["skipped"] == sorted(EXPECTED_MIGRATION_NAMES)
+    assert result["drifted"] == []
 
 
 def test_database_status_reports_ok(applied_schema: Any) -> None:
-    status = db.database_status(applied_schema, db.DEFAULT_MIGRATION_FILE)
+    status = db.database_status(applied_schema)
     assert status["ok"] is True, f"status 未通过：{status}"
     assert status["missing_tables"] == ()
     assert status["deferred_present"] == ()
     assert status["unexpected_tables"] == ()
     assert status["checksum_drift"] is False
-    assert status["migration_version"] == db.MIGRATION_VERSION
+    assert status["migrations_missing"] == ()
+    assert status["migrations_unknown"] == ()
+    assert status["migrations_applied"] == tuple(sorted(EXPECTED_MIGRATION_NAMES))
+    assert status["migration_version"] == db.latest_migration_version()
     # PRAGMA 基线与完整性：体检结论必须同时覆盖这三项，否则「ok」没有意义
     assert str(status["journal_mode"]).lower() == "wal"
     assert status["foreign_keys"] is True

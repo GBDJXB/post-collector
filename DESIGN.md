@@ -299,7 +299,7 @@ user ─< user_source_scope >── source                     (L1 用户可读�
 
 **命名沿用既有实现**：本节沿用已经落地的表名与列名，包括三处为避开保留字而做的改名（`user` → `app_user`、`before`/`after` → `before_state`/`after_state`、`authorization` → `source_authorization`；详见 `migrations/postgres/0001_init.sql` 文件头与 AGENTS.md 的偏差声明）。本次重写**只换类型与语法，不换名字**，让后续迁移与全仓库引用都是机械替换。
 
-**本节是骨架摘录，可执行的权威定义在 `migrations/sqlite/0001_init.sql`**：下面的 DDL 片段为了可读性省略了部分 `NOT NULL`、`DEFAULT`、`CONSTRAINT` 命名与索引清单（例如 PG 版带 `DEFAULT now()` 的 61 处时间戳默认值，在这里全部写作 `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`）。**两者不一致时以迁移文件为准**，并应在同一次改动里回改本节——`pc db status` 与集成测试都以迁移文件为事实来源。两套 schema 的差异对照表见 `migrations/README.md`。
+**本节是骨架摘录，可执行的权威定义在 `migrations/sqlite/` 目录**（`0001_init.sql` 起，按序号追加）：下面的 DDL 片段为了可读性省略了部分 `NOT NULL`、`DEFAULT`、`CONSTRAINT` 命名与索引清单（例如 PG 版带 `DEFAULT now()` 的 61 处时间戳默认值，在这里全部写作 `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`）。**两者不一致时以迁移目录为准**，并应在同一次改动里回改本节——`pc db status` 与集成测试都以迁移文件为事实来源。两套 schema 的差异对照表见 `migrations/README.md`。
 
 通用约定：主键用 `INTEGER PRIMARY KEY`（rowid 别名，自增；对外暴露用 `uuid` 列避免枚举）；时间戳统一 `TEXT`（ISO-8601 UTC，毫秒精度，字典序即时间序）；软删除用 `deleted_at TEXT`；所有表带 `created_at`/`updated_at`；布尔用 `INTEGER` + `CHECK (col IN (0,1))`；JSON 用 `TEXT`（`json_valid` 校验、`json_extract` 读取）；数组用 `TEXT` 存 JSON 数组。
 
@@ -472,7 +472,10 @@ content_item(content_id INTEGER PRIMARY KEY, uuid TEXT, message_id INTEGER REFER
      CHECK (submission_tier IN (0,1,2)),
      CHECK (egress_state IN ('local_only','pending','cleared','denied','expired')))
 
-CREATE UNIQUE INDEX content_item_content_hash_key ON content_item (content_hash)
+-- content_hash 上是**普通**部分索引，刻意不是唯一索引：content_item.message_id 是
+-- NOT NULL，同一段文本出现在两条消息里必须能落两行；文本的精确重复交给
+-- dup_group_id / canonical_id 归组（见 3.6、3.8）。字节级硬约束在 media.sha256 上。
+CREATE INDEX content_item_content_hash_idx ON content_item (content_hash)
     WHERE content_hash IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX content_item_dup_group_idx ON content_item (dup_group_id) WHERE dup_group_id IS NOT NULL;
 CREATE INDEX content_item_nsfw_idx ON content_item (nsfw_level) WHERE nsfw_level >= 2;
@@ -922,6 +925,7 @@ v2 曾判定 SQLite"超出舒适区、本项目不推荐"，**v3 反转了这个
 
 - 精确重复（sha256 相同）→ 复用同一 media 行；
 - 近重复（pHash 相近、字节不同）→ 各自保留 media，用 `dup_group_id` 聚合、`canonical_id` 指向代表项；
+- **文本的精确重复同样归组，而不是禁止存在**：`content_item.content_hash` 上是**普通**部分索引（见 `0002_content_hash_not_unique.sql`）——`message_id` 是 NOT NULL，同一段文本出现在两条消息里必须能落两行。导入层命中同哈希时把新行指向已有行所在的组（`dup_group_id`/`canonical_id`），**字节层面的硬约束仍然在 `media.sha256` 上**；
 - **删除 canonical 项时，组内必须按 3.6 的优先级重选 canonical**——这是一条必须写成测试的状态转移，否则会出现"整组指向一个已删行"。
 
 **哈希墓地**
@@ -2119,6 +2123,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
 | **分发承诺收窄 + 基准场景扩充 + 模型供给流程**（v3.1） | 评审指出"全在 GitHub 内"不可字面兑现、分发成本被低估、模型供应链缺流程、搜索预算需真实数据验收 | 0 第 13 条与 10.1 改为**分路径说明自包含程度**（原生需 PyPI、单文件包自包含、镜像经 GHCR）并给出对照表；**阶段 1 只阻塞 uv 路径与 Windows 便携包**，macOS 公证与 Linux 打包移到阶段 2（9 阶段 1 验收⑫ 相应改写）；新增 **4.10**「本地模型的供给与升级」（固定 revision、许可证入注册表、权重哈希校验、离线导入、三档 Profile、CPU 预期、升级后重算）；5.6 增「验收方式」九类场景（中日文混排、2 字词、深分页、受限内容过滤、冷启动首查、后台写入并发、4 并发读者）；附录 A 增第 15、16 条 |
 | **存储引擎落地：设计与实现合并**（v3.1 实现） | 此前 v3/v3.1 只改了设计，代码仍跑在 PostgreSQL 上；评审把它列为 P0「设计与实现完全分叉」，本次把实现补齐 | 新增 `migrations/sqlite/0001_init.sql`（**权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个同步触发器 + 36 条索引）；原 `migrations/0001_init.sql` 移入 `migrations/postgres/` 并冻结；新增 `src/pc/adapters/sqlite.py` 取代 `postgres.py`（路径解析、PRAGMA 基线、单事务迁移、备份、FTS5 重建、设置层读写）；CLI 去掉 `--dsn`、新增 `pc db backup` 与 `pc db reindex`；测试从 101 条（需真实 PG、约 33 秒、Docker 未启动时 19 条报错）变为 **128 条（临时 SQLite 文件、0.5 秒、零外部依赖、永不跳过）**；`pyproject.toml` 去掉 `psycopg`；`docker-compose.yml` 去掉 `db` 服务；`.env.example`、`config/app.yaml`、`.gitignore`、`AGENTS.md`、`README.md`、`migrations/README.md` 同步。**回写** §3.2 与实现不一致的 5 个索引名、`content_item` 的两个派生列、`media.sha256` 的 NOT NULL、`link.risk_level`、`model_version.capability` 的 `manual`，并补 `job` 与 `schema_migration` 两张表；§5.1 的 FTS5 列划分与**实测**的 trigram 3 字门槛；§3.2 明确"本节是骨架摘录，权威定义在迁移文件" |
 | **PostgreSQL 路径退役**（v3.1 实现） | 存储引擎换完后，PG 已经不被任何代码引用；留着 compose 的 `db` 服务、归档迁移脚本与 `.env` 里的连接串，只会让人误以为还要用它 | 删除 `migrations/postgres/`（方言对照表移入 `migrations/README.md` 的"历史"一节）；`.env` 去掉 `POSTGRES_*` / `PC__DB__DSN` / `PC_TEST_DSN`；删除本机 `data/db` 的 PG 集群；宿主侧移除 `postgres:16-alpine` 镜像并回收构建缓存（合计约 1.6 GB）。AGENTS.md 与 README.md 的相关段落同步，`.gitignore` 不再提"PostgreSQL 卷"。**此后本项目不再需要 Docker**——它只是 §10.1 ③ 的可选隔离手段 |
+| **迁移器支持多文件 + 文本重复改为归组**（阶段 1 前置） | 动手实现"适配器 + 手动上传"时发现两个结构问题：① 迁移器只接受**单个**文件、版本号写死为 1，任何第二个 schema 改动都无从落地；② `content_item.content_hash` 的**唯一**索引无法表示"同一段文本出现在两条消息里"（`message_id` 是 NOT NULL），与 v3.1 修掉的 `media` 多对多缺陷同源 | `apply_migration` 改为**按序号应用整个 `migrations/sqlite/` 目录**：每个文件一个显式事务（某文件失败只回滚它自己）、只应用未记账的版本、**逐版本**比对结构指纹、`applied`/`skipped`/`drifted`/`checksum_backfilled` 分列报告；新增 `MigrationState.PENDING`（"已应用一部分"是正常升级路径），`PARTIAL` 收窄为"有业务表却零记账"；记账表 `schema_migration` 由适配器兜底创建；新增 `0002_content_hash_not_unique.sql` 把该索引降级为普通部分索引；§3.2 的索引定义与 §3.8 的"文本精确重复归组"语义同步；`pc db apply/status` 的 `--file` 改为 `--dir`；新增 `tests/test_migrations.py`（15 条） |
 | **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 
 ## 附录 B：参考组件

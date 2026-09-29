@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections.abc import Iterable, Iterator, Mapping
@@ -48,10 +49,11 @@ from typing import Any
 #: 默认路径（相对仓库根）
 DEFAULT_ENV_FILE = Path(".env")
 DEFAULT_APP_CONFIG = Path("config/app.yaml")
-DEFAULT_MIGRATION_FILE = Path("migrations/sqlite/0001_init.sql")
+#: 迁移目录（按序号应用其中的全部 ``*.sql``，见 :func:`discover_migrations`）
+DEFAULT_MIGRATIONS_DIR = Path("migrations/sqlite")
 
-#: 当前由代码认识的迁移版本（``schema_migration.version``）
-MIGRATION_VERSION = 1
+#: 基线迁移文件（0001）；保留它是因为测试与工具常需要"那份真正建表的文件"
+DEFAULT_MIGRATION_FILE = DEFAULT_MIGRATIONS_DIR / "0001_init.sql"
 
 #: 数据库文件名：数据根目录下的这一个文件就是全部持久状态（DESIGN §10.2）
 DB_FILENAME = "pc.sqlite3"
@@ -152,11 +154,12 @@ class SchemaMismatchError(MigrationError):
 
 
 class MigrationState(StrEnum):
-    """当前库相对于 0001 的状态。"""
+    """当前库相对迁移目录的状态。"""
 
-    EMPTY = "empty"  # 干净库：可以应用
-    APPLIED = "applied"  # 记账里有 version 1
-    PARTIAL = "partial"  # 脏库：有表但记账缺失，或有记账但表不全
+    EMPTY = "empty"  # 干净库：一张表都没有，可以全量应用
+    APPLIED = "applied"  # 预期版本全部已应用
+    PENDING = "pending"  # 已应用一部分，还有未应用的版本（正常的升级路径）
+    PARTIAL = "partial"  # 脏库：有业务表但一条记账都没有
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +600,86 @@ def is_fts_shadow_table(name: str) -> bool:
     return any(name.startswith(f"{virtual}_") for virtual in FTS_VIRTUAL_TABLES)
 
 
+@dataclass(frozen=True, slots=True)
+class MigrationFile:
+    """一个迁移文件：版本号来自文件名前缀（``0002_xxx.sql`` → 2）。"""
+
+    version: int
+    path: Path
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+#: 迁移文件名：``<序号>_<描述>.sql``
+_MIGRATION_FILENAME = re.compile(r"^(\d+)_(.+)\.sql$")
+
+#: 记账表由**适配器兜底创建**（0001 里也有，带 IF NOT EXISTS，等价）。
+#: 这样"迁移目录里恰好没写这张表"也不会让整个迁移器崩掉——记账表属于运行器的基础
+#: 设施，而不是某一版 schema 的业务内容；而且它不计入"业务表"（见 migration_state）。
+_SCHEMA_MIGRATION_DDL = """
+CREATE TABLE IF NOT EXISTS schema_migration (
+    version    INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL,
+    checksum   TEXT,
+    applied_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    note       TEXT
+) STRICT
+"""
+
+
+def discover_migrations(directory: Path | str = DEFAULT_MIGRATIONS_DIR) -> list[MigrationFile]:
+    """扫描迁移目录，按版本升序返回全部迁移文件。
+
+    规则（同时写在 ``migrations/README.md``）：
+
+    * 文件名形如 ``<序号>_<描述>.sql``，序号就是版本号；
+    * **序号必须从 1 连续**（1、2、3…）——断号会让"哪些已应用"变得不可回答；
+    * 同一序号只能有一个文件。
+
+    Raises:
+        MigrationError: 目录不存在、没有迁移文件、文件名不合规、序号重复或断号。
+    """
+    base = Path(directory)
+    if not base.is_dir():
+        raise MigrationError(
+            f"找不到迁移目录：{base}。请在仓库根目录运行，或用 --dir 指定路径。"
+        )
+
+    found: dict[int, Path] = {}
+    for path in sorted(base.iterdir()):
+        if not path.is_file():
+            continue
+        match = _MIGRATION_FILENAME.match(path.name)
+        if match is None:
+            if path.suffix == ".sql":
+                raise MigrationError(
+                    f"迁移文件名不合规：{path.name}；应形如 0002_描述.sql（前缀是版本号）。"
+                )
+            continue
+        version = int(match.group(1))
+        if version in found:
+            raise MigrationError(
+                f"迁移版本 {version} 出现了两个文件：{found[version].name} 与 {path.name}。"
+            )
+        found[version] = path
+
+    if not found:
+        raise MigrationError(f"迁移目录里没有任何 .sql 文件：{base}")
+    expected = list(range(1, len(found) + 1))
+    if sorted(found) != expected:
+        raise MigrationError(
+            f"迁移序号必须从 1 连续：实际 {sorted(found)}，期望 {expected}。"
+        )
+    return [MigrationFile(version=version, path=found[version]) for version in expected]
+
+
+def latest_migration_version(directory: Path | str = DEFAULT_MIGRATIONS_DIR) -> int:
+    """迁移目录里的最大版本号（也就是"这个程序认识的 schema 版本"）。"""
+    return discover_migrations(directory)[-1].version
+
+
 def applied_versions(conn: sqlite3.Connection) -> set[int]:
     """``schema_migration`` 里已记录的版本号；表不存在时返回空集。"""
     if "schema_migration" not in public_tables(conn):
@@ -605,116 +688,130 @@ def applied_versions(conn: sqlite3.Connection) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-def migration_state(conn: sqlite3.Connection) -> MigrationState:
-    """判断当前库相对 0001 处于什么状态。"""
+def migration_state(
+    conn: sqlite3.Connection, files: list[MigrationFile] | None = None
+) -> MigrationState:
+    """判断当前库相对迁移目录处于什么状态。
+
+    ``PENDING`` 是**正常**的升级路径（已应用一部分）；``PARTIAL`` 才是脏库
+    （有业务表却一条记账都没有），只有它会让 :func:`apply_migration` 拒绝动手。
+    """
+    expected = {f.version for f in (files if files is not None else discover_migrations())}
+    recorded = applied_versions(conn)
     actual = public_tables(conn)
     has_business_tables = bool(actual & (EXPECTED_TABLES - {"schema_migration"}))
-    if MIGRATION_VERSION in applied_versions(conn):
+
+    if not recorded:
+        return MigrationState.PARTIAL if has_business_tables else MigrationState.EMPTY
+    if expected <= recorded:
         return MigrationState.APPLIED
-    return MigrationState.PARTIAL if has_business_tables else MigrationState.EMPTY
+    return MigrationState.PENDING
 
 
-def recorded_checksum(conn: sqlite3.Connection) -> str | None:
-    """``schema_migration`` 里记录的 checksum；未记录时为 ``None``。"""
+def recorded_checksum(conn: sqlite3.Connection, version: int) -> str | None:
+    """某个版本在 ``schema_migration`` 里记录的 checksum；未记录时为 ``None``。"""
     if "schema_migration" not in public_tables(conn):
         return None
     row = conn.execute(
-        "SELECT checksum FROM schema_migration WHERE version = ?", (MIGRATION_VERSION,)
+        "SELECT checksum FROM schema_migration WHERE version = ?", (version,)
     ).fetchone()
     return str(row[0]) if row and row[0] else None
 
 
-def _store_checksum(conn: sqlite3.Connection, checksum: str) -> None:
+def _store_checksum(conn: sqlite3.Connection, version: int, checksum: str) -> None:
     conn.execute(
         "UPDATE schema_migration SET checksum = ? WHERE version = ?",
-        (checksum, MIGRATION_VERSION),
+        (checksum, version),
     )
 
 
-def _record_migration(conn: sqlite3.Connection, name: str, checksum: str) -> None:
-    """写入（或补齐）本次迁移的记账行；由 :func:`apply_migration` 在同一事务内调用。"""
+def _record_migration(conn: sqlite3.Connection, version: int, name: str, checksum: str) -> None:
+    """写入（或补齐）某个版本的记账行；由 :func:`apply_migration` 在同一事务内调用。"""
     conn.execute(
         "INSERT INTO schema_migration (version, name, checksum, applied_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT (version) DO UPDATE SET name = excluded.name, checksum = excluded.checksum",
-        (MIGRATION_VERSION, name, checksum, now_iso()),
+        (version, name, checksum, now_iso()),
     )
 
 
 def apply_migration(
-    conn: sqlite3.Connection, path: Path | str = DEFAULT_MIGRATION_FILE
+    conn: sqlite3.Connection, directory: Path | str = DEFAULT_MIGRATIONS_DIR
 ) -> dict[str, Any]:
-    """把整篇迁移应用到连接所在的库。
+    """把迁移目录里**尚未应用**的版本按序应用。
 
     行为契约：
 
-    * 干净库 -> 在**单个显式事务**内整篇执行，成功后写入记账行；失败整体回滚，
-      绝不留下半成品。
-    * 已应用 -> 不重复执行，返回 ``already_applied``；若 checksum 未记录则补记，
-      若 checksum 与文件不符则返回 ``checksum_drift`` 而**不覆盖**（漂移要被看见，
+    * 每个文件在**自己的显式事务**内整体执行，成功后写入该版本的记账行；某个文件失败
+      只回滚它自己，已成功的版本保持已应用（这是"一个文件一个事务"的取舍：比"全目录
+      一个大事务"更容易恢复，也不会因为第 3 个文件失败而回退掉前两个）。
+    * 已应用的版本不重复执行；若 checksum 未记录则补记（``checksum_backfilled``）。
+    * 已应用的版本与文件内容不符 -> 计入 ``drifted`` 而**不覆盖**（漂移要被看见，
       不该被抹掉）。
-    * 脏库（有表没记账，或有记账表不全）-> 抛 :class:`SchemaMismatchError`，
-      不猜测、不修补。
+    * 脏库（有业务表却一条记账都没有）-> 抛 :class:`SchemaMismatchError`，不猜测、不修补。
 
     Returns:
-        含 ``applied`` / ``reason`` / ``checksum`` 等键的结果字典。
+        含 ``applied`` / ``skipped`` / ``drifted`` / ``checksum_backfilled`` / ``statements``
+        的结果字典（``applied`` 等是版本号列表）。
     """
-    p = Path(path)
-    if not p.is_file():
-        raise MigrationError(
-            f"找不到迁移文件：{p}。请在仓库根目录运行，或用 --file 指定路径。"
-        )
-
-    sql = p.read_text(encoding="utf-8")
-    checksum = migration_checksum(sql)
-    state = migration_state(conn)
-
-    if state is MigrationState.APPLIED:
-        recorded = recorded_checksum(conn)
-        if recorded is None:
-            with transaction(conn):
-                _store_checksum(conn, checksum)
-            return {
-                "applied": False,
-                "reason": "already_applied",
-                "checksum": checksum,
-                "checksum_recorded": True,
-            }
-        return {
-            "applied": False,
-            "reason": "checksum_drift" if recorded != checksum else "already_applied",
-            "checksum": checksum,
-            "checksum_recorded": False,
-            "checksum_recorded_value": recorded,
-        }
-
+    files = discover_migrations(directory)
+    state = migration_state(conn, files)
     if state is MigrationState.PARTIAL:
         actual = sorted(public_tables(conn))
         raise SchemaMismatchError(
-            "数据库处于半成品状态：存在业务表但迁移记账不完整，或记账与表不一致。\n"
+            "数据库处于半成品状态：存在业务表但迁移记账完全缺失。\n"
             f"  实际表（{len(actual)} 张）：{', '.join(actual) or '(无)'}\n"
             "  本工具**不会**自动修补这种情况。建议先 `pc db backup` 留档，再删除该文件重建：\n"
             "    uv run pc db apply"
         )
 
-    statements = split_statements(sql)
-    try:
+    # 记账表是运行器的基础设施：先确保它存在，再谈"应用了哪些版本"
+    if "schema_migration" not in public_tables(conn):
         with transaction(conn):
-            for statement in statements:
-                conn.execute(statement)
-            _record_migration(conn, p.name, checksum)
-    except MigrationError:
-        raise
-    except Exception as exc:
-        raise MigrationError(
-            f"应用 {p.name} 失败，已在单事务内整体回滚，数据库未被改动。\n原始错误：{exc}"
-        ) from exc
+            conn.execute(_SCHEMA_MIGRATION_DDL)
+
+    recorded = applied_versions(conn)
+    applied: list[int] = []
+    skipped: list[int] = []
+    drifted: list[int] = []
+    backfilled: list[int] = []
+    statements_total = 0
+
+    for migration in files:
+        checksum = migration_checksum(migration.path.read_text(encoding="utf-8"))
+        if migration.version in recorded:
+            skipped.append(migration.version)
+            known = recorded_checksum(conn, migration.version)
+            if known is None:
+                with transaction(conn):
+                    _store_checksum(conn, migration.version, checksum)
+                backfilled.append(migration.version)
+            elif known != checksum:
+                drifted.append(migration.version)
+            continue
+
+        statements = split_statements(migration.path.read_text(encoding="utf-8"))
+        try:
+            with transaction(conn):
+                for statement in statements:
+                    conn.execute(statement)
+                _record_migration(conn, migration.version, migration.name, checksum)
+        except MigrationError:
+            raise
+        except Exception as exc:
+            raise MigrationError(
+                f"应用 {migration.name} 失败，已在单事务内整体回滚，该版本未被记账。\n"
+                f"  之前成功的版本仍然有效（每个文件一个事务）。\n原始错误：{exc}"
+            ) from exc
+        applied.append(migration.version)
+        statements_total += len(statements)
 
     return {
-        "applied": True,
-        "reason": "applied",
-        "checksum": checksum,
-        "checksum_recorded": True,
-        "statements": len(statements),
+        "applied": applied,
+        "skipped": skipped,
+        "drifted": drifted,
+        "checksum_backfilled": backfilled,
+        "statements": statements_total,
+        "latest": files[-1].version,
     }
 
 
@@ -730,18 +827,20 @@ def integrity_check(conn: sqlite3.Connection) -> str:
 
 
 def database_status(
-    conn: sqlite3.Connection, path: Path | str = DEFAULT_MIGRATION_FILE
+    conn: sqlite3.Connection, directory: Path | str = DEFAULT_MIGRATIONS_DIR
 ) -> dict[str, Any]:
-    """只读地报告「库里的结构是否与迁移一致」。
+    """只读地报告「库里的结构是否与迁移目录一致」。
 
     Returns:
         含下列键的字典（全部为只读探测结果）：
 
         ``sqlite_version`` / ``db_path`` / ``journal_mode`` / ``foreign_keys`` /
         ``fts_tables`` / ``fts_ok`` / ``integrity`` / ``tables`` / ``missing_tables`` /
-        ``unexpected_tables`` / ``deferred_present`` / ``state`` / ``migration_version`` /
-        ``migration_file_present`` / ``checksum_recorded`` / ``checksum_current`` /
-        ``checksum_drift`` / ``ok``
+        ``unexpected_tables`` / ``deferred_present`` / ``state`` /
+        ``migrations_expected`` / ``migrations_applied`` / ``migrations_missing`` /
+        ``migrations_unknown`` / ``migration_version`` / ``migrations_dir_present`` /
+        ``checksum_drift_versions`` / ``checksum_unrecorded_versions`` /
+        ``checksum_recorded`` / ``checksum_drift`` / ``ok``
     """
     actual = public_tables(conn)
     expected = set(EXPECTED_TABLES)
@@ -749,30 +848,51 @@ def database_status(
     unexpected = tuple(sorted(actual - expected))
     deferred_present = tuple(sorted(DEFERRED_TABLES & actual))
 
-    p = Path(path)
-    file_present = p.is_file()
-    checksum_current = migration_checksum(p.read_text(encoding="utf-8")) if file_present else ""
-    checksum_recorded = recorded_checksum(conn)
-    drift = bool(checksum_recorded and checksum_current and checksum_recorded != checksum_current)
+    base = Path(directory)
+    dir_present = base.is_dir()
+    files: list[MigrationFile] = []
+    if dir_present:
+        try:
+            files = discover_migrations(base)
+        except MigrationError:
+            files = []
+    expected_versions = tuple(f.version for f in files)
+    actual_versions = applied_versions(conn)
+    missing_versions = tuple(v for v in expected_versions if v not in actual_versions)
+    unknown_versions = tuple(sorted(actual_versions - set(expected_versions)))
 
-    state = migration_state(conn)
+    drift_versions: list[int] = []
+    backfillable: list[int] = []
+    for migration in files:
+        if migration.version not in actual_versions:
+            continue
+        known = recorded_checksum(conn, migration.version)
+        current = migration_checksum(migration.path.read_text(encoding="utf-8"))
+        if known is None:
+            backfillable.append(migration.version)
+        elif known != current:
+            drift_versions.append(migration.version)
+
+    state = migration_state(conn, files) if files else MigrationState.PARTIAL
     present_fts = fts_tables(conn)
     fts_ok = set(FTS_VIRTUAL_TABLES).issubset(present_fts)
     journal_mode = pragma_value(conn, "journal_mode") or "unknown"
     foreign_keys = (pragma_value(conn, "foreign_keys") or "0") == "1"
     integrity = integrity_check(conn)
+    applied_max = max(actual_versions) if actual_versions else None
 
     ok = (
         state is MigrationState.APPLIED
         and not missing
         and not deferred_present
+        and not unknown_versions
         and fts_ok
         and journal_mode.lower() == "wal"
         and foreign_keys
         and integrity == "ok"
-        # 拿不到迁移文件就无法比对结构指纹，此时不能声称「一致」
-        and file_present
-        and not drift
+        # 拿不到迁移目录就无法比对结构指纹，此时不能声称「一致」
+        and dir_present
+        and not drift_versions
     )
 
     db_path = database_file_of(conn)
@@ -789,11 +909,16 @@ def database_status(
         "unexpected_tables": unexpected,
         "deferred_present": deferred_present,
         "state": str(state),
-        "migration_version": MIGRATION_VERSION if state is MigrationState.APPLIED else None,
-        "migration_file_present": file_present,
-        "checksum_recorded": checksum_recorded,
-        "checksum_current": checksum_current,
-        "checksum_drift": drift,
+        "migrations_expected": expected_versions,
+        "migrations_applied": tuple(sorted(actual_versions)),
+        "migrations_missing": missing_versions,
+        "migrations_unknown": unknown_versions,
+        "migration_version": applied_max,
+        "migrations_dir_present": dir_present,
+        "checksum_drift_versions": tuple(drift_versions),
+        "checksum_unrecorded_versions": tuple(backfillable),
+        "checksum_recorded": bool(actual_versions) and not backfillable,
+        "checksum_drift": bool(drift_versions),
         "ok": ok,
     }
 
@@ -1094,11 +1219,11 @@ __all__ = [
     "DB_FILENAME",
     "DEFAULT_APP_CONFIG",
     "DEFAULT_ENV_FILE",
+    "DEFAULT_MIGRATIONS_DIR",
     "DEFAULT_MIGRATION_FILE",
     "DEFERRED_TABLES",
     "EXPECTED_TABLES",
     "FTS_VIRTUAL_TABLES",
-    "MIGRATION_VERSION",
     "MIN_SQLITE_VERSION",
     "PRAGMA_BASELINE",
     "SETTING_CHANGE_VIA",
@@ -1106,6 +1231,7 @@ __all__ = [
     "DatabaseError",
     "DatabaseUnavailableError",
     "MigrationError",
+    "MigrationFile",
     "MigrationState",
     "ResolvedPath",
     "SchemaMismatchError",
@@ -1118,11 +1244,13 @@ __all__ = [
     "database_file_of",
     "database_status",
     "default_data_root",
+    "discover_migrations",
     "ensure_version_gate",
     "fts_tables",
     "integrity_check",
     "is_comment_only",
     "is_fts_shadow_table",
+    "latest_migration_version",
     "migration_checksum",
     "migration_state",
     "now_iso",

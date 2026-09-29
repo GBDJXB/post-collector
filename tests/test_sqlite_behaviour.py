@@ -21,7 +21,7 @@ import pytest
 from pc.adapters import sqlite as db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MIGRATION = REPO_ROOT / db.DEFAULT_MIGRATION_FILE
+MIGRATIONS_DIR = REPO_ROOT / db.DEFAULT_MIGRATIONS_DIR
 
 #: 造数据用的固定 sha256（STRICT 表不校验长度，但列语义要求 64 个十六进制字符）
 SHA256 = "a" * 64
@@ -29,10 +29,10 @@ SHA256 = "a" * 64
 
 @pytest.fixture
 def behaviour_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
-    """函数级干净库：已应用 0001，测试之间互不影响。"""
+    """函数级干净库：已应用全部迁移，测试之间互不影响。"""
     conn = db.connect(tmp_path / "behaviour.sqlite3")
     try:
-        db.apply_migration(conn, MIGRATION)
+        db.apply_migration(conn, MIGRATIONS_DIR)
         yield conn
     finally:
         conn.close()
@@ -164,27 +164,32 @@ def test_version_gate_fails_closed_with_human_readable_hint() -> None:
 
 
 def test_migration_rolls_back_ddl_atomically(tmp_path: Path) -> None:
-    """整篇单事务：``CREATE TABLE`` 也要跟着回滚。
+    """单个文件失败只回滚它自己：``CREATE TABLE`` 也要跟着回滚。
 
     Python 3.12 起 DDL 不再隐式开启事务，因此这条断言是在守
     「适配器显式 BEGIN IMMEDIATE」这个实现选择，而不是在守 SQLite 的默认行为。
     """
-    broken = tmp_path / "9999_broken.sql"
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
     broken_sql = (
         "CREATE TABLE probe_table (a INTEGER);\n"
         "THIS IS NOT VALID SQL;\n"
     )
-    broken.write_text(broken_sql, encoding="utf-8")
+    (migrations / "0001_broken.sql").write_text(broken_sql, encoding="utf-8")
     # 反空转：确认切分出来的确实是两条语句——否则「库是空的」只是因为 CREATE 根本没跑
     assert len(db.split_statements(broken_sql)) == 2
 
     conn = db.connect(tmp_path / "rollback.sqlite3")
     try:
         with pytest.raises(db.MigrationError) as excinfo:
-            db.apply_migration(conn, broken)
+            db.apply_migration(conn, migrations)
         assert "整体回滚" in str(excinfo.value)
-        assert db.public_tables(conn) == set(), "DDL 没有回滚，库里留下了半成品表"
-        assert db.migration_state(conn) is db.MigrationState.EMPTY
+        # 记账表是运行器自己兜底建的（基础设施），不属于业务表；探针表必须消失
+        assert db.public_tables(conn) == {"schema_migration"}, "DDL 没有回滚，留下了半成品表"
+        assert db.applied_versions(conn) == set(), "失败的版本不该被记账"
+        assert db.migration_state(conn, db.discover_migrations(migrations)) is (
+            db.MigrationState.EMPTY
+        )
     finally:
         conn.close()
 
@@ -221,7 +226,7 @@ def test_split_statements_handles_literals_and_comments() -> None:
 
 def test_checksum_drift_is_reported_but_not_applied(tmp_path: Path) -> None:
     """结构指纹：改注释不漂移、改 DDL 必须漂移，且漂移只被报告、不被执行。"""
-    real_sql = MIGRATION.read_text(encoding="utf-8")
+    real_sql = (MIGRATIONS_DIR / "0001_init.sql").read_text(encoding="utf-8")
 
     # 单元级：整行注释不参与指纹（迁移文件头就是用来追加修订记录的）
     assert db.migration_checksum(f"-- 修订记录：无结构变化\n{real_sql}") == db.migration_checksum(
@@ -230,27 +235,32 @@ def test_checksum_drift_is_reported_but_not_applied(tmp_path: Path) -> None:
     ddl_changed = f"{real_sql}\nCREATE INDEX probe_idx ON content_item (lang);\n"
     assert db.migration_checksum(ddl_changed) != db.migration_checksum(real_sql)
 
+    # 用一个只含 0001 的临时迁移目录，这样"改文件"不会碰到真实仓库里的其他版本
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    target = migrations / "0001_init.sql"
+    target.write_text(real_sql, encoding="utf-8")
+
     conn = db.connect(tmp_path / "drift.sqlite3")
     try:
-        applied = db.apply_migration(conn, MIGRATION)
-        assert applied["applied"] is True
+        applied = db.apply_migration(conn, migrations)
+        assert applied["applied"] == [1]
+        assert applied["drifted"] == []
 
-        commented = tmp_path / "commented.sql"
-        commented.write_text(f"-- 修订记录：无结构变化\n{real_sql}", encoding="utf-8")
-        result = db.apply_migration(conn, commented)
-        assert result["applied"] is False
-        assert result["reason"] == "already_applied", "整行注释的增删不该被报成漂移"
+        target.write_text(f"-- 修订记录：无结构变化\n{real_sql}", encoding="utf-8")
+        result = db.apply_migration(conn, migrations)
+        assert result["applied"] == []
+        assert result["drifted"] == [], "整行注释的增删不该被报成漂移"
 
-        drifted = tmp_path / "drifted.sql"
-        drifted.write_text(
+        target.write_text(
             f"{real_sql}\nCREATE INDEX probe_drift_idx ON content_item (lang);\n",
             encoding="utf-8",
         )
-        result = db.apply_migration(conn, drifted)
-        assert result["applied"] is False
-        assert result["reason"] == "checksum_drift"
+        result = db.apply_migration(conn, migrations)
+        assert result["applied"] == []
+        assert result["drifted"] == [1], "改过 DDL 的已应用版本必须被报成漂移"
         # 漂移要被看见，不该被抹掉（记账仍然是原文件的指纹），也不该顺带执行
-        assert db.recorded_checksum(conn) == db.migration_checksum(real_sql)
+        assert db.recorded_checksum(conn, 1) == db.migration_checksum(real_sql)
         assert _scalar(
             conn, "SELECT count(*) FROM sqlite_master WHERE name = 'probe_drift_idx'"
         ) == 0, "漂移的迁移文件不该被执行"
