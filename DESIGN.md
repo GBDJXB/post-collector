@@ -1,6 +1,6 @@
 # post-collector 可行性评估与方案设计
 
-版本：v2 设计基线（含三层用户模型、容量管理、角色特征识别与 AI 外发待审放行）
+版本：v3 设计基线（以 SQLite 单文件取代 PostgreSQL，解除 Docker 硬依赖，下载到使用全在 GitHub 内完成）
 受众：后续开发者、维护者、root 用户
 范围：架构、数据模型、算法与安全方案。本文不含实现代码，不含测试。
 
@@ -10,22 +10,24 @@
 
 ## 0. 结论摘要（TL;DR）
 
-**可行，且适合作为单人/小团队项目落地。** 按确认后的量级（存量约 10 万条、日增约 100 条），这是一个**单机、单库、无队列中间件**就能轻松承载的负载。真正的风险不在架构，而集中在四处：平台接入合规性、二次元角色识别准确率、匿名提报入口的滥用、以及把内容送进 AI 服务商的隐私与注入面。方案对这四处都给出了明确的兜底设计。
+**可行，且适合作为单人/小团队项目落地。** 按确认后的量级（存量约 10 万条、日增约 100 条），这是一个**单机、单文件、零服务进程**就能轻松承载的负载。真正的风险不在架构，而集中在四处：平台接入合规性、二次元角色识别准确率、匿名提报入口的滥用、以及把内容送进 AI 服务商的隐私与注入面。方案对这四处都给出了明确的兜底设计。
 
-十条核心判断：
+核心判断如下（v3 由 12 条扩为 14 条，新增分发与容量两条）：
 
 1. **接入模式分级**。官方 Bot API + 用户主动授权导出/转发（官方"保存到收藏"/"转发到私有频道"）是长期稳定的唯一路径。浏览器自动化会话劫持、私有接口逆向、付费墙绕过属于高风险，不予设计支持。
-2. **不做"分布式优先"**。10 万存量 / 日增 100 的负载用 PostgreSQL + 本地目录 + 单机 Docker Compose 绰绰有余，甚至在树莓派级硬件上都能跑。Kafka、Kubernetes、微服务、OpenSearch 在这个量级是纯负担。容量管理靠**滚动删除与分层保留**（见 7.5），不靠扩容。
-3. **队列用数据库，不用消息中间件**。任务表 + `FOR UPDATE SKIP LOCKED` + 状态机 + 死信状态，配合幂等键，可覆盖重试、去重、人工复核全部需求，且零额外运维。
+2. **不做"分布式优先"，也不需要数据库服务**。10 万存量 / 日增 100 的负载用一个 SQLite 单文件 + 本地媒体目录就绰绰有余，在树莓派级硬件上都能跑。Kafka、Kubernetes、微服务、OpenSearch、以及"另起一个数据库进程"在这个量级都是纯负担；Docker 也从必需依赖降为**可选的隔离手段**（见 10.1）。容量管理靠**滚动删除与分层保留**（见 7.5），不靠扩容。
+3. **队列用数据库表，不用消息中间件**。SQLite 任务表 + `BEGIN IMMEDIATE` 原子抢占 + 状态机 + 死信状态，配合幂等键，可覆盖重试、去重、人工复核全部需求，且零额外运维。代价是**单写者**：写事务必须短，批量作业必须分批（见 2.3、3.7）。
 4. **原始层不可变、派生层可重算**。所有模型输出必须带 `model_version` 与 `prompt_version`，全库重新分类是一条 SQL 加一个任务批次，而不是数据迁移。
 5. **图片能力本地优先**。Danbooru 系 tagger（WD 系列）、感知哈希、图像 embedding 全部本地跑；第三方反查 API（SauceNAO/IQDB/ascii2d）只作为低置信度条目的按需补充，默认关闭。
 6. **角色识别不直接"判定角色"，而是分解为可独立验证的特征 tag 再组合投票**（双马尾 + 蓝发 → 初音未来）。识别失败不丢进无意义的"未分类"，而是按标志性特征归档到 `unclassified/by_hair_color` 这类可浏览、可继续检索的分类桶（见 4.9）。这是对"角色识别准确率天然低"最务实的应对：低置信度的角色标签降级为特征标签，信息不丢失。
 7. **LLM 负责"摘要、命名、建议标签、难例判定"，不负责"事实、权限、去重、安全判定、入库"**。任何 LLM 输出都必须经过 schema 校验与白名单，且不能直接触发工具或写操作。
-8. **搜索分三阶段演进**：PostgreSQL FTS/`pg_trgm` → Meilisearch（中文与容错检索）→ 混合检索（BM25 + 向量 + 重排），检索层始终在接口后面，可替换。
+8. **搜索分三阶段演进**：SQLite FTS5（BM25 + 三元组，中文分词在应用层）→ 可选 Meilisearch（中文与容错更强）→ 混合检索（BM25 + 向量 + 重排）。向量检索的选型**推迟到阶段 3**（见 5.2、5.3），检索层始终在接口后面、可替换。
 9. **AI 外发采用"默认不外发 + 待审队列 + 批量审阅放行"**。所有新内容先由本地模型打标并可正常检索；只有 `egress_state='cleared'` 的内容才有资格送第三方 AI。放行粒度是**内容 + 服务商 + 用途**，不是全局开关。受本地能力限制需要外发的高价值内容进队列，root 审阅后批量放行——这是"没有完美方案"时唯一可接受的工程折中（见 6.3）。
 10. **链接与媒体默认视为恶意**：默认禁网段、禁重定向跨域、强制字节上限与解压比上限、EXIF 位置信息清除、SVG/PDF 走隔离渲染。
 11. **匿名提报入口（L2）是独立子系统**，落 `inbox_item` 隔离区，审查前对主库与检索零副作用，且默认恶意、严格配额（见 6.1、3.3）。
-12. **一切基础设施可替换**：存储后端、模型提供方、索引、通知渠道都在端口/适配器后面。唯一"重"依赖是 PostgreSQL，它同时承担事实源、任务队列与全文索引，且迁移成本可控。
+12. **一切基础设施可替换，且没有外部服务依赖**：存储后端、模型提供方、索引、通知渠道都在端口/适配器后面；唯一的持久状态是**一个 SQLite 文件 + 一个媒体目录**。数据库访问收敛在单一适配器模块内（见 9.2），将来若要迁到 PostgreSQL，只替换该适配器，业务层不动。
+13. **下载到使用全在 GitHub 内完成**：代码、Release 产物、容器镜像都在同一个 GitHub 账号体系下。原生安装（`uv tool install` / `pipx`）是主路径，单文件可执行包面向不想碰命令行的人，Docker 镜像只作为**可选的隔离运行方式**（见 10.1）。用户不需要 Docker、不需要数据库服务，也不需要访问任何第三方站点。
+14. **容量有明确承诺与口径**：实测每条内容项约 6 KB（含标签与两个 FTS 索引，5,000 条规模），10 万条约 0.6–0.9 GB；舒适区为 10 万–100 万条，上限由可用内存决定（工程经验值约为可用内存的三分之一）。实测与推算的分界见 3.7。
 
 ---
 
@@ -49,20 +51,23 @@
 - 不做模型训练与微调（只做推理与评估集积累）。
 - 不做未成年人相关内容的收集、索引与检索优化；命中即标记为受限并默认不可检索（见 6.5）。
 - 不为 L2 匿名提报者提供任何账号、历史记录或检索能力；不承诺对匿名提报的留存（可配置为"仅保留待审期"）。
+- **不承诺多用户、远程并发访问与服务化部署**。SQLite 是单写者，多人同时写入、跨机访问或需要独立数据库服务时，应迁移到 PostgreSQL（迁移路径见 3.5）；本设计不为此预先增加复杂度。
 
 ### 1.2 关键假设
 
 | 编号 | 假设 | 若假设不成立的影响 |
 |---|---|---|
 | A1 | root 用户对采集来源拥有授权（自己的账号、自己管理的群/频道、或已取得管理者同意） | 合规基础失效，方案不适用 |
-| A2 | 部署为单机或单台家用服务器/NAS，有至少 4 核 CPU、8 GB 内存、可用 GPU 可选 | 本地视觉模型不可用，需全部走 API，成本与隐私恶化 |
+| A2 | 部署为单机或单台家用服务器/NAS，有至少 4 核 CPU、8 GB 内存，可用 GPU 可选；**用户不需要预装数据库服务，也不需要 Docker** | 本地视觉模型不可用，需全部走 API，成本与隐私恶化 |
 | A3 | 内容以中文/日文/英文混合为主，二次元图片占比高 | 中文分词与二次元 tagger 的价值下降 |
-| A4 | **存量约 10 万条内容，日新增约 100 条**，媒体单文件通常 < 20 MB | 若日增上到 5000 条或存量到千万级，本地模型吞吐与索引策略需重新设计（本文 7.5、8.3 已给出触发点） |
+| A4 | **存量约 10 万条内容，日新增约 100 条**，媒体单文件通常 < 20 MB（本地实测：每条内容项约 6 KB 元数据与索引，见 3.7） | 若日增上到 5000 条或存量到千万级，本地模型吞吐与索引策略需重新设计（本文 7.5、8.3 已给出触发点） |
 | A5 | 允许使用第三方 LLM API，但**默认不启用**，且需 root 逐批审阅放行 | 只能用本地模型，分类质量下降、硬件要求上升 |
 | A6 | 平台提供的官方接口在项目周期内保持可用（需核实） | 连接器需要替换，架构上已隔离（见 1.3） |
 | A7 | 用户数极少（1 个 root + 少量 L1），L2 为开放入口 | 需要真正的多租户与配额体系，MVP 方案需升级 |
 | A8 | 硬件可满足本地 tagger 推理（有 GPU 最优，无 GPU 亦可接受批处理延迟） | 打标延迟上升或必须依赖外部服务，隐私与成本恶化 |
 | A9 | **root 用户可能不具备编程能力**，也可能愿意直接改配置 | 前者要求所有日常操作与调参在界面上完成（见 6.2）；后者要求配置可深改、可脚本化、可解释来源。两者都必须支持，不能二选一 |
+| A10 | 用户能提供 Python 3.12+ 运行环境，**或**愿意使用随 GitHub Release 分发的单文件可执行包；两者都不需要 Docker | 安装门槛回到容器，与 1.1 的"零服务依赖"取向冲突（见 10.1） |
+| A11 | 部署机上有可写的数据目录（平台默认的用户数据目录或用户显式指定的路径），媒体目录允许独立指向大容量盘或 NAS | 需要改用容器卷或调整目录权限（见 10.2） |
 
 ### 1.3 平台接入模式可行性分级
 
@@ -96,13 +101,13 @@
 ### 1.5 版本能力范围
 
 **MVP（2~4 周，单人可完成）**
-单机本地部署；2~3 个来源适配器（建议 Telegram Bot + RSS + 官方导出导入）；**三层用户与权限**（root 认证 + TOTP、L1 指定转发用户带 scope、L2 匿名提报走隔离收件箱）；文本/图片/链接/图文混合的基础解析；SHA-256 去重 + 感知哈希近重复；**AI 参与度可设为"完全不参与（纯手动）"，此时不加载任何模型，内容进待人工分类队列**（见 4.7）；参与度设为"仅本机"时用 WD tagger 打标（含特征 tag 拆分与 `unclassified/by_*` 归档桶）；PostgreSQL 单库 + 本地目录存储；基于 tag / 关键词 / 来源 / 时间 / 类型的过滤检索；Web 界面：列表、详情、tag 编辑、**手动分类台（键盘优先）**、批量重分类、软删与恢复、**提报收件箱审核台**；**容量管理**：磁盘水位监控 + 手动/自动滚动删除 + 保留策略配置；安全基线：MIME 校验、EXIF 剥离、字节上限、链接不自动抓取（仅记录）、**AI 外发默认关闭且无外发代码路径**。
+单机本地部署（**无需数据库服务、无需 Docker**）；2~3 个来源适配器（建议 Telegram Bot + RSS + 官方导出导入）；**三层用户与权限**（root 认证 + TOTP、L1 指定转发用户带 scope、L2 匿名提报走隔离收件箱）；文本/图片/链接/图文混合的基础解析；SHA-256 去重 + 感知哈希近重复；**AI 参与度可设为"完全不参与（纯手动）"，此时不加载任何模型，内容进待人工分类队列**（见 4.7）；参与度设为"仅本机"时用 WD tagger 打标（含特征 tag 拆分与 `unclassified/by_*` 归档桶）；**SQLite 单文件 + 本地目录存储**；基于 tag / 关键词 / 来源 / 时间 / 类型的过滤检索；Web 界面：列表、详情、tag 编辑、**手动分类台（键盘优先）**、批量重分类、软删与恢复、**提报收件箱审核台**；**容量管理**：磁盘水位监控 + 手动/自动滚动删除 + 保留策略配置；**原生安装与升级**（`uv tool install` / `pipx`，或单文件包，见 10.1）；安全基线：MIME 校验、EXIF 剥离、字节上限、链接不自动抓取（仅记录）、**AI 外发默认关闭且无外发代码路径**。
 
 **推荐版本（1~3 个月，个人长期使用）**
-PostgreSQL + MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+ 倒排过滤；**内容待审队列 + 批量审阅放行工作流 + 服务商策略登记**（见 6.3）；AI 参与度可切到 `assist`：LLM 摘要与建议标签（脱敏 + 注入防护 + schema 校验 + 一键采纳），敏感度判定仍由本地多信号投票向上取整；角色识别走**特征组合投票 + 自建参考库**（第三方反查按需开启）；链接沙箱抓取（禁内网、限重定向、限大小）；相似图检索与聚类；任务队列状态机、重试、死信与人工复核台；审计日志、备份脚本、健康指标与告警；**自动滚动删除与冷热分层**；可插拔模型注册表与模型版本迁移。
+SQLite（WAL 调优；若出现多用户或远程访问需求则迁 PostgreSQL，见 3.5）+ MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+ 倒排过滤（**触发条件：FTS5 的中文与容错不足**，见 5.3）；**内容待审队列 + 批量审阅放行工作流 + 服务商策略登记**（见 6.3）；AI 参与度可切到 `assist`：LLM 摘要与建议标签（脱敏 + 注入防护 + schema 校验 + 一键采纳），敏感度判定仍由本地多信号投票向上取整；角色识别走**特征组合投票 + 自建参考库**（第三方反查按需开启）；链接沙箱抓取（禁内网、限重定向、限大小）；相似图检索与聚类；任务队列状态机、重试、死信与人工复核台；审计日志、备份脚本（`VACUUM INTO` + 校验，见 7.1）、健康指标与告警；**自动滚动删除与冷热分层**；可插拔模型注册表与模型版本迁移。
 
 **长期版本（6~12 个月+）**
-混合检索（BM25 + 向量 + RRF 融合 + LLM 重排）；自然语言查询（查询理解 → 结构化过滤器 + 语义检索）；以图搜图（上传图片 → embedding → 候选 → 感知哈希校验）；多用户与租户隔离（RBAC、配额、独立存储后端）；多存储后端与冷热分层；多来源高并发采集（外部队列、限流器、熔断）；模型评估集与回归评测流水线；自动 tag 治理（合并、拆分、同义词、层级重构建议）；**角色特征权重的自学习**（用人工纠正样本持续校准特征→角色的打分）。
+混合检索（BM25 + 向量 + RRF 融合 + LLM 重排；**向量方案在阶段 3 选型**，见 5.2）；自然语言查询（查询理解 → 结构化过滤器 + 语义检索）；以图搜图（上传图片 → embedding → 候选 → 感知哈希校验）；多用户与租户隔离（**该阶段需要迁移到服务型数据库**，见 3.5）；多存储后端与冷热分层；多来源高并发采集（限流器、熔断）；模型评估集与回归评测流水线；自动 tag 治理（合并、拆分、同义词、层级重构建议）；**角色特征权重的自学习**（用人工纠正样本持续校准特征→角色的打分）。
 
 ---
 
@@ -133,7 +138,7 @@ PostgreSQL + MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+
                         └────────────────────────────────┬────────────────────────────────┘
                                                          │
    ┌─────────────────────────────────────────────────────▼────────────────────────────────────────────────┐
-   │  L3 处理层  Async Workers（可水平扩，单机多进程即可）                                                │
+   │  L3 处理层  Workers（默认单进程内含调度线程；多进程可选，见 10.3）                                 │
    │                                                                                                      │
    │  ① normalize   文本规范化/语言识别/转发链展开                                                        │
    │  ② scan        安全扫描：MIME 嗅探、病毒、压缩炸弹、SVG/PDF、URL 检查、注入特征                      │
@@ -143,15 +148,15 @@ PostgreSQL + MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+
    │  ⑥ classify    规则优先 → 本地模型（tagger/OCR/NSFW/embedding/特征→角色打分）→ 置信度不足才考虑外发  │
    │  ⑦ link        链接沙箱抓取（OG 解析，禁内网/限重定向/限大小）                                       │
    │  ⑧ tag         候选标签生成（带 source/confidence/evidence）→ 冲突消解 → 角色失败落 char_bucket      │
-   │  ⑨ index       写入检索索引（FTS/Meilisearch）+ 向量库                                               │
+   │  ⑨ index       写入检索索引（FTS5 / 可选 Meilisearch）+ 向量库（阶段 3 再定，见 5.2）                │
    │  ⑩ persist     内容项定稿、缩略图、元数据、审计                                                      │
    │  ⑪ egress      外发资格判定：默认 local_only；需外发者标记 pending 入队，不在此处发起调用            │
    └───────┬─────────────────────────┬──────────────────────────┬─────────────────────────────────────────┘
            │                         │                          │
    ┌───────▼────────┐      ┌─────────▼──────────┐     ┌─────────▼─────────────┐
-   │ PostgreSQL     │      │ 媒体存储（端口）   │     │ 检索层（端口）        │
-   │ 事实源/队列/   │      │ 本地目录 / NAS /   │     │ PG FTS·pgvector /     │
-   │ 关系/审计      │      │ MinIO S3 / 云盘    │     │ Meilisearch（可选）   │
+   │ SQLite 单文件  │      │ 媒体存储（端口）   │     │ 检索层（端口）        │
+   │ 事实源/队列/   │      │ 本地目录 / NAS /   │     │ FTS5（库内）/         │
+   │ FTS/关系/审计  │      │ MinIO S3 / 云盘    │     │ Meilisearch（可选）   │
    └───────┬────────┘      └─────────┬──────────┘     └─────────┬─────────────┘
            │                         │                          │
            └─────────────┬───────────┴──────────────┬───────────┘
@@ -170,25 +175,25 @@ PostgreSQL + MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+
 
 | 组件 | 选型 | 理由 |
 |---|---|---|
-| 主数据库 | PostgreSQL 16+ | 事实源 + 任务队列 + FTS + JSONB 元数据，一个组件顶三个 |
-| 任务队列 | PostgreSQL 任务表 + `SKIP LOCKED` | 零运维、事务一致、可人工干预；量级远未到需要中间件 |
-| Worker 运行时 | Python 3.12 + 进程池 / RQ / Dramatiq | 生态与 AI 库一致 |
+| 主数据库 | SQLite（Python 标准库 `sqlite3`，最低 3.40） | 事实源 + 任务队列 + FTS5 + JSON 元数据，一个文件顶三个；**零服务进程、零运维、单文件备份** |
+| 任务队列 | SQLite 任务表 + `BEGIN IMMEDIATE` 原子抢占 | 零运维、事务一致、可人工干预；**单写者**，写事务必须短、批量必须分批（见 2.3） |
+| Worker 运行时 | Python 3.12 + 单进程内调度线程（多进程可选） | 生态与 AI 库一致；单写者语义下单进程最省心（见 10.3） |
 | 媒体存储 | 本地目录（S3 兼容接口抽象） | 个人部署最省事，接口留出 S3 |
 | 图像标签 | WD 系 tagger（本地 ONNX/PyTorch） | 二次元场景成熟、可自托管、零 API 成本 |
 | 感知哈希 | pHash / dHash / aHash + 可选 CLIP embedding | 近重复与相似图的低成本主力 |
-| 全文检索（阶段 1） | PostgreSQL FTS + `pg_trgm` | 无需额外服务，先跑起来 |
+| 全文检索（阶段 1） | SQLite FTS5（`trigram` + 预分词 `unicode61` 双索引） | 无需额外服务；中文分词放在应用层，不依赖任何数据库扩展（见 5.1） |
 | 安全网关 | 自研模块：URL 策略、MIME 校验、脱敏、注入检测 | 本项目特有，无现成组件 |
 | 提报收件箱 | 自研模块 + `inbox_item` 表 + 审核台 UI | L2 匿名入口必须与主库隔离，这是权限模型的地基 |
 | 容量管理 | 保留策略引擎 + 滚动删除任务 + 磁盘水位监控 | 10 万条 + 日增 100 条最终会撞上磁盘上限，必须内建而非事后补救 |
 | 设置层 | 声明式注册表（YAML）+ `setting` 表 + 热更新 | root 兼有开发者与非技术用户两种画像，配置必须既能安全调又能深改（见 6.2） |
 | API + Web UI | FastAPI + 前端框架（Next.js 或轻量 SPA） | 检索、人工纠错、审查台、设置页必须有好用的界面 |
-| 部署 | Docker Compose | 单命令起停，低维护 |
+| 部署 | 原生安装（`uv tool install` / `pipx` / 单文件包）；Docker **可选**，仅作隔离 | 单命令安装与升级；用户不需要数据库服务，也不需要 Docker（见 10.1） |
 
 **可选组件（推荐版本加入）**
 
 | 组件 | 触发条件 |
 |---|---|
-| Meilisearch | 中文/日文检索质量或容错需求超过 PG FTS（几乎必然会触发） |
+| Meilisearch | FTS5 的中文检索质量或容错不足（2 字词、错字、排序不满意；见 5.3） |
 | MinIO | 需要 S3 接口、多设备访问或与云盘同步 |
 | 本地 LLM（Ollama / llama.cpp） | 隐私要求高或 API 成本敏感 |
 | OCR（PaddleOCR / RapidOCR） | 图内文字参与检索的比例上升 |
@@ -199,23 +204,41 @@ PostgreSQL + MinIO/S3 兼容存储；Meilisearch 全文检索（中文友好）+
 
 | 组件 | 触发条件 |
 |---|---|
-| 外部队列（Redis Streams / NATS JetStream） | 多机 worker、跨主机并发超过单机上限 |
+| 服务型数据库（PostgreSQL） | **需要多写者、远程/多用户访问，或规模到千万级**；这是最可能的扩展方向，迁移路径与成本见 3.5 |
+| 外部队列（Redis Streams / NATS JetStream） | 先迁到服务型数据库仍不够，且出现多机 worker、跨主机并发超过单机上限 |
 | 分布式对象存储（Ceph / 云 OSS） | 容量 > 单机磁盘，或需要多活 |
 | 重排序服务 | 混合检索召回噪声影响体验 |
 | 评测与 A/B 平台 | 模型频繁更替，需要回归对比 |
-| 多租户网关 | 从个人扩展到小团队共享服务 |
+| 多租户网关 | 从个人扩展到小团队共享服务（此时数据库必然已迁到服务型） |
 
 ### 2.3 队列、重试、幂等、死信与人工复核的位置
 
 **同步任务**：每个来源一条 `sync_cursor` 记录（游标、上次成功时间、失败次数、退避下次时间）。调度器按来源独立节拍触发，互不阻塞。同步器只负责"发现新消息并入队"，不做任何重处理。
 
-**队列落点**：`job` 表，字段 `(job_id, job_type, target_type, target_id, status, priority, attempts, max_attempts, run_after, locked_by, locked_at, idem_key, last_error)`。
+**队列落点**：`job` 表，字段 `(job_id, job_type, target_type, target_id, status, priority, attempts, max_attempts, run_after, locked_by, locked_at, idem_key, last_error)`。SQLite 没有 `FOR UPDATE SKIP LOCKED`，抢占改为「取写锁 → 选一条 → 标记」的短事务：
+
+```sql
+BEGIN IMMEDIATE;          -- 立刻拿写锁；拿不到就退避重试，不做长时间空等
+SELECT job_id FROM job
+ WHERE status = 'queued' AND run_after <= :now
+ ORDER BY priority, job_id LIMIT 1;
+UPDATE job SET status = 'running', locked_by = :worker, locked_at = :now
+ WHERE job_id = :id;
+COMMIT;
+```
+
+**单写者纪律（v3 新增的硬约束）**：同一时刻只允许一个写事务。由此推出四条纪律：
+
+- **写事务必须短**：网络请求、模型推理、大文件读写一律放在事务之外，事务内只写结果。
+- **批量作业必须分批**：重打标 10 万条不能塞进一个大事务，要按批（例如每批 500–2000 条）提交并在界面显示进度，主动让出写锁。
+- **崩溃恢复**：启动时把 `locked_at` 超时的 `running` 任务重置为 `queued`。
+- **读不受影响**：WAL 模式下读事务与写事务并发进行（本项目已实测）；跨进程用 `busy_timeout` 等待写锁而不是立刻报错。PRAGMA 基线见 3.2。
 
 **幂等性三层**：
 
 1. 摄入层：`(source_id, platform_msg_id)` 唯一约束，重复投递直接忽略。
 2. 任务层：`idem_key = f"{job_type}:{target_type}:{target_id}:{model_version}"` 唯一约束，保证同一目标同一模型版本只处理一次。
-3. 内容层：`content_hash` 唯一 + `media.sha256` 唯一，重算不产生重复实体。
+3. 内容层：`content_hash` 唯一 + `media.sha256` 唯一（**部分唯一索引**，SQLite 同样支持，实测确认），重算不产生重复实体。
 
 **重试策略**：指数退避 + 抖动（如 30s/2m/8m/30m/2h），仅对可重试错误（网络、5xx、限流）重试；对确定性错误（400、格式非法、策略拒绝）直接终止并记录原因。上游限流用 `Retry-After` 优先。
 
@@ -264,33 +287,74 @@ inbox_item ─(promote)─> message ─> content_item          (L2 提报经审�
 user ─< user_source_scope >── source                     (L1 用户可读写的来源范围)
 ```
 
-补充说明：`message` 与 `content_item` 是**一对多**关系。一条平台消息可以包含文本、多张图片、外链，系统将其拆为多个 content_item（文本项、媒体项、链接项），共享同一 `message_id`，这样检索、去重、打标都以内容项为单位，而来源上下文仍挂在消息上。转发/引用通过 `message.repost_of_message_id`（内部已知）与 `message.forward_chain`（JSONB，平台侧不可解析的外链转发链）表达。
+补充说明：`message` 与 `content_item` 是**一对多**关系。一条平台消息可以包含文本、多张图片、外链，系统将其拆为多个 content_item（文本项、媒体项、链接项），共享同一 `message_id`，这样检索、去重、打标都以内容项为单位，而来源上下文仍挂在消息上。转发/引用通过 `message.repost_of_message_id`（内部已知）与 `message.forward_chain`（JSON 文本，平台侧不可解析的外链转发链）表达。
 
 **`inbox_item` 与 `content_item` 的关系是关键**：前者是"待审的候选内容"，后者是"已进入系统的事实"。二者**不共用表**，因为（a）L2 内容在审查前不应有任何副作用，（b）审查可能拒绝并永久丢弃，不应在事实表留下垃圾行，（c）两者字段需求不同（收件箱关注提交侧元数据与配额，事实表关注内容侧语义）。
 
-### 3.2 字段级设计（PostgreSQL）
+### 3.2 字段级设计（SQLite）
 
-通用约定：主键用 `BIGINT GENERATED ALWAYS AS IDENTITY`（对外暴露用 `uuid` 列避免枚举）；时间戳统一 `timestamptz`；软删除用 `deleted_at timestamptz`；所有表带 `created_at`/`updated_at`。
+**命名沿用既有实现**：本节沿用已经落地的表名与列名，包括三处为避开保留字而做的改名（`user` → `app_user`、`before`/`after` → `before_state`/`after_state`、`authorization` → `source_authorization`；详见 `migrations/0001_init.sql` 文件头与 AGENTS.md 的偏差声明）。本次重写**只换类型与语法，不换名字**，让后续迁移与全仓库引用都是机械替换。
+
+通用约定：主键用 `INTEGER PRIMARY KEY`（rowid 别名，自增；对外暴露用 `uuid` 列避免枚举）；时间戳统一 `TEXT`（ISO-8601 UTC，毫秒精度，字典序即时间序）；软删除用 `deleted_at TEXT`；所有表带 `created_at`/`updated_at`；布尔用 `INTEGER` + `CHECK (col IN (0,1))`；JSON 用 `TEXT`（`json_valid` 校验、`json_extract` 读取）；数组用 `TEXT` 存 JSON 数组。
+
+**类型映射（v2 → v3）**
+
+| v2（PostgreSQL） | v3（SQLite） | 说明 |
+|---|---|---|
+| `bigint GENERATED ALWAYS AS IDENTITY` | `INTEGER PRIMARY KEY` | rowid 别名，自动递增 |
+| `uuid` + `gen_random_uuid()` | `TEXT` | UUIDv4/v7 由应用层生成，不依赖数据库函数 |
+| `timestamptz` | `TEXT` | ISO-8601 UTC，可直接比较与排序 |
+| `jsonb` | `TEXT` | `json_valid` / `json_extract`；**没有 GIN**，热点查询用生成列 + 普通索引补 |
+| `text[]` | `TEXT` | 存 JSON 数组；SQLite 没有数组类型 |
+| `boolean` | `INTEGER` | 配 `CHECK (col IN (0,1))` |
+| `smallint` / `int` / `bigint` | `INTEGER` | 64 位有符号；`phash` 按有符号整数存 |
+| `real` / `numeric` | `REAL` | 本库无金额语义，无精度顾虑 |
+| `CHECK` 约束、部分唯一索引、`ON CONFLICT` | **保留** | 三者均实测支持；`ON CONFLICT` 必须写冲突目标 |
+| `FOREIGN KEY` | 保留 | **必须 `PRAGMA foreign_keys=ON`**：SQLite 默认关闭，这是最容易踩的坑 |
+| `CREATE INDEX ... USING gin (col gin_trgm_ops)` | 删除 | 全文检索改走 FTS5 虚拟表（见 5.1） |
+
+**连接基线（PRAGMA）**：每个连接建立后立即执行，缺一不可。
+
+```sql
+PRAGMA journal_mode = WAL;      -- 并发读 + 单写者；WAL 是持久设置，写进库文件
+PRAGMA foreign_keys = ON;       -- 默认关闭，必须显式打开
+PRAGMA busy_timeout = 5000;     -- 写锁争用时等待 5 秒，而不是立刻抛错
+PRAGMA synchronous = NORMAL;    -- WAL 下的推荐折中；归档场景可选 FULL（见 7.1）
+PRAGMA temp_store = MEMORY;
+```
+
+`synchronous` 的取舍：`NORMAL` + WAL 下数据库不会因断电损坏，但极端断电可能丢掉最近若干已提交事务；`FULL` 每次提交都 fsync，更保守也更慢。默认取 `NORMAL`，由 7.1 的每日备份 + 完整性校验兜住最坏情况。
+
+**SQLite 版本门槛**：最低 **3.40**（STRICT 表需 3.37、FTS5 `trigram` 需 3.34、`RETURNING` 需 3.35）。各平台 Python 内置的 SQLite 版本不一，**启动时必须校验 `sqlite3.sqlite_version_info` 并 fail closed**，给出"你的 Python 自带 SQLite 太旧，请升级 Python 或改用单文件包"这类人话提示（见 10.1）。
 
 **user / identity / 权限**
 
 ```sql
-user(user_id PK, username UNIQUE NULL, display_name, tier smallint,   -- 0=root 1=designated 2=anonymous(不建账号)
-     status, password_hash, totp_secret_enc, created_by FK user NULL,
-     created_at, disabled_at, last_login_at)
+app_user(user_id INTEGER PRIMARY KEY, uuid TEXT, username TEXT UNIQUE, display_name TEXT, tier INTEGER,  -- 0=root 1=designated 2=anonymous(不建账号)
+     status TEXT, password_hash TEXT, totp_secret_enc BLOB, created_by INTEGER REFERENCES app_user(user_id),
+     created_at TEXT, updated_at TEXT, disabled_at TEXT, last_login_at TEXT,
+     CHECK (tier IN (0,1,2)),
+     CHECK (tier <> 0 OR (password_hash IS NOT NULL AND totp_secret_enc IS NOT NULL)))
 -- tier=0 必须有口令+TOTP；tier=1 由 root 创建并逐个授权；tier=2 不产生 user 行
 
-account_identity(identity_id PK, user_id FK, platform, platform_user_id, display_name, is_bot bool,
-     verified_at, UNIQUE(platform, platform_user_id))
+account_identity(identity_id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES app_user(user_id), platform TEXT,
+     platform_user_id TEXT, display_name TEXT, is_bot INTEGER, verified_at TEXT,
+     UNIQUE(platform, platform_user_id))
 
-role(role_id PK, name UNIQUE, description)
-permission(perm_id PK, code UNIQUE, description)          -- 如 source:read, content:submit, content:delete, inbox:promote, model:invoke, storage:manage
-role_binding(binding_id PK, user_id FK, role_id FK, scope_type, scope_id, UNIQUE(user_id, role_id, scope_type, scope_id))
-user_source_scope(scope_id PK, user_id FK, source_id FK, can_read bool, can_submit bool,
-     granted_by FK user, granted_at, revoked_at, UNIQUE(user_id, source_id))
+role(role_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT)
+permission(perm_id INTEGER PRIMARY KEY, code TEXT UNIQUE, description TEXT)   -- 如 source:read, content:submit, content:delete, inbox:promote, model:invoke, storage:manage
+role_binding(binding_id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES app_user(user_id),
+     role_id INTEGER REFERENCES role(role_id), scope_type TEXT, scope_id INTEGER,
+     UNIQUE(user_id, role_id, scope_type, scope_id))
+user_source_scope(scope_id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES app_user(user_id),
+     source_id INTEGER REFERENCES source(source_id), can_read INTEGER, can_submit INTEGER,
+     granted_by INTEGER REFERENCES app_user(user_id), granted_at TEXT, revoked_at TEXT,
+     UNIQUE(user_id, source_id))
 
-api_credential(cred_id PK, user_id FK, name, key_hash, key_prefix, scopes text[], last_used_at,
-     expires_at, revoked_at)
+api_credential(cred_id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES app_user(user_id), name TEXT,
+     key_hash TEXT, key_prefix TEXT,
+     scopes TEXT,                                            -- JSON 数组字符串（原 text[]）
+     last_used_at TEXT, expires_at TEXT, revoked_at TEXT)
 ```
 
 权限码按层预置（不要用通配符权限）：
@@ -306,170 +370,217 @@ api_credential(cred_id PK, user_id FK, name, key_hash, key_prefix, scopes text[]
 **source / 授权 / 同步游标**
 
 ```sql
-source(source_id PK, uuid, name, platform, kind,            -- kind: bot_api|webhook|rss|export|user_api
-     external_ref,                                          -- 频道 ID / 群 ID / RSS URL
-     config jsonb,                                          -- 平台特有配置（凭证引用，不存明文）
-     trust_level smallint,                                  -- 1=可信自有 2=已授权群 3=外部不确定
-     enabled bool, created_by FK user, created_at, deleted_at)
+source(source_id INTEGER PRIMARY KEY, uuid TEXT, name TEXT, platform TEXT, kind TEXT,   -- kind: bot_api|webhook|rss|export|user_api
+     external_ref TEXT,                                     -- 频道 ID / 群 ID / RSS URL
+     config TEXT,                                           -- 平台特有配置 JSON（凭证引用，不存明文）
+     trust_level INTEGER,                                   -- 1=可信自有 2=已授权群 3=外部不确定
+     enabled INTEGER, created_by INTEGER REFERENCES app_user(user_id), created_at TEXT,
+     updated_at TEXT, deleted_at TEXT,
+     CHECK (kind IN ('bot_api','webhook','rss','export','user_api')),
+     CHECK (trust_level IN (1,2,3)))
 
-authorization(authz_id PK, source_id FK, mode,              -- mode: owner_token|admin_consent|public_feed|manual_export
-     scope jsonb,                                           -- 允许读取的消息类型、时间范围
-     evidence_ref,                                          -- 授权证明文件路径/链接/截图 hash
-     granted_by FK user, granted_at, expires_at, revoked_at)
+source_authorization(authz_id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES source(source_id),
+     mode TEXT,                                             -- mode: owner_token|admin_consent|public_feed|manual_export
+     scope TEXT,                                            -- 允许读取的消息类型、时间范围（JSON）
+     evidence_ref TEXT,                                     -- 授权证明文件路径/链接/截图 hash
+     granted_by INTEGER REFERENCES app_user(user_id), granted_at TEXT, expires_at TEXT, revoked_at TEXT,
+     created_at TEXT, updated_at TEXT,
+     CHECK (mode IN ('owner_token','admin_consent','public_feed','manual_export')))
 
-sync_cursor(source_id PK/FK, cursor_value, last_seen_at, last_success_at,
-     consecutive_failures, next_attempt_at, state)          -- state: idle|running|backoff|paused|error
+sync_cursor(source_id INTEGER PRIMARY KEY REFERENCES source(source_id), cursor_value TEXT,
+     last_seen_at TEXT, last_success_at TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
+     next_attempt_at TEXT, state TEXT NOT NULL DEFAULT 'idle', updated_at TEXT,
+     CHECK (state IN ('idle','running','backoff','paused','error')))
 
-fetch_log(fetch_id PK, source_id FK, started_at, finished_at, items_seen, items_new,
-     http_status, error_class, error_detail, rate_limit_remaining)
+fetch_log(fetch_id INTEGER PRIMARY KEY, source_id INTEGER REFERENCES source(source_id), started_at TEXT,
+     finished_at TEXT, items_seen INTEGER, items_new INTEGER, http_status INTEGER,
+     error_class TEXT, error_detail TEXT, rate_limit_remaining INTEGER)
 ```
 
 **message（原始信封）**
 
 ```sql
-message(message_id PK, uuid, source_id FK, platform_msg_id, platform_thread_id,
-     sender_identity_id FK NULL, sender_display_name, sender_is_bot bool,
-     sent_at timestamptz, ingested_at timestamptz,
-     message_type,                                          -- text|media|mixed|link|system|repost
-     text_raw text,                                         -- 不可变原文
-     text_normalized text,                                  -- 派生
-     lang text,                                             -- 派生
-     reply_to_platform_id, repost_of_message_id FK NULL,
-     forward_chain jsonb,                                   -- [{platform, sender, channel, url}]
-     permalink, raw_payload jsonb,                          -- 原始载荷（保留可重放）
-     raw_payload_hash text,
-     source_trust smallint, nsfw_gate smallint,             -- 摄入时的门控判定副本
-     deleted_at,
-     UNIQUE(source_id, platform_msg_id))
-CREATE INDEX ON message (source_id, sent_at DESC);
-CREATE INDEX ON message (sender_identity_id, sent_at DESC);
-CREATE INDEX ON message USING gin (text_normalized gin_trgm_ops);
+message(message_id INTEGER PRIMARY KEY, uuid TEXT, source_id INTEGER REFERENCES source(source_id),
+     platform_msg_id TEXT, platform_thread_id TEXT,
+     sender_identity_id INTEGER REFERENCES account_identity(identity_id),
+     sender_display_name TEXT, sender_is_bot INTEGER,
+     sent_at TEXT, ingested_at TEXT,
+     message_type TEXT,                                     -- text|media|mixed|link|system|repost
+     text_raw TEXT,                                         -- 不可变原文
+     text_normalized TEXT,                                  -- 派生
+     lang TEXT,                                             -- 派生
+     reply_to_platform_id TEXT, repost_of_message_id INTEGER REFERENCES message(message_id),
+     forward_chain TEXT,                                    -- JSON: [{platform, sender, channel, url}]
+     permalink TEXT, raw_payload TEXT,                      -- 原始载荷 JSON（保留策略见下）
+     raw_payload_hash TEXT,
+     source_trust INTEGER, nsfw_gate INTEGER,               -- 摄入时的门控判定副本
+     created_at TEXT, updated_at TEXT, deleted_at TEXT,
+     UNIQUE(source_id, platform_msg_id),
+     CHECK (message_type IN ('text','media','mixed','link','system','repost')))
+
+CREATE INDEX message_source_time_idx ON message (source_id, sent_at DESC);
+CREATE INDEX message_sender_time_idx ON message (sender_identity_id, sent_at DESC);
+-- 原 pg_trgm GIN 索引取消：中文子串检索改由 FTS5 的 content_fts 承担（见 5.1）
 ```
 
-`raw_payload` 保留策略：默认保留原文与结构化载荷（便于重放与模型迁移），媒体本体按对象存储保留期独立治理。
+`raw_payload` 保留策略（**v3 收紧**）：它是本库体积的最大变量——平台原始载荷通常 2–5 KB/条，10 万条即 200–500 MB，比结构化数据本身还大。因此默认**只保留 `raw_payload_hash`**，`raw_payload` 由设置项按需开启（例如"保留最近 N 天"），需要重放或模型迁移时再临时打开。媒体本体按对象存储保留期独立治理。
 
 **content_item（可检索、可打标、可去重的核心单元）**
 
 ```sql
-content_item(content_id PK, uuid, message_id FK, item_type,  -- text|image|video|audio|link|sticker|file
-     ordinal smallint,                                       -- 同消息内顺序
-     text_content text,                                      -- 文本项正文或媒体项的说明文本
-     ocr_text text,                                          -- 派生
-     caption text,                                           -- 派生（VLM/LLM）
-     content_hash text,                                      -- 规范化内容的 SHA-256（文本项）
-     phash bigint, dhash bigint, ahash bigint,               -- 感知哈希（图片项）
-     embedding_id text, vector_ref text,
-     canonical_id FK content_item NULL,                      -- 归并后的代表项
-     dup_group_id, dup_distance smallint,
-     nsfw_level smallint, nsfw_score real,                   -- 0 safe … 4 restricted
-     sensitive_flags text[],                                 -- gore|minor_risk|violence|self_harm|politics…
-     lang text, char_count int, byte_size bigint,
-     quality_score real,
-     status,                                                 -- active|quarantined|archived|deleted
-     submission_tier smallint,                               -- 0=root 1=designated 2=anonymous（来源可信度）
-     submitted_by FK user NULL,                              -- L1 提报者；L2 为 NULL
-     inbox_item_id FK NULL,                                  -- 若由收件箱提升而来，留溯源指针
-     egress_state,                                           -- local_only|pending|cleared|denied（AI 外发资格）
-     egress_scope jsonb,                                     -- 放行到哪些服务商/用途（见 6.3）
-     char_bucket,                                            -- 派生：未识别角色时的特征归档桶（见 4.9）
-     first_seen_at, last_seen_at, deleted_at,
-     UNIQUE(message_id, ordinal))
+content_item(content_id INTEGER PRIMARY KEY, uuid TEXT, message_id INTEGER REFERENCES message(message_id),
+     item_type TEXT,                                        -- text|image|video|audio|link|sticker|file
+     ordinal INTEGER,                                       -- 同消息内顺序
+     text_content TEXT,                                     -- 文本项正文或媒体项的说明文本
+     ocr_text TEXT,                                         -- 派生
+     caption TEXT,                                          -- 派生（VLM/LLM）
+     content_hash TEXT,                                     -- 规范化内容的 SHA-256（文本项）
+     phash INTEGER, dhash INTEGER, ahash INTEGER,           -- 感知哈希（图片项；64 位有符号）
+     embedding_id TEXT, vector_ref TEXT,                    -- 阶段 3 再定实现（见 5.2）
+     canonical_id INTEGER REFERENCES content_item(content_id),   -- 归并后的代表项
+     dup_group_id INTEGER, dup_distance INTEGER,
+     nsfw_level INTEGER NOT NULL DEFAULT 0, nsfw_score REAL,     -- 0 safe … 4 restricted
+     sensitive_flags TEXT,                                  -- JSON 数组：gore|minor_risk|violence|self_harm|politics…
+     lang TEXT, char_count INTEGER, byte_size INTEGER,
+     quality_score REAL,
+     status TEXT NOT NULL DEFAULT 'active',                 -- active|quarantined|archived|deleted
+     submission_tier INTEGER NOT NULL DEFAULT 0,            -- 0=root 1=designated 2=anonymous（来源可信度）
+     submitted_by INTEGER REFERENCES app_user(user_id),     -- L1 提报者；L2 为 NULL
+     inbox_item_id INTEGER REFERENCES inbox_item(inbox_id), -- 若由收件箱提升而来，留溯源指针
+     egress_state TEXT NOT NULL DEFAULT 'local_only',       -- local_only|pending|cleared|denied|expired（AI 外发资格）
+     egress_scope TEXT,                                     -- 放行到哪些服务商/用途（JSON，见 6.3）
+     char_bucket TEXT,                                      -- 派生：未识别角色时的特征归档桶（见 4.9）
+     first_seen_at TEXT, last_seen_at TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT,
+     UNIQUE(message_id, ordinal),
+     CHECK (item_type IN ('text','image','video','audio','link','sticker','file')),
+     CHECK (status IN ('active','quarantined','archived','deleted')),
+     CHECK (nsfw_level BETWEEN 0 AND 4),
+     CHECK (submission_tier IN (0,1,2)),
+     CHECK (egress_state IN ('local_only','pending','cleared','denied','expired')))
 
-CREATE UNIQUE INDEX ON content_item (content_hash) WHERE content_hash IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX ON content_item (dup_group_id);
-CREATE INDEX ON content_item (nsfw_level) WHERE nsfw_level >= 2;
-CREATE INDEX ON content_item (egress_state, nsfw_level);        -- 驱动外发待审队列
-CREATE INDEX ON content_item (submission_tier, status);          -- 驱动提报审查队列
-CREATE INDEX ON content_item (char_bucket) WHERE char_bucket IS NOT NULL;
+CREATE UNIQUE INDEX content_item_hash_key ON content_item (content_hash)
+    WHERE content_hash IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX content_item_dup_group_idx ON content_item (dup_group_id) WHERE dup_group_id IS NOT NULL;
+CREATE INDEX content_item_nsfw_idx ON content_item (nsfw_level) WHERE nsfw_level >= 2;
+CREATE INDEX content_item_egress_idx ON content_item (egress_state, nsfw_level);      -- 驱动外发待审队列
+CREATE INDEX content_item_tier_status_idx ON content_item (submission_tier, status);  -- 驱动提报审查队列
+CREATE INDEX content_item_char_bucket_idx ON content_item (char_bucket) WHERE char_bucket IS NOT NULL;
 ```
 
-注意：`content_hash` 的唯一索引用**部分索引**并排除软删除行，这样软删后可重新导入同一内容而不冲突。
+注意：`content_hash` 的唯一索引用**部分索引**并排除软删除行，这样软删后可重新导入同一内容而不冲突（SQLite 支持部分索引，已实测）。
 
 **inbox_item（L2 匿名提报隔离区）**
 
 ```sql
-inbox_item(inbox_id PK, uuid,
-     received_at, channel,                                   -- web|telegram_bot|email|api
-     submitter_ip_hash text, submitter_ua_hash text,         -- 只存哈希，不存原始 IP
-     claimed_identity jsonb,                                 -- 提交者自称的身份，不可信，仅供人看
-     text_raw text, media_blobs jsonb,                       -- 原始字节/暂存对象键（隔离区，非主存储）
-     blob_sha256 text, size_bytes bigint,
-     quota_bucket text,                                      -- 用于配额与限流的桶键（IP/会话）
-     scan_verdict jsonb,                                     -- 扫描结果（fail closed）
-     status,                                                 -- pending|reviewing|promoted|rejected|expired
-     reviewed_by FK user NULL, reviewed_at, reject_reason,
-     promoted_message_id FK message NULL,
-     reject_ttl_at timestamptz,                              -- 拒绝/超期后自动清理隔离区字节
-     created_at)
+inbox_item(inbox_id INTEGER PRIMARY KEY, uuid TEXT,
+     received_at TEXT, channel TEXT,                         -- web|telegram_bot|email|api
+     submitter_ip_hash TEXT, submitter_ua_hash TEXT,         -- 只存哈希，不存原始 IP
+     claimed_identity TEXT,                                  -- 提交者自称的身份（JSON），不可信，仅供人看
+     text_raw TEXT, media_blobs TEXT,                        -- 原始字节/暂存对象键（JSON；隔离区，非主存储）
+     blob_sha256 TEXT, size_bytes INTEGER,
+     quota_bucket TEXT,                                      -- 用于配额与限流的桶键（IP/会话）
+     scan_verdict TEXT,                                      -- 扫描结果 JSON（fail closed）
+     status TEXT NOT NULL DEFAULT 'pending',                 -- pending|reviewing|promoted|rejected|expired
+     reviewed_by INTEGER REFERENCES app_user(user_id), reviewed_at TEXT, reject_reason TEXT,
+     promoted_message_id INTEGER REFERENCES message(message_id),
+     reject_ttl_at TEXT,                                     -- 拒绝/超期后自动清理隔离区字节
+     created_at TEXT,
+     CHECK (channel IN ('web','telegram_bot','email','api')),
+     CHECK (status IN ('pending','reviewing','promoted','rejected','expired')))
 
-CREATE INDEX ON inbox_item (status, received_at);
-CREATE UNIQUE INDEX ON inbox_item (blob_sha256) WHERE status = 'pending';  -- 同一待审内容不重复占位
+CREATE INDEX inbox_item_status_time_idx ON inbox_item (status, received_at);
+CREATE UNIQUE INDEX inbox_item_pending_blob_key ON inbox_item (blob_sha256) WHERE status = 'pending';
 ```
 
-要点：`inbox_item` 的媒体字节存在**隔离区前缀**（如 `/data/quarantine/inbox/`），与主存储分离，被拒绝或超期后由清理任务直接删除，绝不进入内容寻址主库。`submitter_ip_hash` 用服务端固定盐，既支持滥用溯源与限流，又不构成"存储访客 IP"。
+要点：`inbox_item` 的媒体字节存在**隔离区前缀**（如 `<data_root>/quarantine/inbox/`），与主存储分离，被拒绝或超期后由清理任务直接删除，绝不进入内容寻址主库。`submitter_ip_hash` 用服务端固定盐，既支持滥用溯源与限流，又不构成"存储访客 IP"。
+
+**结构上就没有通往主库的路**：本表没有任何指向 `content_item` 的列或外键，唯一的出边是 `promoted_message_id`（审查通过后的溯源指针）与 `reviewed_by`。这是"匿名提报审查前零副作用"在数据模型上的体现，集成测试会断言这一点（见 3.3）。
 
 **media（媒体本体，按哈希寻址）**
 
 ```sql
-media(media_id PK, uuid, content_id FK NULL,               -- 允许多个 content_item 复用同一本体
-     sha256 char(64) UNIQUE, blake3 text, size_bytes bigint,
-     mime_detected, mime_declared, extension, width int, height int,
-     duration_ms int, frame_count int, is_animated bool,
-     storage_backend_id FK, object_key, storage_class,      -- hot|cold|archive
-     thumb_key, preview_key, webp_key,
-     exif jsonb,                                            -- 已清洗过敏感字段
-     scan_status,                                           -- pending|clean|infected|suspicious|skipped
-     scan_engine, scan_at, quarantine_key,
-     created_at, deleted_at,
-     UNIQUE(storage_backend_id, object_key))
+media(media_id INTEGER PRIMARY KEY, uuid TEXT, content_id INTEGER REFERENCES content_item(content_id),  -- 允许多个 content_item 复用同一本体
+     sha256 TEXT UNIQUE, blake3 TEXT, size_bytes INTEGER,
+     mime_detected TEXT, mime_declared TEXT, extension TEXT, width INTEGER, height INTEGER,
+     duration_ms INTEGER, frame_count INTEGER, is_animated INTEGER,
+     storage_backend_id INTEGER REFERENCES storage_backend(backend_id),
+     object_key TEXT, storage_class TEXT,                   -- hot|cold|archive
+     thumb_key TEXT, preview_key TEXT, webp_key TEXT,
+     exif TEXT,                                             -- JSON，已清洗过敏感字段
+     scan_status TEXT,                                      -- pending|clean|infected|suspicious|skipped
+     scan_engine TEXT, scan_at TEXT, quarantine_key TEXT,
+     created_at TEXT, updated_at TEXT, deleted_at TEXT,
+     UNIQUE(storage_backend_id, object_key),
+     CHECK (storage_class IN ('hot','cold','archive')),
+     CHECK (scan_status IN ('pending','clean','infected','suspicious','skipped')))
 ```
 
 **link**
 
 ```sql
-link(link_id PK, content_id FK, url_raw, url_normalized, url_canonical,
-     domain, scheme, final_url, redirect_chain jsonb,
-     fetch_status, http_status, content_type, fetched_at, size_bytes,
-     title, description, site_name, og_image_media_id FK NULL,
-     snapshot_key,                                          -- 本地/Wayback 快照引用
-     risk_level, risk_reasons text[], blocked_reason,
-     expires_at, deleted_at)
+link(link_id INTEGER PRIMARY KEY, content_id INTEGER REFERENCES content_item(content_id),
+     url_raw TEXT, url_normalized TEXT, url_canonical TEXT,
+     domain TEXT, scheme TEXT, final_url TEXT, redirect_chain TEXT,   -- redirect_chain 为 JSON
+     fetch_status TEXT, http_status INTEGER, content_type TEXT, fetched_at TEXT, size_bytes INTEGER,
+     title TEXT, description TEXT, site_name TEXT,
+     og_image_media_id INTEGER REFERENCES media(media_id),
+     snapshot_key TEXT,                                     -- 本地/Wayback 快照引用
+     risk_level INTEGER, risk_reasons TEXT, blocked_reason TEXT,      -- risk_reasons 为 JSON 数组
+     created_at TEXT, updated_at TEXT, expires_at TEXT, deleted_at TEXT,
+     CHECK (risk_level IS NULL OR risk_level BETWEEN 0 AND 3))
 ```
 
 **tag 体系**
 
 ```sql
-tag(tag_id PK, uuid, name, name_norm UNIQUE,               -- 归一化（小写、全半角、下划线统一）
-     display_name, namespace,                              -- character|work|artist|general|meta|rating|source|system
-     kind,                                                 -- auto|human|system|suggested
-     parent_id FK tag NULL, description, aliases text[],
-     external_ref jsonb,                                   -- danbooru/gelbooru tag id 等
-     usage_count int, status,                               -- active|pending|merged|deprecated
-     merged_into FK tag NULL, created_by, created_at)
+tag(tag_id INTEGER PRIMARY KEY, uuid TEXT, name TEXT, name_norm TEXT UNIQUE,   -- 归一化（小写、全半角、下划线统一）
+     display_name TEXT, namespace TEXT,                     -- character|feature|unclassified|work|artist|general|meta|rating|source|system
+     kind TEXT,                                             -- auto|human|system|suggested
+     parent_id INTEGER REFERENCES tag(tag_id), description TEXT,
+     aliases TEXT,                                          -- JSON 数组（原 text[]）
+     external_ref TEXT,                                     -- JSON：danbooru/gelbooru tag id 等
+     usage_count INTEGER, status TEXT,                       -- active|pending|merged|deprecated
+     merged_into INTEGER REFERENCES tag(tag_id),
+     created_by INTEGER REFERENCES app_user(user_id), created_at TEXT, updated_at TEXT,
+     CHECK (namespace IN ('character','feature','unclassified','work','artist','general','meta','rating','source','system')),
+     CHECK (kind IN ('auto','human','system','suggested')),
+     CHECK (status IN ('active','pending','merged','deprecated')),
+     CHECK (status <> 'merged' OR merged_into IS NOT NULL))
 
-tag_synonym(synonym_id PK, tag_id FK, alias, alias_norm UNIQUE, source, confidence)
-tag_relation(rel_id PK, from_tag FK, to_tag FK, relation,  -- parent|child|related|conflicts_with
-     UNIQUE(from_tag, to_tag, relation))
+tag_synonym(synonym_id INTEGER PRIMARY KEY, tag_id INTEGER REFERENCES tag(tag_id), alias TEXT,
+     alias_norm TEXT UNIQUE, source TEXT, confidence REAL)
+tag_relation(rel_id INTEGER PRIMARY KEY, from_tag INTEGER REFERENCES tag(tag_id),
+     to_tag INTEGER REFERENCES tag(tag_id), relation TEXT,   -- parent|child|related|conflicts_with
+     UNIQUE(from_tag, to_tag, relation),
+     CHECK (relation IN ('parent','child','related','conflicts_with')))
 
-tag_assignment(assign_id PK, content_id FK, tag_id FK, source,  -- auto|human|system|suggested|merged
-     confidence real, model_version_id FK NULL, evidence jsonb,  -- 命中位置、分数、被引用的 OCR 片段
-     assigned_by FK user NULL, assigned_at, revoked_at,
-     UNIQUE(content_id, tag_id, source))
+tag_assignment(assign_id INTEGER PRIMARY KEY, content_id INTEGER REFERENCES content_item(content_id),
+     tag_id INTEGER REFERENCES tag(tag_id), source TEXT,     -- auto|human|system|suggested|merged
+     confidence REAL, model_version_id INTEGER REFERENCES model_version(model_version_id),
+     evidence TEXT,                                         -- JSON：命中位置、分数、被引用的 OCR 片段
+     assigned_by INTEGER REFERENCES app_user(user_id), assigned_at TEXT, revoked_at TEXT,
+     UNIQUE(content_id, tag_id, source),
+     CHECK (source IN ('auto','human','system','suggested','merged')),
+     -- 本地模型的标签必须可追溯：没有 model_version_id 与 confidence 就不许写成 auto
+     CHECK (source <> 'auto' OR (model_version_id IS NOT NULL AND confidence IS NOT NULL)))
 ```
 
 **分类运行与模型版本**
 
 ```sql
-model_version(model_version_id PK, capability,             -- tagger|ocr|nsfw|embed_image|embed_text|llm|vlm
-     provider, model_name, revision, params jsonb,
-     prompt_version text, license text, local bool,
-     cost_in_per_mtok numeric, cost_out_per_mtok numeric,
-     active bool, created_at)
+model_version(model_version_id INTEGER PRIMARY KEY, capability TEXT,   -- tagger|ocr|nsfw|embed_image|embed_text|llm|vlm
+     provider TEXT, model_name TEXT, revision TEXT, params TEXT,       -- params 为 JSON
+     prompt_version TEXT, license TEXT, local INTEGER,
+     cost_in_per_mtok REAL, cost_out_per_mtok REAL,
+     active INTEGER, created_at TEXT, updated_at TEXT,
+     CHECK (capability IN ('tagger','ocr','nsfw','embed_image','embed_text','llm','vlm')))
 
-classification_run(run_id PK, content_id FK, capability, model_version_id FK,
-     input_ref, output jsonb, confidence real, latency_ms int, cost_estimate numeric,
-     status, error_class, created_at)
-CREATE INDEX ON classification_run (capability, model_version_id, created_at);
+classification_run(run_id INTEGER PRIMARY KEY, content_id INTEGER REFERENCES content_item(content_id),
+     capability TEXT, model_version_id INTEGER REFERENCES model_version(model_version_id),
+     input_ref TEXT, output TEXT, confidence REAL, latency_ms INTEGER, cost_estimate REAL,
+     status TEXT, error_class TEXT, created_at TEXT,
+     CHECK (status IN ('succeeded','failed','skipped')))
+CREATE INDEX classification_run_cap_model_idx ON classification_run (capability, model_version_id, created_at);
 ```
 
 `classification_run` 是模型迁移的关键：它让"当前标签是怎么来的"完全可追溯，也让"用新模型重跑哪些内容"变成一次查询。
@@ -477,40 +588,67 @@ CREATE INDEX ON classification_run (capability, model_version_id, created_at);
 **storage_backend / 审计 / 复核**
 
 ```sql
-storage_backend(backend_id PK, name, kind,                 -- local|s3|smb_nfs|webdav|cloud_drive
-     config jsonb, root_prefix, is_default bool, writable bool, health_status, last_check_at)
+storage_backend(backend_id INTEGER PRIMARY KEY, name TEXT, kind TEXT,   -- local|s3|smb_nfs|webdav|cloud_drive
+     config TEXT, root_prefix TEXT, is_default INTEGER, writable INTEGER,
+     health_status TEXT, last_check_at TEXT,
+     CHECK (kind IN ('local','s3','smb_nfs','webdav','cloud_drive')))
 
-audit_log(audit_id PK, actor_type,                         -- user|system|connector|llm
-     actor_id, action, target_type, target_id,
-     before jsonb, after jsonb, result, ip, user_agent, request_id, created_at)
+audit_log(audit_id INTEGER PRIMARY KEY, actor_type TEXT,    -- user|system|connector|llm
+     actor_id INTEGER, action TEXT, target_type TEXT, target_id INTEGER,
+     before_state TEXT, after_state TEXT, result TEXT, ip TEXT, user_agent TEXT,
+     request_id TEXT, created_at TEXT,
+     CHECK (actor_type IN ('user','system','connector','llm')))
 
-review_task(task_id PK, uuid, kind,                        -- inbox_submission|egress_review|low_confidence|nsfw_uncertain|dedup_conflict|scan_gray|tag_conflict|link_risk|char_ambiguous
-     target_type, target_id, priority, payload jsonb,
-     status, assigned_to FK user, resolution jsonb, resolved_at, created_at)
+review_task(task_id INTEGER PRIMARY KEY, uuid TEXT, kind TEXT,   -- inbox_submission|egress_review|low_confidence|nsfw_uncertain|dedup_conflict|scan_gray|tag_conflict|link_risk|char_ambiguous
+     target_type TEXT, target_id INTEGER, priority INTEGER, payload TEXT,
+     status TEXT, assigned_to INTEGER REFERENCES app_user(user_id), resolution TEXT,
+     resolved_at TEXT, created_at TEXT,
+     CHECK (kind IN ('inbox_submission','egress_review','low_confidence','nsfw_uncertain','dedup_conflict','scan_gray','tag_conflict','link_risk','char_ambiguous')),
+     CHECK (status IN ('pending','in_progress','resolved','canceled')))
 
-retention_policy(policy_id PK, name, scope_type, scope_id,  -- scope: global|source|tag|nsfw_level|submission_tier
-     strategy,                                             -- keep_forever|ttl|rolling_cap|size_budget|hot_cold_tier
-     retain_days int, min_keep_count int,                  -- 时间下限与条数下限（保证不删空）
-     max_total_bytes bigint, max_items int,                -- 容量上限（滚动删除的触发条件）
-     age_tiebreak,                                         -- 超限时先删什么：oldest|least_accessed|lowest_quality|not_in_any_collection
-     never_evict_tags text[], never_evict_nsfw_max smallint, -- 受保护内容：命中即豁免滚动删除
-     action,                                               -- archive|soft_delete|hard_delete|demote_storage_class
-     apply_to jsonb, dry_run bool, enabled, created_at, updated_at)
+retention_policy(policy_id INTEGER PRIMARY KEY, name TEXT UNIQUE, scope_type TEXT, scope_id INTEGER,
+     strategy TEXT,                                         -- keep_forever|ttl|rolling_cap|size_budget|hot_cold_tier
+     retain_days INTEGER, min_keep_count INTEGER,            -- 时间下限与条数下限（保证不删空）
+     max_total_bytes INTEGER, max_items INTEGER,             -- 容量上限（滚动删除的触发条件）
+     age_tiebreak TEXT,                                     -- 超限时先删什么：oldest|least_accessed|lowest_quality|not_in_any_collection
+     never_evict_tags TEXT, never_evict_nsfw_max INTEGER,    -- never_evict_tags 为 JSON 数组；命中即豁免滚动删除
+     action TEXT,                                           -- archive|soft_delete|hard_delete|demote_storage_class
+     apply_to TEXT, dry_run INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
+     created_at TEXT, updated_at TEXT,
+     CHECK (scope_type IN ('global','source','tag','nsfw_level','submission_tier')),
+     CHECK (strategy IN ('keep_forever','ttl','rolling_cap','size_budget','hot_cold_tier')),
+     CHECK (action IN ('archive','soft_delete','hard_delete','demote_storage_class')),
+     CHECK (age_tiebreak IS NULL OR age_tiebreak IN ('oldest','least_accessed','lowest_quality','not_in_any_collection')))
 
-storage_usage(snapshot_at, backend_id, class, object_count, total_bytes, item_count)  -- 时序快照，驱动水位与预测
-retention_run(run_id PK, policy_id FK, started_at, finished_at, dry_run bool,
-     candidates int, deleted_media int, freed_bytes bigint, blocked_count int, report jsonb)
+storage_usage(snapshot_at TEXT, backend_id INTEGER REFERENCES storage_backend(backend_id), class TEXT,
+     object_count INTEGER, total_bytes INTEGER, item_count INTEGER,   -- 时序快照，驱动水位与预测
+     PRIMARY KEY (snapshot_at, backend_id, class),
+     CHECK (class IN ('hot','cold','archive')))
 
-setting(key PK, value jsonb, value_type, source,            -- source: default|yaml|db|env
-     schema_version int, updated_by FK user NULL, updated_at,
-     is_dangerous bool, last_validated_at)
+retention_run(run_id INTEGER PRIMARY KEY, policy_id INTEGER REFERENCES retention_policy(policy_id),
+     started_at TEXT, finished_at TEXT, dry_run INTEGER NOT NULL DEFAULT 1,
+     candidates INTEGER, deleted_media INTEGER, freed_bytes INTEGER, blocked_count INTEGER, report TEXT)
 
-setting_change(change_id PK, key, before jsonb, after jsonb,
-     changed_by FK user NULL, changed_via,                  -- ui|yaml|env|migration
-     precheck_result jsonb, applied bool, rolled_back bool, applied_at)
+setting(key TEXT PRIMARY KEY, value TEXT, value_type TEXT,
+     source TEXT NOT NULL DEFAULT 'default',                 -- source: default|yaml|db|env
+     schema_version INTEGER NOT NULL DEFAULT 1, updated_by INTEGER REFERENCES app_user(user_id),
+     updated_at TEXT, is_dangerous INTEGER NOT NULL DEFAULT 0, last_validated_at TEXT,
+     CHECK (source IN ('default','yaml','db','env')))
+
+setting_change(change_id INTEGER PRIMARY KEY, key TEXT,
+     before_state TEXT, after_state TEXT,                     -- 原 before / after（偏差[2]）
+     changed_by INTEGER REFERENCES app_user(user_id), changed_via TEXT,   -- ui|yaml|env|migration
+     precheck_result TEXT NOT NULL DEFAULT '{}', applied INTEGER NOT NULL DEFAULT 0,
+     rolled_back INTEGER NOT NULL DEFAULT 0, applied_at TEXT, created_at TEXT,
+     CHECK (changed_via IN ('ui','yaml','env','migration')))
 ```
 
 `setting` 表是 6.2 描述的设置层的落地：`source` 字段让"这个值是从哪来的"可被查询（对应 6.2.4 的 `config show --explain`），`setting_change` 让每次改动的前后值与校验结果可追溯，`dangerous` 项在写入前必须经过二次确认。设置项的自描述（label/help/impact/range）不在数据库里，而在版本化的注册表文件中，由界面读取——这样新增一项设置不需要写迁移。
+
+两处与 PG 版的实现差异要记住：
+
+- **没有布尔类型**：`dry_run` / `enabled` / `applied` / `is_dangerous` 这类列用 `INTEGER` 存 0/1，默认值写 `1` 表示真；读取时由应用层转换。
+- **SQLite 的连接级设置不随库走**：`foreign_keys` 默认关闭，任何一处漏设 `PRAGMA foreign_keys=ON` 都会让外键约束静默失效。因此连接必须集中在一处创建（见 9.2 的"数据库访问收敛在单一适配器"），不允许业务代码自己 `sqlite3.connect()`。
 
 ```mermaid
 stateDiagram-v2
@@ -576,37 +714,39 @@ stateDiagram-v2
 
 | 方案 | 优点 | 缺点 | 适用 |
 |---|---|---|---|
-| **SQLite + FTS5** | 零运维、单文件、备份简单、FTS5 有 BM25 | 并发写弱（WAL 下单写者）、无原生向量、JSONB 弱、迁移麻烦 | 极小规模（<5 万条）、纯本机体验。**本项目不推荐**：10 万条 + 三角色权限 + 任务队列已超出它的舒适区 |
-| **PostgreSQL** | 事务与约束强、JSONB、FTS + `pg_trgm`、pgvector、`SKIP LOCKED` 队列、生态成熟 | 需要一个服务进程；中文 FTS 需扩展（zhparser/pg_bigm，需核实可用性） | **默认选择** |
+| **SQLite + FTS5** | 零运维、零服务进程、单文件、备份=复制文件、FTS5 自带 BM25 与三元组分词、Python 标准库内置 | **单写者**（WAL 下读并发、写串行）、无原生向量类型、JSON 没有 GIN 索引、不支持跨机并发访问 | **默认选择（v3）**：10 万条量级实测绰绰有余；舒适区与上限见 3.7 |
+| **PostgreSQL** | 多写者与行级锁（`SKIP LOCKED` 队列）、JSONB + GIN、`pg_trgm`、pgvector、远程访问与备份工具成熟 | **需要一个常驻服务进程**：安装、升级、备份、故障恢复都要人管；中文 FTS 需扩展（zhparser/pg_bigm，可用性需核实），否则只能走应用层分词 | **升级路径**：需要多写者、远程/多用户访问或千万级规模时迁入（见 3.5） |
 | **DuckDB** | 列存分析快、读 Parquet 直接查 | 不适合做在线事务与并发写；无成熟 FTS/队列 | 分析型旁路：统计、报表、导出快照 |
 | **Obsidian / Markdown 文件** | 人类可读、可用现成编辑器、git 友好、便携 | 检索能力弱、并发与结构化查询差、tag 治理难、媒体关系难维护 | **作为导出/镜像格式**，不作为事实源 |
 | **对象存储（MinIO/S3）** | 内容寻址天然契合、可扩展、API 稳定 | 需要一个服务；本地小规模略重 | 推荐版本起的媒体层 |
 | **NAS（SMB/NFS）** | 容量大、成本低、家里已有 | 延迟高、锁语义弱、不可靠断连 | 冷数据/归档层；不用于热路径 |
 | **云盘（WebDAV/专有 API）** | 免运维、跨设备、有版本 | API 不稳、限流、隐私外泄、专有锁定 | 只作为**备份出口**，不参与在线读写 |
 
+v2 曾判定 SQLite"超出舒适区、本项目不推荐"，**v3 反转了这个结论**。反转的依据不是规模变小，而是把代价算清了：单写者对"日增 100 条"没有影响（实测批量写入约 8,900 条/秒），而"另起一个数据库服务"的安装、备份与故障恢复成本是每天都要付的。完整口径（哪些是实测、哪些是外推）见 3.7。
+
 ### 3.5 推荐默认组合与迁移路径
 
-**默认组合（推荐版本）**
-- 元数据与关系：PostgreSQL 16（单实例，含任务队列与 FTS）。
-- 媒体本体：本地目录 `/data/media`，通过 S3 兼容端口实现，配置项指向本地文件系统驱动。当需要多设备或容量扩展时，把配置切到 MinIO，对象键不变。
-- 检索索引：阶段 1 用 PG FTS；加入 Meilisearch 后，PG 仍是事实源，Meilisearch 只是可重建的派生索引。
-- 向量：阶段 2 用 pgvector。**按 10 万条量级，pgvector 是终局而非过渡**——10 万条 768 维向量（约 300 MB）加 HNSW 索引完全在单机能力内，Qdrant 在这个规模带来的收益不足以抵消多一个服务与备份对象的成本。仅当向量数 > 50 万或需要多向量/量化时再考虑 Qdrant。
+**默认组合（MVP 与推荐版本共用）**
+- 元数据与关系：**SQLite 单文件**（`<data_root>/pc.sqlite3`），WAL 模式，同时承担任务队列、FTS5 与全部派生索引。PRAGMA 基线与版本门槛见 3.2。
+- 媒体本体：本地目录（`<data_root>/media`，可指向任意路径或 NAS），通过 S3 兼容端口实现。需要多设备或容量扩展时把配置切到 MinIO，对象键不变。
+- 检索索引：阶段 1 只用 FTS5（双索引，见 5.1）；引入 Meilisearch 后 SQLite 仍是事实源，Meilisearch 只是可重建的派生索引。
+- 向量：**阶段 3 再定**（见 5.2）。10 万条 768 维向量约 300 MB：走内存暴力检索要常驻内存，走可加载扩展则要接受"允许加载本地扩展"的安全含义（等于允许任意代码执行），两条路的判据见 5.3。
 - 冷数据：NAS 目录挂载为 `storage_class=cold` 的后端。
 
-**迁移路径**
+**迁移路径（v3 反转方向：从 SQLite 向外扩，而不是向内收敛）**
 
 | 阶段 | 数据层变化 | 迁移动作 |
 |---|---|---|
-| 单机个人 | SQLite 或 PG（推荐直接 PG），本地目录 | — |
-| 单机扩容 | 媒体迁 MinIO，索引迁 Meilisearch | 对象键不变；索引全量重建（可重放） |
-| 家庭服务器/NAS | PG 独立服务 + MinIO + 定时备份到 NAS/云盘 | 数据库逻辑备份 + WAL 归档；媒体 rsync 后校验哈希 |
-| 小团队多用户 | PG 加 `tenant_id`（若做多租户）或用独立 schema/库隔离；外部队列（Redis Streams/NATS）；worker 水平扩展 | 加列 + 回填 + 唯一约束调整（唯一键全部前缀化 `tenant_id`） |
+| 单机个人（**默认**） | SQLite 单文件 + 本地目录 | — |
+| 容量或媒体增长 | 媒体迁 MinIO；索引加 Meilisearch | 对象键不变；索引全量重建（可重放）；数据库不动 |
+| 需要多写者 / 远程访问 / 多用户 | **SQLite → PostgreSQL** | 用同一份逻辑 schema 重建（类型映射见 3.2），按表搬迁数据；因数据库访问收敛在单一适配器（见 9.2），业务层与查询构造不动 |
+| 多租户 / 多机 | PG 加 `tenant_id`（若做多租户）或用独立 schema/库隔离；外部队列（Redis Streams/NATS）；worker 水平扩展 | 加列 + 回填 + 唯一约束调整（唯一键全部前缀化 `tenant_id`） |
 
-迁移成本评估：数据库从 SQLite → PG 是**最高成本**的一次迁移（建议一开始就用 PG，避免这次迁移）；索引层迁移是**最低成本**（可从 PG 全量重建，无需数据搬迁）；媒体层迁移成本中等（依赖哈希校验与对象键不变原则）。
+迁移成本评估：SQLite → PG 是**一次性、方向明确的上坡**，成本主要来自类型映射与数据搬迁，而不是业务代码改写——这正是 9.2 那条"数据库访问收敛在单一适配器"要买的东西。反向迁移（PG → SQLite）不鼓励：那意味着放弃多写者能力，并且要重新验证全部并发语义。索引层迁移成本最低（可从事实源全量重建），媒体层中等（依赖哈希校验与对象键不变原则）。
 
 ### 3.6 媒体本体与元数据分离
 
-**分离原则**：PostgreSQL 只存**元数据与指针**（`media_id, sha256, object_key, backend_id, 派生字段`），媒体字节只在存储后端。删除元数据不删除本体（除非显式硬删），反之亦然，通过后台一致性任务对账。
+**分离原则**：数据库只存**元数据与指针**（`media_id, sha256, object_key, backend_id, 派生字段`），媒体字节只在存储后端。删除元数据不删除本体（除非显式硬删），反之亦然，通过后台一致性任务对账。这也是"库很小"的根本原因：10 万条内容的库只有几百 MB，与媒体总量无关。
 
 **哈希策略**
 
@@ -616,13 +756,65 @@ stateDiagram-v2
 | BLAKE3 | 高速完整性校验、大文件流式校验 | 可选，作为 SHA-256 的加速补充 |
 | pHash（DCT） | 近重复、相似图检索的第一道 | 64 bit；汉明距离 ≤ 6 视为近重复，≤ 12 视为相似候选 |
 | dHash / aHash | 与 pHash 交叉验证，降低对抗性误判 | 三者投票，避免单一哈希被规避 |
-| 图像 embedding | 语义相似、以图搜图、聚类 | CLIP/SigLIP 系；本地生成，存向量库 |
+| 图像 embedding | 语义相似、以图搜图、聚类 | CLIP/SigLIP 系；本地生成；存储与检索方式阶段 3 再定（见 5.2） |
 | 文本 content_hash | 文本项精确去重 | 归一化后（去空白、统一标点、去转发前缀）计算 |
 | MinHash/SimHash | 长文本近重复 | 可选；短文本用编辑距离或 trigram Jaccard |
 
 **去重与 canonical 归并**：精确命中直接复用 `media_id`（多对一），`content_item` 仍各自保留（不同来源、不同语境）。近重复用 `dup_group_id` 聚合，选 `canonical_id`：优先级 = 分辨率高 > 文件大 > 无二次压缩痕迹 > 最早入库。检索默认按 canonical 折叠展示，提供"展开同组"选项。canonical 选择必须可人工覆写，且覆盖记录进审计。
 
 **校验策略**：写入时算哈希并记录 `size_bytes`；后台一致性任务定期抽样重新读取并校验 sha256；发现不匹配标记 `scan_status='suspicious'` 并告警。备份恢复后强制全量校验一次哈希清单。
+
+### 3.7 SQLite 落地实测记录与容量承诺
+
+本节把"为什么敢换成 SQLite"的证据固定下来，并明确区分**实测**与**推算**——两者不能混为一谈。
+
+**测试环境**：Windows 11；13th Gen Intel i7-13620H（16 逻辑核）；47.6 GB 内存；Python 3.13.7 自带的 SQLite **3.50.4**（`sqlite3.sqlite_version`）。数据为合成数据，口径：每条内容项含约 300 个汉字的文本（正文 80 字 + OCR 52 字且覆盖率 40% + 消息原文与分词各约 80 字）、8 条标签赋值、0.6 条媒体元数据、0.77 条消息。
+
+**能力探测（逐项实测）**
+
+| 能力 | 结果 |
+|---|---|
+| FTS5 全文检索、`tokenize='trigram'`、`tokenize='unicode61'` | 支持 |
+| 部分唯一索引、`CHECK`、JSON 函数、`UPSERT`、`RETURNING`、生成列、`STRICT` 表 | 支持 |
+| WAL 模式（`journal_mode=wal` 持久生效） | 支持 |
+| 写事务进行中的并发读 | 支持 |
+| 原子队列抢占（`BEGIN IMMEDIATE` + SELECT + UPDATE + COMMIT） | 可行 |
+| **多写者 / `FOR UPDATE SKIP LOCKED`** | **不支持**：第二个写者得到 `database is locked` |
+| **数组类型 `text[]`** | **不支持**：SQLite 接受任意类型名，但绑定 Python `list` 直接报错（假阳性陷阱） |
+
+**体积与吞吐（实测，5,000 条规模）**
+
+| 指标 | 实测值 |
+|---|---|
+| 插入 + 建索引耗时 | 0.6 秒（约 **8,900 条/秒**） |
+| 落盘体积 | 29.1 MB |
+| **每条内容项占用** | **约 5.96 KB**（含标签、媒体元数据、消息与两个 FTS 索引） |
+
+**容量推算（明确标注为外推）**
+
+| 规模 | 预估体积（按每条 6 KB 线性外推，并计入 1.2–1.5 倍索引增长冗余） |
+|---|---|
+| 1 万条 | 约 60 MB |
+| 10 万条（设计目标） | 约 0.6–0.9 GB |
+| 50 万条 | 约 3–4.5 GB |
+| 100 万条 | 约 6–9 GB |
+
+性能上限**不取决于行数，而取决于库能否常驻内存**：索引一旦大于可用内存，随机读落到磁盘，延迟从毫秒级升到几十毫秒。按 6 KB/条估算，工程经验值是"库体积不超过可用内存的三分之一"：
+
+| 机器内存 | 常驻上限 | 对应内容量（体验不显著下降） |
+|---|---|---|
+| 8 GB | 约 2.5 GB | 约 40 万条 |
+| 16 GB | 约 5 GB | 约 80 万条 |
+| 32 GB | 约 10 GB | 约 160 万条 |
+
+**写入侧**：实测 8,900 条/秒的批量写入，而设计量级是**日增 100 条**，相差约 6 个数量级；即便放大到日增 10 万条，一天也只有十几秒的写入工作。瓶颈从来不是写入量，而是"批量重算"这类长事务——对策是分批（见 2.3）。
+
+**四条必须带进实现与测试的结论**
+
+1. 连接必须集中创建并统一设置 PRAGMA；`foreign_keys=ON` 尤其容易漏，漏了外键会静默失效。
+2. 启动时校验 `sqlite3.sqlite_version_info >= (3, 40)`，不满足就 fail closed 并给人话提示。
+3. FTS5 用 external content 表时，**删除与更新索引行的语义必须在迁移计划里实测并写成断言**（本节探测只覆盖插入与查询）。
+4. 本节数字全部来自 5,000 条规模的单机实测；10 万条以上是线性外推。迁移完成后必须用真实数据复核，并把复核结果回写本节。
 
 ---
 
@@ -670,7 +862,7 @@ stateDiagram-v2
 ### 4.4 图文混合与转发消息
 
 - 拆分为多个 `content_item`，共享 `message_id`，检索结果按消息聚合展示（避免一条图文消息在结果里出现 5 次）。
-- 转发链：能解析的转成 `repost_of_message_id`，不能解析的写入 `forward_chain` JSONB。转发的**原始作者**是重要的检索维度，应在 UI 中区分"谁发的"与"谁原创的"。
+- 转发链：能解析的转成 `repost_of_message_id`，不能解析的写入 `forward_chain`（JSON 文本）。转发的**原始作者**是重要的检索维度，应在 UI 中区分"谁发的"与"谁原创的"。
 - 引用/回复：解析 `reply_to_platform_id`，在详情页展示上下文线程。
 
 ### 4.5 能力评估表
@@ -687,7 +879,7 @@ stateDiagram-v2
 | NSFW 分类 | 本地分类器 + tagger rating 标签 | 云端审核 API | 是 | 近零 | **中~高（二次元误判）** | 无（本地） | **必须**：不确定转人工 |
 | 恶意内容检测 | 本地规则 + LLM 辅助 + 人工 | 云内容安全 API | 是 | 低 | 中 | 外发风险 | 灰名单复核 |
 | 感知哈希/近重复 | pHash+dHash+aHash 投票 | 图像 embedding 近邻 | 是 | 近零 | 低 | 无 | 归并冲突复核 |
-| 图像向量检索 | CLIP/SigLIP + Qdrant/pgvector | 云端多模态 embedding | 是 | 近零 | 中（同人图区分度有限） | 无 | 相似度阈值调优 |
+| 图像向量检索 | 阶段 3 再定（见 5.2、5.3） | 云端多模态 embedding | 是 | 近零 | 中（同人图区分度有限） | 无 | 相似度阈值调优 |
 | 角色识别 | 特征分解 + 权重打分（4.8）+ 自建参考库 kNN | 第三方反查 API（需外发放行） | **是** | 近零（特征路线）/ 按次（反查） | 头部角色可用，**长尾必然失败**——故设计为"进桶"而非"错标" | 反查会外发图片 | **必须**：低置信度不落角色 tag，进桶或复核 |
 | 作品识别 | 人工 + 来源元数据为主，参考库 kNN 辅助 | 反查 API | 是 | 近零 | **高**（作品特征弱、画风差异大） | 同上 | 必须 |
 | 特征 tag（发色/发型等） | WD tagger 输出直接采纳（高阈值） | 自训特征模型 | 是 | 近零 | 低（这些特征本身识别很稳） | 无 | 抽样即可 |
@@ -881,21 +1073,25 @@ WD tagger 输出（已带置信度）
 
 ## 5. 搜索与推荐设计
 
-### 5.1 阶段 1：BM25 / 倒排 / 过滤（PostgreSQL）
+### 5.1 阶段 1：BM25 / 倒排 / 过滤（SQLite FTS5）
 
-- `tsvector` 列（`simple` 配置，避免英文词干化破坏中文与专有名词）+ `pg_trgm` 做模糊与子串匹配。
-- 中文分词二选一：`zhparser`（基于 SCWS）或 `pg_bigm`（无需词典，二元组，中文容错好）。**需核实**目标 PG 版本与平台的扩展可用性；若不可用，降级方案是应用层分词后写入 `text_search` 字段（空格连接），用 `simple` 配置检索——这没有额外扩展依赖，是**最稳的兜底**。
-- 检索字段合成一个 `search_document`：原始文本 + OCR 文本 + caption + tag 名 + 同义词 + 来源名 + 发送者名 + 链接标题/描述。这一招能让"任意字段命中"变得简单，但必须保留分字段加权的可能（用 `setweight`）。
+- **两个 FTS5 索引**，都用 external content 表（`content='content_item'`、`content_rowid='content_id'`，只存倒排表、不复制正文）：
+  - `content_fts`：`tokenize='trigram'`，承担子串与容错检索（前缀、错字、任意位置的字串）。
+  - `content_word`：`tokenize='unicode61'`，喂入**应用层分词结果**（jieba / pkuseg，空格连接后写入 `content_item.text_search`），承担词级检索。
+- **中文分词放在应用层**，不依赖任何数据库扩展。这是相对 v2 的实质简化：v2 需要核实 `zhparser` / `pg_bigm` 在目标 PG 版本上的可用性，并在不可用时降级到应用层分词；v3 直接把应用层分词定为唯一路径，少一个"需核实"项、少一处平台差异。
+- **必须知道的退化点**：FTS5 的 `trigram` 与 PG 的 `pg_trgm` 一样，**查询串少于 3 个字符时用不上索引**。中文里 2 字查询极常见（"蓝发"），因此 **2 字查询必须走 `content_word` 词级索引**，由应用层分词保证"蓝发"是一个词。查询构造要先看查询长度与分词结果，再决定查哪个索引——这条要写进实现，并在测试里用"2 字查询必须命中索引"的断言守住。
+- 检索字段合成一个 `search_document`：原始文本 + OCR 文本 + caption + tag 名 + 同义词 + 来源名 + 发送者名 + 链接标题/描述。分字段加权用 `bm25()` 的列权重参数（替代 v2 的 `setweight`）。
 - 过滤维度：`source_id`、`sender_identity_id`、时间范围、`item_type`、`lang`、`nsfw_level`、`status`、`namespace` 下的 tag 集合（`tag_assignment` 上建 `(tag_id, content_id)` 索引，多 tag 过滤用交集或 `GROUP BY ... HAVING count(*) = n`）。
-- 排序：BM25 相关度（`ts_rank_cd`）× 时间衰减 × 来源信任度。搜索结果必须支持"仅看原图"（canonical 折叠）。
+- 排序：BM25 相关度（`bm25()`）× 时间衰减 × 来源信任度。搜索结果必须支持"仅看原图"（canonical 折叠）。
+- **索引同步**：external content 表要求索引行与正文行一致——软删、改 tag、重算 caption 都要同步更新索引行。**删除/更新语义在迁移计划里必须实测并写成断言**（见 3.7 的四条结论之一）。
 
 ### 5.2 阶段 2：混合检索
 
 ```
 query
   ├─ 查询理解（规则优先；必要时 LLM）→ {keywords[], filters{}, semantic_intent}
-  ├─ 关键词通道：Meilisearch / PG FTS  → R1 (top 100)
-  ├─ 向量通道：text embedding → Qdrant/pgvector → R2 (top 100)
+  ├─ 关键词通道：Meilisearch / FTS5  → R1 (top 100)
+  ├─ 向量通道（阶段 3 再定选型，见 5.3）：text embedding → 向量索引 → R2 (top 100)
   │   （图片查询时：image embedding → 同一向量空间 → R2')
   ├─ 元数据过滤：tag/source/time/type/nsfw 在两条通道上都下推（pre-filter）
   ├─ 融合：RRF (k=60) 或加权归一化 → top 50
@@ -903,21 +1099,24 @@ query
   └─ 解释：每条结果附带命中来源（哪个字段、哪个 tag、哪个向量邻居、哪个过滤器）
 ```
 
-**图片来源的 two-stage 检索**：先用 embedding 召回（快、容忍形变），再用 pHash 汉明距离精确校验（准、抗对抗）。两者结合比单用任一都好，且 pHash 校验是**本地、零成本、可解释**的。
+**本阶段（阶段 2）实际要做的**：关键词通道 + 元数据过滤 + RRF 融合 + 解释性，**不含向量通道**。向量通道在阶段 3 定选型（见 5.3）；阶段 2 的产出正好是它的基线——先量出"纯关键词 + 标签"的召回质量，才知道向量能补上多少。
+
+**图片来源的 two-stage 检索（阶段 3）**：先用 embedding 召回（快、容忍形变），再用 pHash 汉明距离精确校验（准、抗对抗）。两者结合比单用任一都好，且 pHash 校验是**本地、零成本、可解释**的。
 
 ### 5.3 组件比较
 
 | 组件 | 适用条件 | 优势 | 代价 |
 |---|---|---|---|
-| **PostgreSQL FTS** | 规模 < 30 万、查询模式简单、想零额外服务 | 与事务同库、无同步问题、可事务性更新 | 中文需扩展或应用层分词；排序与容错弱于专用引擎 |
-| **SQLite FTS5** | 纯本机、单用户 | 零运维、BM25 内建 | 并发弱、无服务化、向量弱 |
+| **SQLite FTS5** | **本项目默认**：单机单用户、10 万条量级 | 零运维、零服务、与事实源同一个文件、BM25 与列权重内建、`trigram` 支持中文子串、索引可全量重建 | 单写者；少于 3 字的查询用不上 `trigram`（要靠预分词的词级索引）；复杂聚合力弱 |
+| **PostgreSQL FTS** | 已经迁到 PG 之后（见 3.5） | 与事务同库、可事务性更新、`setweight` 分字段加权 | 中文需扩展或应用层分词；要维护一个服务进程 |
 | **Meilisearch** | 个人/小团队首选补充 | 开箱中文与容错、typo 容忍、极简运维、简单过滤 | 索引需与 PG 同步（可重建）；复杂聚合弱 |
 | **Typesense** | 需要更强过滤与聚合 | 过滤语法强、性能好 | 生态小于 Meilisearch |
 | **OpenSearch/Elasticsearch** | 规模大、需要复杂分析与聚合 | 能力最全、生态最广 | **运维成本高**，个人项目是过度设计 |
-| **pgvector** | 向量 < 50 万、想省一个服务。**本项目 10 万条量级下这是终局选择，不是过渡** | 与元数据同库、SQL 联合过滤、事务一致 | 索引调优与规模上限低于专用库 |
-| **Qdrant** | 向量 > 50 万、需要 HNSW 参数调优、多向量、强 payload 过滤。**本项目当前不需要** | 专用性能好、过滤强、可自托管、Rust 单二进制 | 多一个服务与备份对象 |
+| **内存暴力检索（numpy）** | 阶段 3 候选方案之一：向量数 ≤ 数十万 | 不引入任何扩展、实现最简单、结果完全可解释 | 向量要常驻内存（10 万条 768 维约 300 MB，50 万条约 1.5 GB）；每次查询做全量点积 |
+| **sqlite-vec 等可加载扩展** | 阶段 3 候选方案之二：需要更好的近邻性能 | 与库同文件、SQL 联合过滤、比暴力快 | **加载扩展等于允许任意代码执行**：只能加载随包分发并校验哈希的扩展；版本与许可证要自己盯 |
+| **Qdrant** | 向量 > 50 万、需要 HNSW 调参、多向量或量化 | 专用性能好、过滤强、可自托管、Rust 单二进制 | 多一个服务与备份对象 |
 
-**推荐判断**：起步用 PG FTS；一旦出现"中文搜不到/错字搜不到/排序不满意"，就上 Meilisearch（这一步几乎必然发生，建议在 MVP 就把检索接口抽象好）。向量用 pgvector 即可，**在 10 万条量级下不需要评估 Qdrant**——换向量库的收益要到向量数几十万以上才显现。向量检索的真正难点不在引擎，而在 embedding 模型对同人图的区分度，把精力放在那里更有价值。
+**推荐判断（v3）**：起步只用 FTS5 双索引，**先把关键词、标签与过滤器做扎实**；向量检索的选型**推迟到阶段 3**，届时的判据是三条——数据量（是否超过几十万条）、内存预算、以及是否愿意接受"允许加载本地扩展"的安全含义。检索层的两个接口（`SearchIndex`、`VectorStore`）从 MVP 就抽象好，所以上面这几种选择都不会推翻既有代码。向量检索的真正难点不在引擎，而在 embedding 模型对同人图的区分度，把精力放在那里更有价值。
 
 ### 5.4 自然语言查询
 
@@ -975,15 +1174,15 @@ query
 
 ### 6.2 root 用户画像与配置分层（面向"会用的人"和"不想懂技术的人"）
 
-**问题**：root 用户同时是两类人——愿意读代码、改 YAML、加连接器的开发者，和只想把东西跑起来用、看到 `docker-compose.yml` 就头疼的普通用户。这不是体验问题，是设计约束：**如果调参必须改配置文件并重启，普通用户就永远用默认值；如果所有参数都藏在配置里，开发者就永远要绕过界面。**
+**问题**：root 用户同时是两类人——愿意读代码、改 YAML、加连接器的开发者，和只想把东西跑起来用、看到命令行与配置文件就头疼的普通用户。这不是体验问题，是设计约束：**如果调参必须改配置文件并重启，普通用户就永远用默认值；如果所有参数都藏在配置里，开发者就永远要绕过界面。**
 
 **判断：核心矛盾不是"配置放哪"，而是"哪些配置可以安全地让人改"。** 因此按危险程度分三层，而不是按技术程度分。
 
 | 层 | 面向谁 | 存放形式 | 修改方式 | 生效方式 |
 |---|---|---|---|---|
-| **L1 设置页** | 所有 root | PostgreSQL `setting` 表（键值 + 类型 + 版本） | Web 界面，中文标签、分组、每项一句大白话说明 | **热更新**，无需重启（见下） |
+| **L1 设置页** | 所有 root | SQLite `setting` 表（键值 + 类型 + 版本） | Web 界面，中文标签、分组、每项一句大白话说明 | **热更新**，无需重启（见下） |
 | **L2 开发配置** | 开发者 | `config/app.yaml`（带注释、进 git） | 编辑器直接改，或界面"高级"标签页（YAML 编辑器 + schema 校验） | 校验通过后热重载；影响进程结构的项提示重启 |
-| **L3 部署配置** | 部署者 | `docker-compose.yml` / `.env` | 编辑器或部署脚本 | 需重启容器栈 |
+| **L3 部署配置** | 部署者 | `.env`、`PC_DATA_ROOT` 与平台默认数据目录；用 Docker 时还有 compose 文件 | 编辑器或部署脚本 | 需重启进程（或容器栈） |
 
 **关键原则：大多数设置项只有一个来源。** L1 的 `setting` 表在首次启动时用 `config/app.yaml` 的 `defaults` 段播种，此后以数据库为准；YAML 中对应键被标记为 `seeded_by_ui: true`，界面会明确显示"此项由设置页管理"。这条规则避免了"改了文件没生效""界面上改了但重启被覆盖"这类最让人困惑的故障。
 
@@ -1083,7 +1282,7 @@ query
 界面保存
   → 服务端用注册表校验（类型、range、requires 依赖链）
   → 写 setting 表（含 before/after、操作者、时间；dangerous 项强制二次确认）
-  → 发布配置版本号（单调递增），通过进程内事件 + PostgreSQL LISTEN/NOTIFY 广播
+  → 发布配置版本号（单调递增），通过进程内事件广播；跨进程时各进程轮询 setting 表的版本列（SQLite 没有 LISTEN/NOTIFY）
   → app / worker / scheduler / retention 各自收到通知后原子替换内存中的配置快照
   → 需要重算的项（recompute 非空）→ 提示并（可选）自动入队一个重算任务，同样走 dry-run 风格的影响预估
   → 界面显示"已生效"或"已生效，有 3 项需重启"，绝不静默
@@ -1122,7 +1321,7 @@ query
 
 #### 6.2.5 落地记录（骨架阶段实现）
 
-以下几条是写代码时才需要拍板、而前面没写死的地方。结论记在这里，实现见 `src/pc/config.py` 与 `pc.adapters.postgres` 的 `setting` / `setting_change` 读写：
+以下几条是写代码时才需要拍板、而前面没写死的地方。结论记在这里，实现见 `src/pc/config.py` 与 `pc.adapters.sqlite` 的 `setting` / `setting_change` 读写（v2 时期落在 `pc.adapters.postgres`，迁移计划里改名）：
 
 - **注册表加载 fail closed**：未知字段、未知键名、键名重复、默认值越界都在加载时就报错，并尽量给出"是不是想写 X"的建议。这些错误全都属于"改了没生效"那一类，越晚发现越难查。
 - **`requires` 不在加载期校验**：依赖是否满足要看运行期其它项的值，而且依赖可以指向一个"状态标志"（如 `ai.provider_policy_registered`）而不是设置项。因此加载期只校验类型与范围；依赖校验放在 `validate_value` / `plan_setting_change`，并且**拿不到依赖值一律视为未满足**（fail closed）。
@@ -1206,14 +1405,14 @@ content_item（已扫描、已脱敏候选）
 **服务商策略登记表（必须落到数据里，而不是靠记忆）**
 
 ```sql
-ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
-     data_retention,          -- none|short|long|unknown      （是否留存请求/响应，需核实）
-     trains_on_data,          -- no|opt_out_available|yes|unknown
-     data_region, dpa_ref,    -- 数据处理协议引用
-     allowed_purposes text[], -- tag|ocr|caption|embed|query_parse|rerank
-     max_nsfw_level smallint, -- 允许外发的最高敏感级
-     requires_pii_strip bool, -- 是否强制脱敏（默认 true）
-     verified_at, verified_by FK user, notes, enabled)
+ai_provider_policy(policy_id INTEGER PRIMARY KEY, provider TEXT, endpoint TEXT, model_pattern TEXT,
+     data_retention TEXT,     -- none|short|long|unknown      （是否留存请求/响应，需核实）
+     trains_on_data TEXT,     -- no|opt_out_available|yes|unknown
+     data_region TEXT, dpa_ref TEXT,    -- 数据处理协议引用
+     allowed_purposes TEXT,   -- JSON 数组：tag|ocr|caption|embed|query_parse|rerank
+     max_nsfw_level INTEGER,  -- 允许外发的最高敏感级
+     requires_pii_strip INTEGER,  -- 是否强制脱敏（默认 1）
+     verified_at TEXT, verified_by INTEGER REFERENCES app_user(user_id), notes TEXT, enabled INTEGER)
 ```
 
 - `data_retention` 与 `trains_on_data` **必须逐项核实**（多数服务商的默认行为与"企业版/API 版"不同，且会随条款变化）。
@@ -1298,7 +1497,7 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 | 10 | 越权访问 | 未授权用户访问 API/界面，或普通成员访问非授权来源 | 隐私泄露 | 鉴权中间件、scope 校验、异常访问审计 | RBAC + scope + 最小权限；默认只监听本机/内网；反向代理层认证 | 配置错误；**残余低** |
 | 11 | 隐私泄露 | 日志/导出/备份中含敏感信息；LLM 外发含个人信息 | 泄露第三方隐私 | 脱敏管线 + 导出审计 + 外发前策略判定 | 日志脱敏、外发白名单、导出需二次确认、备份加密 | 人为误操作；**残余中** |
 | 12 | 凭证泄露 | API key 落日志、镜像层、任务载荷、git 仓库 | 账号被滥用、费用损失 | 密钥扫描、日志脱敏、仓库预提交钩子 | 信封加密 + 只存哈希 + 内存使用 + 定期轮换 | 主机被控；**残余中** |
-| 13 | 依赖供应链 | 恶意/被投毒的模型权重、pip 包、Docker 镜像 | 任意代码执行 | 依赖锁定 + 哈希校验 + 权重来源与格式校验 | 只用可信来源（官方 HF 仓库 + 固定 revision）、镜像固定 digest、定期更新 | 上游被投毒；**残余中** |
+| 13 | 依赖供应链 | 恶意/被投毒的模型权重、pip 包、Docker 镜像、**SQLite 可加载扩展**（阶段 3 若引入） | 任意代码执行（加载 SQLite 扩展尤其直接：它就是本机代码） | 依赖锁定 + 哈希校验 + 权重来源与格式校验 | 只用可信来源（官方 HF 仓库 + 固定 revision）、镜像固定 digest、定期更新；**SQLite 扩展只允许随包分发并校验哈希的那一个，且默认不开启扩展加载** | 上游被投毒；**残余中** |
 | 14 | 模型输出 | 幻觉生成不存在的事实性元数据 | 数据污染，误导检索 | 事实字段只来自平台；LLM 输出 schema 只允许建议类字段 | 禁止 LLM 写事实字段；建议 tag 走 pending | 人工误采纳；**残余低** |
 | 15 | 存储后端 | 云盘/对象存储错误配置为公开可读 | 全量内容泄露 | 定期权限巡检 | 默认本地；云盘只作加密备份出口；桶策略最小权限 | 云侧误配；**残余中** |
 | 16 | 匿名提报入口（L2） | 投稿违法/受限内容、内容投毒、把系统当免费存储或文件分发站、刷量挤占队列 | 法律责任、磁盘与队列被占满、主库被污染 | 提交侧配额与速率异常、扫描拒绝率、队列构成分析 | 独立隔离区 + 默认恶意 + 审查前零副作用 + 验证码 + 严格配额 + 全局熔断 + 只存 IP 哈希 | 有组织的小流量慢速投稿；**残余中** |
@@ -1319,9 +1518,10 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 - **背压**：队列深度超过阈值时，暂停低优先级来源的同步（而非盲目堆积）；磁盘水位超阈值时停止媒体下载并告警。
 - **一致性对账任务**：每日核对 `media` 表与实际对象存储；每周抽样校验哈希；每月核对索引条数与 DB 条数、清理孤儿对象。
 - **备份**：
-  - PostgreSQL：`pg_dump` 每日全量 + WAL 归档（可选），保留 7 日/4 周/6 月分层。
+  - **数据库（SQLite 单文件）**：每日用 `VACUUM INTO`（或用 Python 的 `Connection.backup()`）生成一个事务一致快照，随做 `PRAGMA integrity_check` 与行数核对，保留 7 日/4 周/6 月分层。备份**不需要停写**；WAL 由自动检查点自然收敛，无需额外归档。
+  - **备份与库必须放不同物理介质**：单文件是 SQLite 最大的优点，也是它最大的风险点——一块盘坏掉就同时丢掉库和它的备份。
   - 媒体：内容寻址天然增量，rsync/restic 增量备份到 NAS + 云盘（加密）。
-  - 索引：不备份（可从 DB 重建），只备份配置。
+  - 索引：不备份（可从事实源重建），只备份配置。
   - 恢复演练：每季度一次从备份恢复到干净环境并跑哈希校验；**未演练的备份不算备份**。
 - **可观测性**：指标（Prometheus 格式）覆盖队列深度、任务成功率/延迟、各来源同步新鲜度、限流命中、扫描拒绝数、LLM token 与花费、磁盘与对象数、索引延迟。日志结构化（JSON）+ 请求 ID 贯穿；敏感字段在写入前脱敏。追踪可选（OpenTelemetry）用于跨 worker 的链路。
 - **告警**：来源同步超过 N 小时无新数据（可能是凭证失效或平台变更）、死信增长、磁盘 > 85%、单日 LLM 花费超预算、扫描器大量拒绝（可能是攻击或配置错误）。告警走本地通知渠道（邮件/webhook/Telegram），避免依赖单一云服务。
@@ -1331,9 +1531,9 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 
 | 部署 | 硬件 | 组件 | 适合 | 注意 |
 |---|---|---|---|---|
-| **个人本地（推荐起点）** | 4~8 核、16 GB 内存、可选 GPU（8 GB 显存足够跑 tagger 与小 VLM）、SSD + HDD | Docker Compose：app + worker + PostgreSQL + Meilisearch + MinIO（可选）+ Qdrant（可选） | 单人、< 50 万条内容 | 只监听本机/内网；媒体目录与 DB 分别放 SSD/HDD；定时备份到 NAS |
-| **小型 NAS / 家用服务器** | NAS（群晖/威联通）或小型工控机 + 外接存储 | 同上 + NAS 作为冷存储与备份目标；GPU 可选（无 GPU 则视觉任务排队或用云端） | 小团队 2~5 人、需要多设备访问 | 反向代理 + HTTPS + 认证；限制 Web 界面暴露；NAS 只用于冷数据与备份，不做热路径 |
-| **云部署** | 云主机 + 对象存储 + 托管 PG | app/worker 容器 + 托管 PostgreSQL + S3 + 可选托管向量库；出口固定 IP | 需要公网 webhook、需要多地访问、无本地硬件 | 成本显著上升；数据出境与隐私评估；出口固定 IP 便于平台白名单；务必做对象存储私有化与加密 |
+| **个人本机（推荐起点）** | 4~8 核、16 GB 内存、可选 GPU（8 GB 显存足够跑 tagger 与小 VLM）、SSD + HDD | **原生安装**：`pc serve` 单进程（含后台调度）+ SQLite 单文件 + 本地媒体目录；可选 Meilisearch / MinIO | 单人、**10 万~100 万条内容** | 只监听本机/内网；库与媒体目录分放 SSD/HDD；每日 `VACUUM INTO` 到 NAS 或另一块盘 |
+| **家用 NAS / 小主机** | NAS（群晖/威联通）或小型工控机 + 外接存储 | 原生安装为主；**需要隔离时**再上 Docker（GHCR 镜像，单容器 + 一个数据卷）；NAS 作为冷层与备份目标；GPU 可选（无 GPU 则视觉任务排队） | 1~3 人、需要多设备访问 | 反向代理 + HTTPS + 认证；NAS 只用于冷数据与备份，不做热路径；**多人同时写入是本方案的边界**（见 3.5） |
+| **多人 / 远程访问** | 云主机或家用服务器 + 托管 PG | app/worker 容器 + **PostgreSQL**（此时按 3.5 迁移）+ 对象存储 + 可选托管向量库；出口固定 IP | 需要公网 webhook、多人共享、多地访问 | 已超出 SQLite 的适用面；成本显著上升；数据出境与隐私评估；出口固定 IP 便于平台白名单；务必做对象存储私有化与加密 |
 
 个人场景强烈建议：**本地 + Tailscale（或同类组网）访问**，避免为内网工具开公网端口。若必须接收 webhook，用 Cloudflare Tunnel / Tailscale Funnel 这类出站隧道，而不是端口转发。
 
@@ -1345,8 +1545,8 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 | 视觉模型 API | 按图/按 token | 图片数量、分辨率、是否只处理难例 | 云端图像标签/OCR 通常每千张几个到几十元不等（**需核实**） |
 | 图像反查 API | 按次 | 查询次数 | SauceNAO 等有免费额度与付费档（**需核实**其条款、限流与价格） |
 | 对象存储 | 存储 GB/月 + 请求数 + 出流量 | 媒体总量、缩略图倍数、访问模式 | 本地存储≈硬件成本；云存储注意出流量费 |
-| 数据库 | 自托管≈0；托管按实例 | 实例规格、备份存储 | 托管 PG 是云部署主要固定成本 |
-| 检索/向量 | 自托管≈0；托管按实例/请求 | 向量数、维度、副本 | pgvector/Qdrant 自托管几乎零边际成本 |
+| 数据库 | 自托管≈0（**SQLite 没有服务进程**）；托管按实例 | 实例规格、备份存储 | 默认 **0 成本**；只有按 3.5 迁到托管 PG 之后才产生固定成本 |
+| 检索/向量 | 自托管≈0；托管按实例/请求 | 向量数、维度、副本 | FTS5 就在数据库文件内，零边际成本；阶段 3 的向量方案成本主要体现在**内存占用**而非服务费 |
 | 代理/抓取 | 代理流量费、隧道服务费 | 外链抓取量、是否需住宅代理 | 尽量不抓；如需抓，成本随量线性增长 |
 | 带宽 | 下载媒体、备份上传 | 日增媒体体积、备份频率 | 家用带宽上行通常是瓶颈 |
 | 电费/GPU | 常驻功耗 | 是否 24×7 跑本地模型 | 本地推理的隐性成本，批量处理可错峰 |
@@ -1370,13 +1570,17 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 
 **为什么必须内建**：日增 100 条约等于每月 3000 条，若含图片，按平均 1.5 MB/条估算就是每月约 4.5 GB、每年约 55 GB（未计缩略图与重复副本）。这不是灾难性增长，但**没有任何清理机制的系统最终一定会因为磁盘满而停摆**，而停摆时的第一反应往往是"先删点东西"——那是最容易误删的时刻。所以策略必须事先定义、自动执行、可预演。
 
+**数据库本身的增长要小得多**：按 3.7 的实测口径每条约 6 KB，10 万条约 0.6–0.9 GB，一年新增 3.6 万条也只增加约 200–350 MB。真正吃盘的是媒体字节，而它已经在内容寻址目录里、由本节的策略单独治理。
+
+**批量作业必须分批**：重打标、重算去重、重建索引这类操作要按批提交（见 2.3），否则会长时间独占 SQLite 的写锁，把采集与人工复核一起卡住。
+
 **三层存储位置**
 
 | 层 | 存放内容 | 介质建议 | 访问延迟要求 |
 |---|---|---|---|
 | hot | 元数据、缩略图、preview、近 6~12 个月的媒体本体、embedding | SSD / 本地磁盘 | 秒级 |
 | cold | 较早的媒体本体、低频访问的原始文件 | HDD / NAS | 可接受数秒~数十秒，UI 显式提示"正在从冷层取回" |
-| archive | 仅元数据 + 校验哈希 + 来源指针（本体已删除或仅在离线备份中） | 元数据留在 PG | 只可检索，取原图需人工恢复或标记为"已失联" |
+| archive | 仅元数据 + 校验哈希 + 来源指针（本体已删除或仅在离线备份中） | 元数据留在 SQLite | 只可检索，取原图需人工恢复或标记为"已失联" |
 
 **删除的四个层级（按可逆性递增）**
 
@@ -1428,25 +1632,28 @@ ai_provider_policy(policy_id PK, provider, endpoint, model_pattern,
 |---|---|---|---|---|---|
 | 语言/运行时 | Python 3.12 | AI 生态与采集生态最全 | Node/TS、Go（AI 生态弱） | 高（重写） | 低 |
 | API | FastAPI | 类型校验、异步、自动 OpenAPI | Litestar、Flask | 低 | 低 |
-| 任务队列 | PostgreSQL 任务表 | 零运维、事务一致 | RQ、Dramatiq、Celery | 低（接口抽象） | 低 |
-| 数据库 | PostgreSQL | **10 万条量级下这是终局配置**，一组件顶三个；不需要为规模换任何东西 | SQLite（本场景不推荐） | 中（若从 SQLite 迁移） | 低 |
-| 全文检索 | PG FTS + 应用层分词 | 10 万条规模下 PG FTS 响应完全够用，无额外服务 | Meilisearch（中文体验更好，仍建议抽象好接口） | 低（索引可重建） | 低 |
+| 任务队列 | SQLite 任务表 + `BEGIN IMMEDIATE` 原子抢占 | 零运维、事务一致；单写者，事务必须短（见 2.3） | RQ、Dramatiq、Celery（都要求额外进程或中间件） | 低（接口抽象） | 低 |
+| 数据库 | **SQLite 单文件** | **10 万条量级下这是终局配置**：事实源 + 队列 + FTS 一个文件顶三个，零服务进程、零安装、备份=复制文件 | PostgreSQL（需要多写者或远程访问时才上，见 3.5） | 中（有明确的上坡迁移路径，见 3.5） | 低 |
+| 全文检索 | SQLite FTS5（`trigram` + 预分词 `unicode61` 双索引） | 10 万条规模下响应完全够用、无额外服务；中文分词在应用层，不依赖任何数据库扩展 | Meilisearch（中文体验更好，仍建议抽象好接口） | 低（索引可重建） | 低 |
 | 媒体存储 | 本地目录 + S3 兼容抽象 | 最省事、可平滑转对象存储 | MinIO 直接起步 | 低 | 低 |
 | 用户与鉴权 | FastAPI 依赖注入 + scope 校验 + TOTP | 三层信任模型需要显式鉴权中间件 | Authlib / 自建 session | 低 | 低 |
 | UI | Next.js（或 SvelteKit） | 搜索/编辑/审查台交互复杂，需要成熟框架 | HTMX + 服务端渲染（更省） | 中 | 低 |
 | 图像打标 | WD 系 tagger（ONNX） | 二次元场景成熟、本地、零调用成本 | 云端 vision API | 低 | 中（模型版本与许可证需核实） |
 | 去重 | sha256 + pHash | 简单可靠 | 图像 embedding | 低 | 无 |
 | 容量管理 | 保留策略引擎 + 定时任务 + 存储页面 | 必须内建，否则磁盘满时被迫临时决策（见 7.5） | 手工脚本（不可接受） | 低 | 低 |
-| 配置与设置 | 声明式注册表（YAML）+ PostgreSQL `setting` 表 + 热更新 + 设置页 | root 用户同时是开发者与普通用户，配置必须既能在界面上安全调整，又能在 YAML 里深改（见 6.2） | 纯环境变量 / 纯 YAML（都不满足两类用户） | 低 | 低 |
-| 部署 | Docker Compose | 单命令起停 | 裸机 systemd | 低 | 低 |
+| 配置与设置 | 声明式注册表（YAML）+ SQLite `setting` 表 + 热更新 + 设置页 | root 用户同时是开发者与普通用户，配置必须既能在界面上安全调整，又能在 YAML 里深改（见 6.2） | 纯环境变量 / 纯 YAML（都不满足两类用户） | 低 | 低 |
+| 部署 | **原生安装**（`uv tool install` / `pipx` / 单文件包）+ `pc serve` | 一条命令安装与升级；用户既不需要数据库服务，也不需要 Docker | Docker（GHCR 镜像，**可选**，仅作隔离） | 低 | 低 |
+| 分发 | GitHub Releases（wheel / 单文件包）+ 可选 GHCR 镜像 | 下载到使用全在 GitHub 内完成，不需要第三方站点或账号（见 10.1） | 公开到 PyPI（多一套身份与发布流程） | 低 | 低 |
 
 MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**、向量检索、多租户、多存储后端。这些都是加进来会拖慢首个可用版本的项。注意 MVP 里"AI 外发不做"是**真的不写这段代码**，而不是"写了但开关关着"——没有代码路径就没有误发的可能。
 
 ### 8.2 最适合个人长期使用
 
-在 MVP 基础上加：Meilisearch（中文检索质量）、MinIO（媒体层 S3 化，容量上来后再说）、pgvector（向量首站，10 万条量级下同时是终局）、本地 LLM 或低成本云端 LLM（摘要与难例，经 6.3 待审放行，档位切到 `assist`）、RapidOCR（图内文字）、角色特征权重表与 `char_bucket` 归档（4.8）、ClamAV（可选）、Grafana/裸 Prometheus + 简单告警、restic/rsync 备份、滚动删除自动化、复核台 UI。
+在 MVP 基础上加：Meilisearch（中文检索质量，触发条件见 5.3）、MinIO（媒体层 S3 化，容量上来后再说）、向量检索（**阶段 3 再定选型**，见 5.3）、本地 LLM 或低成本云端 LLM（摘要与难例，经 6.3 待审放行，档位切到 `assist`）、RapidOCR（图内文字）、角色特征权重表与 `char_bucket` 归档（4.8）、ClamAV（可选）、Grafana/裸 Prometheus + 简单告警、restic/rsync 备份、滚动删除自动化、复核台 UI。
 
-关键判断：**个人长期使用的核心矛盾是"维护成本"而不是"性能"**。因此拒绝 OpenSearch、Kafka、Kubernetes 这类需要持续运维的组件，优先选单二进制或单进程的东西（Meilisearch、MinIO 都是单二进制/单容器，符合这个标准）。按本项目 10 万条的规模，Qdrant 和 OpenSearch 判定为**不需要**。
+**是否需要 PostgreSQL？** 只有在出现多写者、多用户或远程访问需求时才需要（见 3.5）。个人长期使用**默认不需要**——这是 v3 相对 v2 最大的成本削减。
+
+关键判断：**个人长期使用的核心矛盾是"维护成本"而不是"性能"**。因此拒绝 OpenSearch、Kafka、Kubernetes 这类需要持续运维的组件，也拒绝为"可能的未来"预置一个数据库服务；优先选单二进制或单进程的东西（Meilisearch、MinIO 都是单二进制/单容器，符合这个标准）。按本项目 10 万条的规模，Qdrant 与 OpenSearch 判定为**不需要**。
 
 第二判断：**先跑纯本地**。建议阶段 2 的前半段不开任何外发，用真实数据回答"到底哪些内容非外发不可"。如果结论是"几乎没有"，那 6.3 的整套待审流程就退化为一个安全开关，这是最好的结果——省下的不只是钱，还有一整套隐私责任。
 
@@ -1456,6 +1663,7 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 
 | 需求 | 选型 | 触发条件 |
 |---|---|---|
+| **多写者 / 多用户 / 远程访问** | **PostgreSQL**（先迁库，见 3.5） | 出现第二个人同时写入，或需要从别的机器访问数据库——这是 SQLite 方案的硬边界 |
 | 多机采集与处理 | Redis Streams 或 NATS JetStream + 现有多 worker | 来源数 > 20 或单机 CPU 持续打满（**本项目当前规模远未到**） |
 | 大规模向量 | Qdrant（集群） | 向量 > 50 万或需要多向量/量化（当前 10 万条不需要） |
 | 大规模全文 | OpenSearch | 千万级文档且需要复杂聚合分析（**本项目不会到**） |
@@ -1464,7 +1672,7 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 | 评测与回归 | 自建评估集 + 离线批跑 + 指标看板 | 模型或 prompt 频繁变更时（阶段 2 起就该有最小版本） |
 | 角色权重自学习 | 用人工纠正样本拟合特征权重（逻辑回归即可，不需要深度模型） | `char_bucket` 占比长期不下降，说明权重表需要系统化更新 |
 
-锁定风险总评：**唯一较难替换的是 PostgreSQL 之外的一切都没有锁定问题**。所以架构原则是"PostgreSQL 只存事实与关系，所有派生数据可重建"，这让索引层、向量层、模型层都可以随时替换。
+锁定风险总评：**默认组合里没有难以替换的组件**——SQLite 是 Python 标准库、FTS5 索引可全量重建、媒体按内容寻址、模型与索引都在端口/适配器后面。唯一需要一次性投入的是**将来迁到 PostgreSQL**，而 9.2 的"数据库访问收敛在单一适配器"和 3.5 的迁移路径就是为它准备的。架构原则始终是"**事实与关系存库，派生数据一律可重建**"，这让索引层、向量层、模型层都可以随时替换。
 
 ---
 
@@ -1475,10 +1683,10 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 | 项 | 内容 |
 |---|---|
 | 目标 | 端到端跑通"授权来源 + 三层提报 → 落库 → 打标 → 检索 → 人工编辑"闭环，单机本地部署，**无任何外发** |
-| 关键模块 | 连接器接口 + 2~3 个适配器（Telegram Bot / RSS / 官方导出导入）；三层用户与鉴权（root 口令+TOTP、L1 scope、L2 匿名收件箱）；内容状态机（3.3）与可见性矩阵；`message`/`content_item`/`media`/`inbox_item`/`tag`/`setting` 表与迁移；PG 任务表队列 + worker；媒体下载与安全检查（MIME、字节上限、EXIF 剥离、解码隔离）；sha256 + pHash 去重；**AI 参与度档位：先以 `off`（纯手动）跑通全流程，再切 `local_only` 验证自动打标**（4.7）；WD tagger 打标 + 特征 tag；PG FTS 检索与过滤；Web UI（列表/详情/tag 编辑/**手动分类台（键盘优先）**/**提报审查台**/软删恢复）；保留策略引擎 + 滚动删除 dry-run + 存储页面；**设置注册表 + 设置页 + 热更新 + 首次运行向导 + 三个模型档位 + 一键重启/备份按钮**（6.2）；备份脚本 |
-| 依赖 | PostgreSQL、Docker、一个可用来源的授权凭证、本地 tagger 模型 |
-| 主要风险 | 平台 Bot 权限与历史消息限制（需核实）；中文 FTS 分词方案不可用（需应用层分词兜底）；tagger 模型获取与许可证（需核实）；**L2 入口的滥用与配额调参**（真实投稿行为难以预估，需可快速收紧）；**面向非技术 root 的可用性**（首次运行、模型下载、报错信息三处最易劝退，需真实找人试用） |
-| 验收标准 | ① 连续 7 天自动同步无人工干预，重复投递不产生重复数据；② 导入 1 万条历史数据后，按 tag/关键词/来源/时间组合检索响应 < 1 s；③ 重复图片（含缩放/重压缩）被正确归并；④ tag 可在 UI 修改且立即反映到检索；⑤ 软删可恢复，硬删清理媒体；⑥ 断网 1 小时后恢复能自动补齐；⑦ **L2 提报在审查前不出现在任何检索结果、不产生媒体入库、不打标**（用一条断言级测试守住）；⑧ **全库 grep 不存在任何外发 AI 调用的代码路径**；⑨ 滚动删除 dry-run 报告与实际执行结果一致，且有人工 tag 的内容零删除；⑩ **在设置页修改"相似图片判定严格度"并保存后立即生效（无需重启），且能提示需要重新归并；填入越界值被拒绝并给出人话提示**；⑪ **一个没读过文档的人在 30 分钟内完成"启动 → 导入样本 → 搜到东西"**（这是可用性验收，必须真的找人试） |
+| 关键模块 | 连接器接口 + 2~3 个适配器（Telegram Bot / RSS / 官方导出导入）；三层用户与鉴权（root 口令+TOTP、L1 scope、L2 匿名收件箱）；内容状态机（3.3）与可见性矩阵；`message`/`content_item`/`media`/`inbox_item`/`tag`/`setting` 表与迁移（SQLite）；**SQLite 任务表队列 + 单进程 worker（含后台调度）**；媒体下载与安全检查（MIME、字节上限、EXIF 剥离、解码隔离）；sha256 + pHash 去重；**AI 参与度档位：先以 `off`（纯手动）跑通全流程，再切 `local_only` 验证自动打标**（4.7）；WD tagger 打标 + 特征 tag；**FTS5 双索引检索与过滤**；Web UI（列表/详情/tag 编辑/**手动分类台（键盘优先）**/**提报审查台**/软删恢复）；保留策略引擎 + 滚动删除 dry-run + 存储页面；**设置注册表 + 设置页 + 热更新 + 首次运行向导 + 三个模型档位 + 一键重启/备份按钮**（6.2）；备份脚本（`VACUUM INTO` + 完整性校验）；**原生安装与分发**（`uv tool install` / 单文件包 + GitHub Release 工作流，见 10.1） |
+| 依赖 | **Python 3.12+（自带 SQLite ≥ 3.40）或单文件包**、一个可用来源的授权凭证、本地 tagger 模型。**不需要 PostgreSQL，也不需要 Docker** |
+| 主要风险 | 平台 Bot 权限与历史消息限制（需核实）；**FTS5 少于 3 字的中文查询用不上三元组索引**（靠应用层分词的词级索引兜底，见 5.1）；tagger 模型获取与许可证（需核实）；**L2 入口的滥用与配额调参**（真实投稿行为难以预估，需可快速收紧）；**面向非技术 root 的可用性**（首次运行、模型下载、报错信息三处最易劝退，需真实找人试用） |
+| 验收标准 | ① 连续 7 天自动同步无人工干预，重复投递不产生重复数据；② 导入 1 万条历史数据后，按 tag/关键词/来源/时间组合检索响应 < 1 s；③ 重复图片（含缩放/重压缩）被正确归并；④ tag 可在 UI 修改且立即反映到检索；⑤ 软删可恢复，硬删清理媒体；⑥ 断网 1 小时后恢复能自动补齐；⑦ **L2 提报在审查前不出现在任何检索结果、不产生媒体入库、不打标**（用一条断言级测试守住）；⑧ **全库 grep 不存在任何外发 AI 调用的代码路径**；⑨ 滚动删除 dry-run 报告与实际执行结果一致，且有人工 tag 的内容零删除；⑩ **在设置页修改"相似图片判定严格度"并保存后立即生效（无需重启），且能提示需要重新归并；填入越界值被拒绝并给出人话提示**；⑪ **一个没读过文档的人在 30 分钟内完成"启动 → 导入样本 → 搜到东西"**（这是可用性验收，必须真的找人试）；⑫ **一条命令从 GitHub 安装并启动**（`uv tool install git+…` → `pc serve` → 浏览器里搜到东西）；⑬ **单文件包双击即用**（Windows 与 macOS 各验证一次）；⑭ 10 万条规模下数据库文件不超过 1 GB（对应 3.7 的容量承诺），且 `foreign_keys` 与实际外键约束生效 |
 | 暂缓 | 链接抓取、AI 外发（连代码都不写）、向量检索、多租户、云存储后端、NSFW 自动判定（MVP 只做保守标记与人工） |
 | 明确不纳入 MVP 的用户功能 | L1 的删除与 tag 治理权限、L2 的账号体系、任何形式的公开访问、**界面内 YAML 编辑器**（MVP 只用文件编辑 + 校验报错；设置页覆盖常用项即可） |
 
@@ -1487,8 +1695,8 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 | 项 | 内容 |
 |---|---|
 | 目标 | 分类质量可用、检索体验好、有安全网关与完整审查闭环 |
-| 关键模块 | 检索抽象层 + Meilisearch 索引；**外发待审队列 + 批量审阅 UI + 服务商策略登记 + egress_log**（6.3）；脱敏、结构化隔离、注入检测、schema 校验、预算；tag 体系完整化（namespace、同义词、层级、冲突、治理操作）；OCR 进检索；NSFW 多信号投票 + 复核台；链接沙箱抓取与 OG 解析；**角色特征权重表 + `char_bucket` 归档 + `char_ambiguous` 复核队列**（4.8）；相似图检索与聚类；pgvector；滚动删除自动化 + 冷热分层；任务死信与人工复核 UI；可观测性与告警；**设置注册表扩展到全量可暴露项 + 界面内 YAML 高级编辑器 + 配置变更影响预估（recompute）自动入队**（6.2） |
-| 依赖 | LLM API 凭据（或本地模型）、GPU（推荐）、对象存储（可选 MinIO） |
+| 关键模块 | 检索抽象层 + Meilisearch 索引（**触发条件见 5.3**）；**外发待审队列 + 批量审阅 UI + 服务商策略登记 + egress_log**（6.3）；脱敏、结构化隔离、注入检测、schema 校验、预算；tag 体系完整化（namespace、同义词、层级、冲突、治理操作）；OCR 进检索；NSFW 多信号投票 + 复核台；链接沙箱抓取与 OG 解析；**角色特征权重表 + `char_bucket` 归档 + `char_ambiguous` 复核队列**（4.8）；相似图检索与聚类（pHash 路线，不含向量）；滚动删除自动化 + 冷热分层；任务死信与人工复核 UI；可观测性与告警；**设置注册表扩展到全量可暴露项 + 界面内 YAML 高级编辑器 + 配置变更影响预估（recompute）自动入队**（6.2） |
+| 依赖 | LLM API 凭据（或本地模型）、GPU（推荐）、对象存储（可选 MinIO）；**不需要新增任何数据库服务** |
 | 主要风险 | 提示注入绕过（残余风险，需持续红队测试）；NSFW 与角色识别误判导致检索污染（必须有人工复核闸门）；**服务商留存政策变更**（需定期核实，机制上靠放行有效期兜底）；反查 API 条款与隐私（需核实）；bulk 放行操作成为新的失误点（需二次确认 + 明细可回溯） |
 | 验收标准 | ① 构建 500 条标注评估集，图像 tagger top-5 命中率、特征 tag 命中率、`char_bucket` 占比给出基线数字；② 注入测试集（≥ 50 条人工构造攻击）拦截率 ≥ 95% 且无误伤正常内容；③ 混合检索相对纯关键词的 nDCG 提升可量化；④ **任一时刻可查出"哪些内容字节曾经外发、发给谁、何时、谁批的"**；⑤ 所有自动 tag 都能追溯到模型版本与置信度；⑥ 备份恢复演练成功且哈希校验通过；⑦ 滚动删除连续运行 4 周无人工 tag 的误删；⑧ `cleared` 内容在服务商策略变更后自动置回待审 |
 | 暂缓 | 多租户、多存储后端、外部队列、生成式图像描述全量应用 |
@@ -1501,9 +1709,9 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 
 | 项 | 内容 |
 |---|---|
-| 目标 | 具备自然语言与以图搜图检索，规模与用户数增长不引发架构变更 |
-| 关键模块 | 混合检索（BM25 + 向量 + RRF + 重排）；查询理解与自然语言搜索（含解释与修正）；以图搜图（上传 → embedding → 召回 → pHash 校验）；Tag 治理自动化建议；**角色特征权重的自学习**（用人工纠正样本拟合权重，4.9）；L1 用户与 scope 的细化（按 tag/来源/时间片授权）；L2 入口的风控增强（行为特征、审核优先级排序）；多存储后端与冷热自动分层；模型评估与回归流水线、灰度切换；数据导出与迁移工具 |
-| 依赖 | 稳定运行 3 个月以上的阶段 2 数据与评估集、真实的人工纠正样本 |
+| 目标 | 具备自然语言与以图搜图检索；规模增长不引发架构变更。**注意**：多用户或远程访问会触发数据库迁移（见 3.5）——那是计划内的上坡，不是意外 |
+| 关键模块 | **向量检索选型与落地**（内存暴力 / sqlite-vec，判据见 5.3）；混合检索（BM25 + 向量 + RRF + 重排）；查询理解与自然语言搜索（含解释与修正）；以图搜图（上传 → embedding → 召回 → pHash 校验）；Tag 治理自动化建议；**角色特征权重的自学习**（用人工纠正样本拟合权重，4.9）；L1 用户与 scope 的细化（按 tag/来源/时间片授权）；L2 入口的风控增强（行为特征、审核优先级排序）；多存储后端与冷热自动分层；模型评估与回归流水线、灰度切换；数据导出与迁移工具 |
+| 依赖 | 稳定运行 3 个月以上的阶段 2 数据与评估集、真实的人工纠正样本；若走可加载扩展路线，还需确认扩展的许可证与分发方式（见 6.7 威胁 13） |
 | 主要风险 | 重排与查询理解带来的成本与延迟；以图搜图对同人图的区分度有限（需明确产品预期）；L1/L2 规模上升后审查吞吐成为瓶颈（需自动化预筛与优先级排序） |
 | 验收标准 | ① 以图搜图 top-10 命中率达到设定阈值，且同人图误召回率在可接受范围；② 自然语言查询的结构化解析准确率可量化并可通过用户修正持续改进；③ 模型版本切换可灰度、可回滚、有回归对比；④ `char_bucket` 占比相对阶段 2 基线下降（证明权重表改进有效）；⑤ 10 万条 + 12 个月增量下，检索 P95 延迟与磁盘占用仍在预算内 |
 | 暂缓 | 内容发布/分享、模型微调、移动端原生应用、多租户 SaaS |
@@ -1514,8 +1722,8 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 |---|---|---|
 | `Connector`（平台接入） | 平台政策会变，连接器必然要换 | `list_new(cursor) -> [SourceMessage]`、`capabilities()`、`authorize()`、`rate_limit_hint()`；连接器不得直接写库 |
 | `StorageBackend`（媒体存储） | 本地→NAS→对象存储→云盘是必然路径 | `put(bytes) -> key`、`get(key)`、`exists`、`delete`、`presign`；键必须内容寻址 |
-| `SearchIndex`（检索） | PG FTS → Meilisearch → 混合检索 | `index(doc)`、`delete(id)`、`query(q, filters, sort, page)`、`rebuild()`；索引必须可全量重建 |
-| `VectorStore` | pgvector → Qdrant | `upsert(id, vec, payload)`、`search(vec, filter, k)`、`delete` |
+| `SearchIndex`（检索） | FTS5 → Meilisearch → 混合检索 | `index(doc)`、`delete(id)`、`query(q, filters, sort, page)`、`rebuild()`；索引必须可全量重建 |
+| `VectorStore` | 阶段 3 再定：内存暴力 / sqlite-vec → Qdrant（见 5.3） | `upsert(id, vec, payload)`、`search(vec, filter, k)`、`delete` |
 | `ModelProvider`（LLM/视觉） | 云端/本地/换供应商 | `classify()/caption()/embed()` 统一签名，输入输出与 `model_version` 绑定；必须支持"仅本地"模式；**外发调用只能经由单一内部函数，便于审计与断言** |
 | `MediaProbe` / `Scanner`（安全） | 扫描器会被替换与叠加 | 统一 `scan(bytes) -> Verdict`，fail closed |
 | `Submitter`（提报入口） | L1 认证提报与 L2 匿名提报形态不同，但审查流程相同 | 统一 `receive(payload) -> inbox_item`；入口层负责认证与配额，核心层不关心来源 |
@@ -1534,43 +1742,117 @@ MVP 明确的**不做**：链接自动抓取、**任何 AI 外发代码路径**�
 - **不要**把模型名与 prompt 硬编码在业务逻辑里（模型注册表 + prompt 版本）。
 - **不要**让 LLM 输出直接落库（必须经 schema 校验与 pending 流程）。
 - **不要**为个人规模引入 Kubernetes/Kafka（可替换性来自接口，不来自组件数量）。
+- **不要**在业务代码里写数据库方言 SQL，也不要自己 `sqlite3.connect()`：**数据库访问收敛在单一适配器内**（PRAGMA 基线、事务边界、类型转换、外键开关都在那里）。这是将来迁到 PostgreSQL 时唯一需要替换的东西（见 3.5）。
+- **不要**把需要独立服务进程的组件当成必需依赖：Docker、数据库服务、检索引擎都必须是可选的，缺了它们应用仍能起来（缺模型是正常状态，缺服务也应是）。
 
 ---
 
 ## 10. 推荐默认架构（起点）
 
-**一句话**：单机 Docker Compose，PostgreSQL 作事实源与队列，媒体存本地内容寻址目录（S3 兼容抽象），检索先用 PG FTS，AI 全部本地优先（WD tagger + pHash + 应用层分词），LLM 外发默认关闭且必须经过安全网关，Web UI 承担检索与人工纠错。
+**一句话**：单机、单进程、单文件——SQLite 作事实源、任务队列与全文索引，媒体存本地内容寻址目录（S3 兼容抽象），检索用 FTS5，AI 全部本地优先（WD tagger + pHash + 应用层分词），LLM 外发默认关闭且必须经过安全网关，Web UI 承担检索与人工纠错。**安装只要一条命令；不需要 Docker，也不需要数据库服务。**
 
 ```
-docker compose:
-  app        FastAPI + Web UI（Next.js 静态产物或同容器）
-  worker     Python worker（分类/媒体/链接/外发任务，可多副本）
-  sync       调度器（每来源独立节拍）
-  retention  保留策略执行器（dry-run 报告 + 定时滚动删除）
-  db         PostgreSQL 16（事实源 + 任务队列 + FTS + pgvector）
-  meili      Meilisearch（阶段 2 加入）
-  minio      MinIO（容量或设备数上来后加入；否则直接用本地目录）
-volumes:
-  /data/db            → PostgreSQL 数据（含 setting 表）
-  /data/media         → 内容寻址媒体（ab/cd/<sha256>），hot
-  /data/cold          → 冷层（可指向 NAS 挂载）
-  /data/quarantine    → L2 提报隔离区（与主存储分离，TTL 自动清理）
-  /data/backup        → 备份目标（可指向 NAS）
-  ./config            → config/app.yaml（带注释的默认值）、settings-registry.yaml（设置项声明）
-expose:
-  仅监听 127.0.0.1 或内网；远程访问走 Tailscale/隧道，不开公网端口
+pc serve（单进程）
+  app        FastAPI + Web UI
+  worker     内嵌后台调度线程（分类/媒体/链接/外发任务）
+  sync       内嵌调度器（每来源独立节拍）
+  retention  内嵌保留策略执行器（dry-run 报告 + 定时滚动删除）
+  （可选）pc worker / pc sync / pc retention —— 拆成独立进程，短事务 + busy_timeout
+  （阶段 2）meili      Meilisearch
+  （可选）  minio      MinIO
+
+数据与目录（都由 PC_DATA_ROOT 定位，默认是平台用户数据目录，见 10.2）：
+  <data_root>/pc.sqlite3      事实源 + 任务队列 + FTS5 + 设置（单文件；-wal / -shm 同目录）
+  <data_root>/media/          内容寻址媒体（ab/cd/<sha256>），hot
+  <data_root>/cold/           冷层（可指向 NAS 挂载）
+  <data_root>/quarantine/     L2 提报隔离区（与主存储物理分离，TTL 自动清理）
+  <data_root>/backup/         `VACUUM INTO` 的落点（可指向 NAS）
+  <data_root>/config/         app.yaml（带注释的默认值）、settings-registry.yaml（设置项声明）
+
+访问面：
+  仅监听 127.0.0.1；远程访问走 Tailscale/隧道，不开公网端口
+
+可选隔离（不是必需路径）：
+  docker run -v pcdata:/data ghcr.io/<owner>/post-collector:<version>
 ```
 
 **为什么它适合作为本项目的起点**
 
-1. **组件数最少但一个不缺**：PG 同时承担关系、队列、全文索引与向量，省掉了四个运维对象，这对个人项目是决定性的。10 万条 / 日增 100 的规模下，这套配置有大量余量，不需要为性能做任何妥协。
-2. **隐私默认安全**：AI 能力全部本地运行，外发连代码路径在 MVP 阶段都不存在；启用后也必须经过"待审队列 + 逐条资格 + 服务商策略登记 + egress_log"四道关卡。默认配置下没有任何内容离开本机。
-3. **成本近乎为零**：无按量计费组件，硬件是一次性投入；外发成本只在显式启用后产生，且有预算硬上限与放行有效期。
-4. **每一步扩展都不需要推翻重来**：媒体层换 MinIO 是改配置；检索层加 Meilisearch 是重建派生索引；多用户是加 scope 与租户绑定；容量增长靠滚动删除与冷热分层，而不是换数据库。九个接口（9.1）保证了这些替换都发生在边界上。
-5. **与真实风险对齐**：它把工程投入放在真正会出事的地方——平台接入合规性、角色识别准确率与人工纠错、匿名提报入口的滥用、以及外发的隐私与注入防线——而不是放在本项目不会遇到的规模问题上。
-6. **失败模式可接受**：任何派生层（索引、向量、标签、caption、角色判定）丢了都能从 PG + 媒体目录重建；唯一需要认真对待的是 PG 与媒体目录的备份，而这两者都有成熟且低成本的做法。
-7. **三层用户模型与内容状态机在地基里**：L2 隔离区、`egress_state`、审查队列都不是"以后加"的功能，而是表结构与状态机的一部分。这类权限与隐私相关的边界，事后补建的成本远高于一开始就画对。
-8. **对两类 root 用户都可用**：常用参数在设置页里用大白话呈现并热更新（`setting` 表 + 声明式注册表），深层参数在 `config/app.yaml` 里由开发者直接改；新增一个设置项只加一段声明，不改前端代码。不需要碰 `docker-compose.yml` 就能日常使用和维护（见 6.2）。
+1. **组件数最少，而且没有常驻服务**：SQLite 一个文件同时承担关系、任务队列与全文索引，省掉了数据库服务、连接池、备份工具链这一整套运维对象。按 3.7 的实测口径，10 万条 / 日增 100 有大量余量，不需要为性能做任何妥协。
+2. **安装门槛降到"装一个东西"**：原生路径只需要 Python 3.12+，单文件包连 Python 都不需要；**默认路径里没有 Docker，也没有数据库服务**。这是 v2 → v3 最重要的变化。
+3. **隐私默认安全**：AI 能力全部本地运行，MVP 阶段连外发代码路径都不存在；启用后也必须经过"待审队列 + 逐条资格 + 服务商策略登记 + egress_log"四道关卡。默认配置下没有任何内容离开本机。
+4. **分发闭环在 GitHub 内**：代码、Release 产物（wheel / 单文件包）、可选镜像（GHCR）都在同一个账号体系下，用户不需要访问任何第三方站点，也不需要 Docker Hub 账号（见 10.1）。
+5. **成本近乎为零**：没有按量计费组件，也没有常驻服务，硬件是一次性投入；外发成本只在显式启用后产生，且有预算硬上限与放行有效期。
+6. **每一步扩展都不需要推翻重来**：媒体层换 MinIO 是改配置；检索层加 Meilisearch 是重建派生索引；需要多写者/多用户时按 3.5 迁到 PostgreSQL，只需要替换数据库适配器；容量增长靠滚动删除与冷热分层。9.1 的接口保证这些替换都发生在边界上。
+7. **与真实风险对齐**：工程投入放在真正会出事的地方——平台接入合规性、角色识别准确率与人工纠错、匿名提报入口的滥用、外发的隐私与注入防线——而不是放在本项目不会遇到的规模问题上。
+8. **失败模式可接受**：任何派生层（索引、标签、caption、角色判定）丢了都能从"库 + 媒体目录"重建；唯一需要认真对待的就是这两个东西的备份，而 SQLite 的备份就是生成一个一致快照（见 7.1）。
+9. **三层用户模型与内容状态机在地基里**：L2 隔离区、`egress_state`、审查队列都不是"以后加"的功能，而是表结构与状态机的一部分。这类权限与隐私相关的边界，事后补建的成本远高于一开始就画对。
+10. **对两类 root 用户都适用**：常用参数在设置页里用大白话呈现并热更新（`setting` 表 + 声明式注册表），深层参数在 `config/app.yaml` 里由开发者直接改；新增一个设置项只加一段声明，不改前端代码。日常使用不需要碰容器或数据库（见 6.2）。
+
+### 10.1 安装与分发（GitHub 内闭环）
+
+三条路径，按推荐顺序排列。同一份代码、同一份数据格式，三种方式可以互换。
+
+**① 原生安装（主路径）**
+
+```bash
+uv tool install "git+https://github.com/<owner>/post-collector@v0.1.0"   # 或者 pipx install
+pc serve                                                                 # 默认监听 127.0.0.1:8080
+```
+
+- 前置条件只有 **Python 3.12+**（且自带 SQLite ≥ 3.40；启动时校验并给人话提示，见 3.2）。
+- 升级：`uv tool upgrade post-collector`；卸载：`uv tool uninstall post-collector`（数据在用户数据目录里，不会被卸载删掉）。
+
+**② 单文件可执行包（面向不想碰命令行的人）**
+
+- 由 GitHub Actions 在打 tag 时构建，作为 **Release 资产**发布：Windows（`.exe`）、macOS（`.dmg`/`.app`）、Linux（AppImage 或 tar.gz）。
+- 双击启动 → 自动打开浏览器 → 首次运行向导（检测环境 → 选模型档位 → 配置第一个来源）。用户不需要 Python，也不需要 Docker。
+- 代价必须提前接受：三平台各自构建与签名、Windows 杀软误报、macOS 公证（notarization）。这三条已列入附录 A。
+
+**③ 容器镜像（可选，仅作隔离）**
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
+  ghcr.io/<owner>/post-collector:0.1.0
+```
+
+- 镜像从 **GHCR** 拉取：GitHub 自带、公共镜像可匿名拉取、公共包免费。
+- **镜像里只有一个进程，没有数据库容器**——SQLite 文件在挂载卷里。
+- Docker 的定位是"给不愿意让应用直接碰宿主文件系统的人一个隔离选项"，**不是安装前提**。
+- 发布细节：Dockerfile 加 `LABEL org.opencontainers.image.source=https://github.com/<owner>/post-collector` 让包与仓库关联；首次发布后要把包的可见性从默认的 private 改为 public；同时推版本 tag 与 `latest`。
+
+**仓库内需要具备的东西**（属实现计划，不在本文档范围）：`.github/workflows/release.yml`（打 tag 触发：构建 wheel → 构建三平台单文件包 → 构建并推 GHCR 镜像 → 生成 Release 说明）、`LICENSE`（MIT）与 `pyproject.toml` 的许可证字段、README 的"三步开始使用"。
+
+### 10.2 数据与目录布局
+
+**数据根目录**（环境变量 `PC_DATA_ROOT`；未设置时按平台取默认值）：
+
+| 平台 | 默认值 |
+|---|---|
+| Windows | `%LOCALAPPDATA%\post-collector` |
+| Linux | `$XDG_DATA_HOME/post-collector`（缺省 `~/.local/share/post-collector`） |
+| macOS | `~/Library/Application Support/post-collector` |
+
+```
+<data_root>/
+├── pc.sqlite3          事实源（含任务队列、FTS5、setting 表）；-wal / -shm 同目录
+├── media/              内容寻址媒体本体（ab/cd/<sha256>）
+├── cold/               冷层（可指向 NAS 挂载点）
+├── quarantine/         L2 提报隔离区（必须与 media/ 物理分离）
+├── backup/             `VACUUM INTO` 的落点（建议指向另一块盘或 NAS）
+└── config/             app.yaml + settings-registry.yaml（首次启动生成默认副本）
+```
+
+- **媒体目录可以单独指向任意路径**（`paths.media_root`），例如外接硬盘或 NAS；数据库与媒体不必在同一块盘上。这直接回应了"用户想自己决定内容放哪"。
+- 运行时产物**不放在安装目录**：用户不一定是开发者，安装目录可能只读（单文件包尤其如此）。
+- 首次启动若 `<data_root>` 不存在就创建，并把默认配置写进 `<data_root>/config/`；界面上要显示"你的数据在 …"，否则用户永远找不到自己的库。
+
+### 10.3 进程模型
+
+- **默认：单进程**。`pc serve` 一个进程内含 FastAPI、内嵌调度线程（采集节拍）、worker 线程池（任务处理）与保留策略执行器。理由：SQLite 是单写者，单进程天然把写串行化，不需要任何锁协调；对"日增 100 条"这种负载，一个进程余量充足。
+- **可选：多进程**。`pc worker` / `pc sync` / `pc retention` 可各自独立运行，每个进程用自己的连接，靠 2.3 的 `BEGIN IMMEDIATE` 原子抢占任务。此时必须遵守**短事务 + `busy_timeout` + 退避重试**三条纪律，并接受写吞吐上限由单写者决定。
+- **批量作业**（重打标、重算去重、重建索引）一律分批提交（每批 500–2000 条），界面显示进度并允许取消。
+- **不引入** Redis / Celery 这类任务中间件：可替换性来自接口，不来自组件数量（见 9.2）。
 
 ---
 
@@ -1580,15 +1862,18 @@ expose:
 2. 所选 WD tagger / NSFW 模型 / VLM 的**许可证**是否允许你的使用场景（部分模型为 `license: other` 或非商用）。
 3. 第三方反查 API（SauceNAO/IQDB/ascii2d 等）的条款、速率限制、当前价格，以及是否允许自动化查询。
 4. LLM 与视觉 API 的当期价格、**数据保留政策（是否留存、是否用于训练、留存时长）**、可用区域与合规声明。这一项必须在 `ai_provider_policy` 中逐条登记并注明核实日期，不得依赖记忆。
-5. PostgreSQL 目标版本上 `zhparser` / `pg_bigm` 的可用性与安装方式；若不可用，确认应用层分词方案的检索质量可接受。
+5. **各平台 Python 内置的 SQLite 版本分布与最低版本门槛**（见 3.2、3.7）；若不足 3.40，确认"升级 Python"与"改用单文件包"哪条对用户更友好。
 6. 云盘（WebDAV/专有 API）作为备份出口的稳定性与配额，以及加密备份的密钥管理方式。
 7. 所在司法辖区对采集、存储、处理他人内容与个人信息的法律要求（尤其涉及二次元 NSFW 与可能的未成年人内容场景）。
 8. 备份恢复演练的实际耗时与 RPO/RTO 是否满足预期。
 9. **L2 匿名提报入口的法律定性**：开放投稿入口后，你是否成为"内容存储服务提供者"、是否有举报与下架义务、是否需要在入口处放置使用条款与举报渠道。这是本次新增的用户模型中最需要法律确认的一项。
 10. **L1 用户的授权形式**：被指定的转发用户是否需要签署简单授权说明（谁、能看哪些来源、能做什么），以及"一键撤销"的操作流程。技术上已支持，制度上需要有记录。
 11. **滚动删除与删除权的冲突**：确认隐私策略中"硬删后仍保留内容哈希"是否可接受；如不可接受，需改为对哈希加盐或使用不可逆的桶标识。
+12. **单文件可执行包的分发成本**：Windows 杀软误报、macOS 公证（notarization）、三平台构建与签名的维护负担（见 10.1）。
+13. **若阶段 3 引入 sqlite-vec 等可加载扩展**：许可证、分发方式，以及"允许加载本地扩展"的安全边界（等于允许任意代码执行，见 5.3 与 6.7 威胁 13）。
+14. **许可证与包的可见性**：仓库许可证（已定 MIT）与 GHCR 包的可见性设置必须在公开分发前落实，否则用户拿到镜像却没有授权声明（见 10.1）。
 
-## 附录 C：相对 v1 的变更记录
+## 附录 C：变更记录（v1 → v2 → v3）
 
 | 变更 | 触发 | 影响范围 |
 |---|---|---|
@@ -1601,12 +1886,20 @@ expose:
 | root 用户画像包含非技术使用者，需要易懂且可深改的参数 | 用户说明 root 同时是开发者与网络小白 | 新增 6.2（配置分层、设置注册表、热更新、首次运行向导、模型档位、错误信息规范）；新增 `setting`/`setting_change` 表；新增 `SettingsRegistry` 接口；6.1 的 root 行更新；8.1 增加配置与设置行；MVP 增加设置页与首次运行向导及两条可用性验收 |
 | 新增 LLM 参与度分级与纯手动模式 | 用户要求保留"LLM 判定不介入、由用户自己判断该不该存与归到哪个分类"的选项，并作为早期调试方式 | 新增 4.7（能力边界矩阵、敏感度向上取整、四档参与度、纯手动模式形态、Classifier 接口可互换、判定记录表）；新增设置项 `ai.involvement`；4.1 与 4.2 的分类步骤改为按档位可选；1.5 的 MVP 与推荐版本、9 的阶段 1 与阶段 2 推进顺序、6.2 的暴露项同步更新；`source='suggested'` 与 `tag_assignment` 的关系明确化；修正 4.5 与 6.3 的编号引用 |
 | 设置层落地暴露的取舍 | 实现 §6.2 时才发现的具体判断（注册表 fail closed 的报错清单、`requires` 延后到运行期校验、YAML 把裸写 `off` 当布尔值的陷阱、`setting.source` 与四层解析的关系、`defaults` 漂移只提示、播种只插不改且不写审计、危险项与 dry-run 闸门收在一处、命令行刻意只读） | 新增 6.2.5；实现 `src/pc/config.py`（注册表加载与校验、四层解析、`plan_setting_change`、不可变快照）与 `pc.adapters.postgres` 的 `setting` / `setting_change` 读写；CLI 新增 `config show` / `config seed`；`config/settings-registry.yaml` 的 `ai.involvement` 取值改为带引号 |
+| **存储引擎由 PostgreSQL 换成 SQLite**（v3） | 用户指出"要求用户自备 Docker Desktop"门槛过高，而 Docker 的硬依赖主要来自"数据库必须是独立服务"；同时把本项目的真实负载与 SQLite 的边界算了清楚 | 重写 3.2（类型映射、PRAGMA 基线、32 张表的 SQLite 方言）、3.4（结论反转为默认选择）、3.5（默认组合与迁移方向反转）、5.1（FTS5 双索引）、5.3（组件比较）；新增 3.7（实测记录与容量承诺）；2.2/2.3/7.1/7.2/8.1/8.2/8.3/9/9.1/9.2/10 同步改写；附录 A 删除 zhparser/pg_bigm 条目；`raw_payload` 由"默认保留"改为"默认只留哈希、按需开启" |
+| **解除 Docker 硬依赖，分发限定在 GitHub 内**（v3） | 用户希望"从下载到使用"全在 GitHub 内完成，且不想让用户装 Docker | 新增 10.1（三条安装路径：原生优先 / 单文件包 / 可选 GHCR 镜像）、10.2（数据根目录与目录布局）、10.3（进程模型）；2.2 部署行、7.2 三种部署建议、8.1 新增分发行、9 阶段 1 的依赖与验收（新增两条分发验收）；Docker 在全文中的定位改为"可选隔离" |
+| **向量检索推迟到阶段 3 再选型**（v3） | SQLite 没有 pgvector，而两种替代方案各有明确代价（内存常驻 / 允许加载本地扩展） | 5.2 与 5.3 改为给出判据而非结论；4.5、8.2、9 阶段 2/3、9.1 的 `VectorStore` 行同步；6.7 威胁 13 补入"可加载扩展"这一供应面 |
+| **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 
 ## 附录 B：参考组件
 
 - 图像打标：[SmilingWolf/wd-swinv2-tagger-v3](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3)、[WD14 tagger 生态](https://huggingface.co/Library-Mutsumi/wd14_tagger_with_embeddings)
 - 反查实现参考：[anime_image_search](https://github.com/Zhaokugua/anime_image_search)、[imgS-plugin](https://github.com/erzaozi/imgS-plugin)（仅作实现思路参考，条款需自行核实）
 - OCR：[Qwen-OCR / PaddleOCR 系](https://github.com/sw30labs/qwen-ocr-mlx)
-- 检索/向量对比参考：[Meilisearch vs Qdrant vs pgvector 实测](https://www.harulogs.com/forum/blog/elasticsearch-%ec%93%b0%ea%b8%b0-%ec%a0%84%ec%97%90-meilisearch-vs-qdrant-vs-pgvec-4437)
+- SQLite 检索：[FTS5 官方文档](https://www.sqlite.org/fts5.html)（含 `trigram` 分词器与 `bm25()`）；[全文检索与中文的实测口径见本文 3.7、5.1](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)
+- SQLite 运维：[WAL 模式](https://www.sqlite.org/wal.html)、[在线备份 API](https://www.sqlite.org/backup.html)、[`VACUUM INTO`](https://www.sqlite.org/lang_vacuum.html)、[PRAGMA 参考](https://www.sqlite.org/pragma.html)
+- 向量检索候选（**阶段 3 再定**）：[sqlite-vec](https://github.com/asg017/sqlite-vec)（可加载扩展，注意 6.7 威胁 13 的安全含义）
+- 分发相关：[uv tool install](https://docs.astral.sh/uv/guides/tools/)、[pipx](https://pipx.pypa.io/)、[GitHub Container Registry 文档](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)、[PyInstaller](https://pyinstaller.org/)
+- 检索/向量对比参考（v2 遗留，结论已按 v3 重估）：[Meilisearch vs Qdrant vs pgvector 实测](https://www.harulogs.com/forum/blog/elasticsearch-%ec%93%b0%ea%b8%b0-%ec%a0%84%ec%97%90-meilisearch-vs-qdrant-vs-pgvec-4437)
 - 云视觉定价参考：[Google Cloud Vision Pricing](https://cloud.google.com/vision/pricing)
 - LLM 定价参考：[DeepSeek V3.2 on OpenRouter](https://openrouter.ai/deepseek/deepseek-v3.2)、[Vercel AI Gateway](https://vercel-docs.vercel.sh/ai-gateway/models/deepseek-v3.2-thinking)
