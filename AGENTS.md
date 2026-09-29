@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层与配置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集侧的第一个适配器已经可用但还没接线**（本地文件连接器、本地内容寻址存储、魔数扫描器与连接器工厂都有单测，CLI 命令在下一个提交里接上）；测试套件覆盖数据库适配层、设置层、配置段与路径解析、连接器/存储/扫描器、SQLite 行为契约、迁移器与 schema 红线，**296 条 + 1 条环境跳过、1.0 秒、不依赖任何外部服务**；**但端到端的业务功能仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 3 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 本地文件连接器 → L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**424 条 + 1 条环境跳过、3.4 秒、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **296 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（1.0 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **424 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（3.4 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR]` | **按文件名序号应用 `migrations/sqlite/` 下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -34,6 +34,11 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
 | 看设置项生效值 | `uv run pc config show [--explain] [--key K] [--json]` | 逐项打印生效值 + **来源**（env / db / yaml / default），回答「这个值为什么是 8」。数据库不可达不影响退出码，只降级成文件与环境层并打印一行说明 |
 | 首次播种设置项 | `uv run pc config seed` | 只插入缺失的键，**绝不覆盖已有值**；重复运行安全。播种不写 `setting_change`（那不是谁做的改动） |
+| 登记来源 | `uv run pc source add NAME --kind export --roots DIR [--authorize manual_export] [--evidence TEXT]` | 一个事务里同时写 `source` 与 `source_authorization`（**三者齐备才可采集**，DESIGN §1.3）；`--roots` 会写进 `source.config` |
+| 列出来源 | `uv run pc source list [--json]` | 带上授权状态（是否有效、什么方式、何时过期） |
+| 导入本地文件 | `uv run pc import PATH... --source NAME [--process] [--dry-run] [--limit N]` | 只做 L2（落 `message` + 入队）；`--process` 接着跑 worker。**目录会持久化进 `source.config`**——worker 在另一个时刻取字节，只读那里 |
+| 跑处理管线 | `uv run pc work [--once] [--max N] [--loop] [--interval S]` | 抢占任务 → 取字节 → 扫描 → 哈希去重 → 落 media/content_item/content_media；确定性失败进死信，偶发失败退避重试 |
+| 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；未建库时只提示不报错 |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -53,22 +58,24 @@ post-collector/
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
 │   ├── sqlite/0001_init.sql      **权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器
-│   ├── sqlite/0002_*.sql         后续迁移（按序号连续追加，见 migrations/README.md）
+│   ├── sqlite/0002_*.sql         文本精确重复改为归组（去掉 content_hash 的唯一索引）
+│   ├── sqlite/0003_*.sql         message.media_refs：媒体引用落进信封，消息才可重放
 │   └── README.md                 执行语义、方言历史与写迁移的规矩
 ├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
-├── tests/                        conftest（临时库夹具）+ 适配器/行为/迁移器/配置段/路径/连接器/存储/扫描器/设置层测试
+├── tests/                        conftest（临时库/干净库夹具）+ 适配器、服务层、CLI 端到端、红线守卫
 └── src/pc/
-    ├── domain.py                 状态枚举、跨层数据结构与跨层错误（零第三方依赖）
+    ├── domain.py                 状态枚举、跨层数据结构、跨层错误与文本规范化（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
     ├── config.py                 设置层与 L2 配置段：注册表校验、四层解析、变更闸门、快照、限额与安全策略
-    ├── cli.py                    doctor / db apply,status,backup,reindex / config show,seed 已接线
+    ├── cli.py                    doctor / config / db / source / import / work / item 全部已接线
     ├── adapters/
     │   ├── sqlite.py             库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写
     │   ├── local_storage.py      本地目录存储后端（内容寻址 ab/cd/<sha256>，原子写入、幂等）
     │   ├── magic_scan.py         魔数嗅探扫描器（白名单 + 字节上限 + fail closed）
     │   ├── local_files.py        本地文件连接器（手工上传与官方导包共用）
     │   └── registry.py           连接器工厂：source.kind → 实现，唯一解密凭证处
+    ├── services/                 业务规则：来源登记、L2 摄入、L3 单进程 worker
     └── api/                      FastAPI 工厂与路由
 ```
 
@@ -78,8 +85,9 @@ post-collector/
 | `src/pc/domain.py` | 状态取值、传输结构与跨层错误（`MediaTooLargeError` / `SourceNotAuthorizedError`）；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器、连接器工厂 | 可用（单元测试覆盖） |
-| `src/pc/cli.py` | `doctor`（含只读数据库段与运行时目录段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
-| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + 配置段与路径解析 + 连接器/存储/扫描器 + schema 红线 + 设置层（全部在临时目录上跑，无外部依赖） | 296 条 + 1 条跳过（Windows 无符号链接权限），1.0 秒全绿 |
+| `src/pc/services/` | 来源登记（source + authorization 同生共死）、L2 摄入（幂等落信封 + 入队）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
+| `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`work`、`item list` | 可用 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端 + 迁移器 + 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 424 条 + 1 条跳过（Windows 无符号链接权限），3.4 秒全绿 |
 
 ## 边界约束
 
@@ -127,6 +135,18 @@ post-collector/
 - `defaults` 段是要播种进数据库的设置项（走注册表校验）；`db` / `paths` / `jobs` / `ingest` / `security` / `models` 六段是**留在文件里**的部署与安全基线，刻意不进设置页。它们的已知键清单写死在 `pc.config.APP_CONFIG_SECTIONS`，**未知段名与未知键一律报错**（拼错的键被静默忽略正是「改了文件没生效」最难查的一类故障），并给出最接近的键名建议；测试断言这张清单与仓库里那份真实文件逐段一致，防止清单过期。
 - 取值一律**类型严格**：整数字段里写 `true` 会报错（`bool` 是 `int` 的子类，静默变成 1 最难查）；布尔字段里写 `"false"` 同样报错。安全相关项的默认值一律在保守那一侧（`fail_closed_on_scan_error=True`、`allow_svg=False`），把它们做成配置项不等于可以随手关掉。
 - 运行时目录的解析在 `pc.adapters.sqlite.resolve_paths()`，与 `resolve_db_path()` 放在**同一个模块**：两者必须对"数据根目录在哪"给出一致答案。优先级：数据根目录取 `PC_DATA_ROOT` > `.env` > `app.yaml:db.data_root` > 平台默认；每个子目录再按 `PC__PATHS__<NAME>_ROOT` > `.env` > `app.yaml:paths.<name>_root` > `<data_root>/<默认名>` 逐项覆盖。**媒体目录跟着数据根目录走，不跟着数据库文件走**——`PC__DB__PATH` 只挪库文件本身（放进 SSD、放到挂载盘），顺带挪走媒体会让老内容静默失联，这条有回归测试钉着。
+
+**采集与处理（DESIGN §2.1、§2.2、§2.3）**
+
+- **任务结局必须落账，成功也要**：`Worker._finalize` 是唯一改 `job.status` 的地方，成功路径也必须走它。只在异常分支写状态的话，任务会永远停在 `running`——而 `running` 不会被再次抢占，于是队列看起来"处理过了"，其实什么都没记下（这个 bug 真发生过，现在有测试钉着）。
+- **`attempts` 在抢占时就 +1**：抢占即一次尝试，进程被杀也要算数，否则一个能稳定搞崩 worker 的任务会被无限重试。`status IN ('queued','failed')` 且 `attempts < max_attempts` 才可抢占；启动时把 `locked_at` 超时（默认 15 分钟）的 `running` 重置为 `queued`。
+- **确定性失败进死信，偶发失败才退避**：文件不存在、超过字节上限、命中哈希墓地、类型不放行、授权失效、来源类型没有实现——这些重试只会得到同样结论，一律 `dead` 并写 `dead_reason`；其余异常按 `jobs.backoff_seconds` 退避重试，到 `max_attempts` 转死信。
+- **幂等护栏**：处理前先查这条消息有没有内容项，有就直接成功返回。崩溃恢复会把任务重置为排队并重跑，护栏保证不会产生第二份内容。
+- **一份字节只有一行 `media`**：`media.sha256` 唯一；多个内容项各自通过 `content_media` 引用同一行（内容项与媒体是**多对多**）。`media.scan_status` 是**字节**的属性，复用时不因某次"扩展名骗人"就改写它；本次判定落在 `content_item.status` 上。
+- **隔离区是独立的存储后端行**：扫描不通过的字节写进 `quarantine_root` 并记 `storage_backend_id = local-quarantine`、`quarantine_key` 非空。`media.object_key` 因此**是相对所属后端根目录的键**——判断"这份字节在主存储还是隔离区"要看 `quarantine_key`，不能只看 `object_key`。
+- **`text_content` 存原文、`text_search` 刻意留空**：`text_search` 的契约是"应用层分词结果，空格连接"（DESIGN §5.1）；本切片没有分词器，塞进未分词原文只会让 `content_word` 里出现一个巨大的单 token。词级检索随检索切片一起接，届时**要覆盖这一列**（不是只在插入时写）。trigram 索引已经在 `text_content` 上工作，所以 ≥3 字符的子串检索今天是可用的；<3 字符命中 0 行（§5.1 已实测）。
+- **`pc import` 必须把目录持久化进 `source.config["roots"]`**：worker 在另一个时刻取字节，它只读那里；目录只活在命令行参数里的话，导入能成功而处理阶段拿不到引用（无法续跑）。`--dry-run` 除外——它什么都不写。
+- 规范化（`pc.domain.normalize_text`）只做**无损**变换（NFKC + 空白折叠），且必须幂等：它的结果进 `content_hash`，是文本精确去重的分组键，不确定就会让同一份内容分裂成两份。
 
 **性能预算（回归红线）**
 
@@ -188,4 +208,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、连接器/存储/扫描器、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：**检索（FTS5 查询层与分词）**、tag 与打标、链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、**缩略图与感知哈希**、worker 的常驻服务化（`pc work --loop` 有了，缺的是 systemd / 计划任务那种托管）、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、连接器/存储/扫描器、服务层与 CLI 端到端、设置层、schema 红线与出网守卫；**没有检索与打标的测试**（因为那两块还没有实现）。

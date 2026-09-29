@@ -24,6 +24,7 @@ import importlib.util
 import os
 import platform
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,6 @@ _EXPECTED_FILES: tuple[str, ...] = (
     "config/settings-registry.yaml",
     "migrations/sqlite/0001_init.sql",
 )
-
 #: 依赖检查：import 名 → 用途说明
 _REQUIRED_DEPS: dict[str, str] = {
     "fastapi": "Web API（api/app.py）",
@@ -620,10 +620,406 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
     return 0
 
 
+def _db_and_paths(args: argparse.Namespace) -> tuple[Any, Any]:
+    """一次性解析库文件与运行时目录——写命令都需要这两者，且必须来自同一份配置。"""
+    from pc.adapters import sqlite as db
+
+    return db.resolve_db_path(getattr(args, "path", None)), db.resolve_paths()
+
+
+def _require_database(resolved: Any) -> bool:
+    if resolved.path.is_file():
+        return True
+    print(f"  ✗ 数据库文件还不存在：{resolved.path}", file=sys.stderr)
+    print("    先建库：uv run pc db apply", file=sys.stderr)
+    return False
+
+
+def _load_app_config(root: Path) -> Any:
+    from pc import config as cfg
+
+    return cfg.load_app_config(Path(root) / cfg.DEFAULT_APP_CONFIG_PATH)
+
+
+def _build_worker(conn: Any, paths: Any, root: Path, *, worker_id: str | None = None) -> Any:
+    """组装 worker：存储、隔离区、扫描器与队列参数全部来自配置（没有硬编码字面量）。"""
+    from pc import config as cfg
+    from pc.adapters.local_storage import LocalStorageBackend
+    from pc.adapters.magic_scan import MagicNumberScanner
+    from pc.services.pipeline import Worker
+
+    app_config = _load_app_config(root)
+    limits = cfg.ingest_limits(app_config)
+    return Worker(
+        conn,
+        storage=LocalStorageBackend(paths.media_root),
+        quarantine=LocalStorageBackend(paths.quarantine_root),
+        scanner=MagicNumberScanner(policy=cfg.security_policy(app_config), limits=limits),
+        limits=limits,
+        job_settings=cfg.job_settings(app_config),
+        worker_id=worker_id,
+    )
+
+
+def _print_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+    """等宽列打印；不用第三方表格库，免得为了排版多一个依赖。"""
+    text_rows = [["" if cell is None else str(cell) for cell in row] for row in rows]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in text_rows)) if text_rows else len(headers[index])
+        for index in range(len(headers))
+    ]
+    print("  " + "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  " + "  ".join("-" * width for width in widths))
+    for row in text_rows:
+        print("  " + "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
+
+
+def cmd_source_add(args: argparse.Namespace) -> int:
+    """登记一个来源，并同时写下它的授权记录（三者齐备才可采集，DESIGN §1.3）。"""
+    from pc.adapters import sqlite as db
+    from pc.adapters.registry import PLANNED_KINDS, SUPPORTED_KINDS
+    from pc.services import sources as sources_service
+
+    resolved, _ = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+
+    config: dict[str, Any] = {}
+    roots = [str(Path(item).expanduser()) for item in (args.roots or [])]
+    if roots:
+        config["roots"] = roots
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            info = sources_service.create_source(
+                conn,
+                name=args.name,
+                platform=args.platform,
+                kind=args.kind,
+                trust_level=args.trust,
+                external_ref=args.ref,
+                config=config,
+                authorization_mode=args.authorize,
+                evidence_ref=args.evidence,
+                expires_at=args.expires_at,
+            )
+    except (db.DatabaseError, sources_service.SourceError) as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        f"  ✓ 已登记来源「{info['name']}」（source_id={info['source_id']}，"
+        f"kind={info['kind']}，信任级别={info['trust_level']}）"
+    )
+    print(
+        f"    授权：mode={info['authorization_mode']}（authz_id={info['authz_id']}）"
+        + ("，无到期时间" if not args.expires_at else f"，到期 {args.expires_at}")
+    )
+    if roots:
+        print(f"    目录：{'、'.join(roots)}")
+    if info["kind"] in PLANNED_KINDS:
+        print(f"  · 注意：kind={info['kind']} 的实现还没落地（{PLANNED_KINDS[info['kind']]}）")
+        print(f"    现在能用的只有：{'、'.join(sorted(SUPPORTED_KINDS))}")
+    return 0
+
+
+def cmd_source_list(args: argparse.Namespace) -> int:
+    """列出全部来源与授权状态。"""
+    from pc.adapters import sqlite as db
+    from pc.services import sources as sources_service
+
+    resolved, _ = _db_and_paths(args)
+    if not resolved.path.is_file():
+        print(f"  · 还没有数据库文件（{resolved.path}）；建库后这里会列出来源。")
+        return 0
+
+    with db.open_db(resolved.path, expect_exists=True) as conn:
+        rows = sources_service.list_sources(conn)
+
+    if args.json:
+        print(cfg_dump_json([{**row, "authorization": dict(row["authorization"])} for row in rows]))
+        return 0
+    if not rows:
+        print("  · 还没有任何来源。用 `pc source add` 登记一个。")
+        return 0
+
+    table: list[list[Any]] = []
+    for row in rows:
+        state = row["authorization"]
+        table.append(
+            [
+                row["source_id"],
+                row["name"],
+                row["platform"],
+                row["kind"],
+                row["trust_level"],
+                "启用" if row["enabled"] else "停用",
+                "授权有效" if state["ok"] else state["reason"],
+                "、".join(state["modes"]) or "-",
+                row["deleted_at"] or "-",
+            ]
+        )
+    _print_table(
+        ["id", "名称", "平台", "kind", "信任", "状态", "授权", "方式", "软删"], table
+    )
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """把本地文件导入库：落信封并入队（L2），``--process`` 时接着跑 worker（L3）。"""
+    from pc import config as cfg
+    from pc.adapters import sqlite as db
+    from pc.adapters.registry import (
+        SourceConfigError,
+        UnsupportedSourceKindError,
+        connector_for,
+        source_config,
+    )
+    from pc.services import ingest as ingest_service
+    from pc.services import sources as sources_service
+
+    resolved, paths = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+
+    requested = [Path(item).expanduser() for item in args.paths]
+    missing = [str(item) for item in requested if not item.exists()]
+    if missing:
+        print(f"  ✗ 找不到这些路径：{'、'.join(missing)}", file=sys.stderr)
+        return 2
+
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_repo_root()
+    app_config = _load_app_config(root)
+    limits = cfg.ingest_limits(app_config)
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            source = sources_service.require_source(conn, args.source)
+            authorizations = sources_service.load_authorizations(conn, int(source["source_id"]))
+            # 目录必须持久化：worker 在另一个时刻取字节，它只读 source.config
+            roots = [str(item) for item in requested]
+            if not args.dry_run:
+                roots = sources_service.merge_roots(conn, source, roots)
+            else:
+                existing = source_config(source).get("roots") or []
+                roots = list(dict.fromkeys([*[str(item) for item in existing], *roots]))
+
+            connector = connector_for(
+                source,
+                authorizations,
+                roots=roots,
+                max_media_bytes=limits.max_media_bytes,
+                max_text_chars=limits.max_text_chars,
+            )
+            if not connector.authorize():
+                print(
+                    f"  ✗ 来源「{source['name']}」未通过授权校验："
+                    "凭证 / 授权范围 / 授权证明三者不齐备（DESIGN §1.3）",
+                    file=sys.stderr,
+                )
+                return 2
+
+            capabilities = connector.capabilities()
+            print(f"[导入] 来源「{source['name']}」（{capabilities['kind']}）")
+            print(f"  目录：{'、'.join(capabilities['roots'])}")
+            if not capabilities.get("supports_pull", False):
+                print("  ✗ 该来源是推送型，不能用 pc import 拉取", file=sys.stderr)
+                return 2
+
+            report = ingest_service.IngestReport()
+            cursor: str | None = None
+            scanned = 0
+            while True:
+                messages, cursor = connector.list_new(cursor)
+                if not messages:
+                    break
+                scanned += len(messages)
+                if args.dry_run:
+                    report = report.merge(
+                        ingest_service.IngestReport(seen=len(messages))
+                    )
+                else:
+                    report = report.merge(
+                        ingest_service.ingest_messages(conn, source, messages)
+                    )
+                if args.limit and scanned >= args.limit:
+                    break
+    except (
+        db.DatabaseError,
+        sources_service.SourceError,
+        UnsupportedSourceKindError,
+        SourceConfigError,
+    ) as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        print(f"  · dry-run：发现 {report.seen} 个文件，未写任何行。去掉 --dry-run 才会真正导入。")
+        return 0
+
+    print(
+        f"  ✓ 新消息 {report.inserted} 条，重复（已存在）{report.duplicates} 条，"
+        f"入队 {report.enqueued} 个任务"
+    )
+    if not args.process:
+        print("    接着处理：uv run pc work（或下次直接加 --process）")
+        return 0
+
+    print()
+    with db.open_db(resolved.path, expect_exists=True) as conn:
+        worker = _build_worker(conn, paths, root, worker_id=args.worker_id)
+        work = worker.run_once()
+    _print_work_report(work, prefix="  ")
+    return 0
+
+
+def cmd_work(args: argparse.Namespace) -> int:
+    """跑 worker：抢占任务、取字节、扫描、去重、落库。"""
+    from pc.adapters import sqlite as db
+
+    resolved, paths = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_repo_root()
+    limit = args.max if args.max else (1 if args.once else None)
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            worker = _build_worker(conn, paths, root, worker_id=args.worker_id)
+            print(f"[worker] id={worker.worker_id}")
+            if args.loop:
+                total = 0
+                while True:
+                    report = worker.run_once(limit=limit)
+                    total += report.claimed
+                    _print_work_report(report, prefix="  ")
+                    if not report.claimed:
+                        print(f"  · 队列空了（本次共处理 {total} 条），{args.interval} 秒后再看；Ctrl+C 退出")
+                    time.sleep(max(1, args.interval))
+            else:
+                report = worker.run_once(limit=limit)
+    except db.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:  # pragma: no cover - 交互式中断
+        print("\n  · 已中断")
+        return 0
+
+    if not args.loop:
+        _print_work_report(report, prefix="  ")
+        if not report.claimed:
+            print("  · 队列里没有可处理的任务（`pc import` 之后才有）")
+    return 0
+
+
+def _print_work_report(report: Any, *, prefix: str = "") -> None:
+    if report.recovered:
+        print(f"{prefix}· 崩溃恢复：重置了 {report.recovered} 条超时任务")
+    print(
+        f"{prefix}✓ 处理 {report.claimed} 条：成功 {report.succeeded}，"
+        f"失败（待重试）{report.failed}，死信 {report.dead}"
+    )
+    for job_id, status, note in report.notes:
+        if status in {"succeeded", "failed", "dead"} and job_id:
+            print(f"{prefix}  job {job_id} {status}：{note}")
+
+
+def cmd_item_list(args: argparse.Namespace) -> int:
+    """列出内容项——这是「内容真的进库了」最直接的证据。"""
+    from pc.adapters import sqlite as db
+
+    resolved, _ = _db_and_paths(args)
+    if not resolved.path.is_file():
+        print(f"  · 还没有数据库文件（{resolved.path}）；建库并导入之后这里会有内容。")
+        return 0
+
+    sql = [
+        "SELECT c.content_id, c.item_type, c.status, s.name AS source, c.ordinal,",
+        "       c.byte_size, c.char_count, c.text_content,",
+        "       (SELECT count(*) FROM content_media cm WHERE cm.content_id = c.content_id) AS media_count,",
+        "       (SELECT m.sha256 FROM content_media cm JOIN media m ON m.media_id = cm.media_id",
+        "         WHERE cm.content_id = c.content_id LIMIT 1) AS sha256,",
+        "       (SELECT m.scan_status FROM content_media cm JOIN media m ON m.media_id = cm.media_id",
+        "         WHERE cm.content_id = c.content_id LIMIT 1) AS scan_status,",
+        "       c.created_at",
+        "  FROM content_item c",
+        "  JOIN message m ON m.message_id = c.message_id",
+        "  JOIN source s ON s.source_id = m.source_id",
+        " WHERE c.deleted_at IS NULL",
+    ]
+    params: list[Any] = []
+    if args.source:
+        sql.append("   AND s.name = ?")
+        params.append(args.source)
+    if args.status:
+        sql.append("   AND c.status = ?")
+        params.append(args.status)
+    sql.append(" ORDER BY c.content_id DESC LIMIT ?")
+    params.append(max(1, args.limit))
+
+    with db.open_db(resolved.path, expect_exists=True) as conn:
+        rows = [dict(row) for row in conn.execute("\n".join(sql), params)]
+        total = conn.execute(
+            "SELECT count(*) FROM content_item WHERE deleted_at IS NULL"
+        ).fetchone()[0]
+
+    if args.json:
+        print(cfg_dump_json({"total": int(total), "items": rows}))
+        return 0
+    if not rows:
+        print("  · 还没有内容。试试：pc source add … → pc import <目录> --source … --process")
+        return 0
+
+    table: list[list[Any]] = []
+    for row in rows:
+        if row["text_content"]:
+            summary = str(row["text_content"])[:32].replace("\n", " ")
+            if len(str(row["text_content"])) > 32:
+                summary += "…"
+        elif row["sha256"]:
+            summary = f"媒体 {row['sha256'][:12]}…（{_human_size(row['byte_size'])}）"
+        else:
+            summary = "（空）"
+        table.append(
+            [
+                row["content_id"],
+                row["item_type"],
+                row["status"],
+                row["source"],
+                summary,
+                row["scan_status"] or "-",
+                row["media_count"],
+                row["created_at"],
+            ]
+        )
+    _print_table(["id", "类型", "状态", "来源", "内容", "扫描", "媒体", "建库时间"], table)
+    print(f"  共 {total} 个内容项（上面显示最近 {len(rows)} 条）")
+    return 0
+
+
+def _human_size(size: Any) -> str:
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):  # pragma: no cover - 列是整数
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"  # pragma: no cover - 上一步已覆盖
+
+
+def cfg_dump_json(payload: Any) -> str:
+    from pc import config as cfg
+
+    return cfg.dump_json(payload)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc",
-        description="post-collector 命令行（骨架阶段；doctor、config、db 已接线）",
+        description="post-collector 命令行（doctor / config / db / source / import / work / item）",
     )
     parser.add_argument("--version", action="version", version=f"post-collector {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -683,6 +1079,76 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_reindex = p_db_sub.add_parser("reindex", help="全量重建两个 FTS5 索引")
     p_db_reindex.add_argument("--path", help=db_path_help)
     p_db_reindex.set_defaults(func=cmd_db_reindex)
+
+    # -- 来源与导入 ---------------------------------------------------------
+
+    p_source = sub.add_parser("source", help="来源登记：授权三者齐备才可采集")
+    p_source_sub = p_source.add_subparsers(dest="source_command", required=True)
+
+    p_source_add = p_source_sub.add_parser("add", help="登记一个来源（同时写下授权记录）")
+    p_source_add.add_argument("name", help="来源名称，唯一")
+    p_source_add.add_argument("--platform", default="local", help="平台标识（默认 local）")
+    p_source_add.add_argument(
+        "--kind",
+        default="export",
+        choices=["export", "bot_api", "webhook", "rss", "user_api"],
+        help="来源类型（默认 export：本地文件/官方导出目录）",
+    )
+    p_source_add.add_argument(
+        "--trust", type=int, default=1, choices=[1, 2, 3], help="信任级别：1=自有 2=已授权群 3=外部"
+    )
+    p_source_add.add_argument("--ref", help="平台侧标识（频道 ID / 群 ID / 导出包标识）")
+    p_source_add.add_argument(
+        "--roots", action="append", help="该来源允许读取的目录（可重复）；会写进 source.config"
+    )
+    p_source_add.add_argument(
+        "--authorize",
+        default="manual_export",
+        choices=["manual_export", "owner_token", "admin_consent", "public_feed"],
+        help="授权取得方式（默认 manual_export：自己的导出与文件）",
+    )
+    p_source_add.add_argument("--evidence", help="授权证明留档：文件路径 / 链接 / 截图哈希")
+    p_source_add.add_argument("--expires-at", help="授权到期时间（ISO-8601，留空表示不过期）")
+    p_source_add.add_argument("--path", help=db_path_help)
+    p_source_add.set_defaults(func=cmd_source_add)
+
+    p_source_list = p_source_sub.add_parser("list", help="列出来源与授权状态")
+    p_source_list.add_argument("--json", action="store_true", help="输出 JSON")
+    p_source_list.add_argument("--path", help=db_path_help)
+    p_source_list.set_defaults(func=cmd_source_list)
+
+    p_import = sub.add_parser("import", help="把本地文件导入库（落信封并入队）")
+    p_import.add_argument("paths", nargs="+", help="文件或目录（目录会递归扫描）")
+    p_import.add_argument("--source", required=True, help="来源名称或 source_id")
+    p_import.add_argument("--process", action="store_true", help="导入后立刻跑 worker 处理")
+    p_import.add_argument("--limit", type=int, help="最多扫描这么多条（调试用）")
+    p_import.add_argument("--dry-run", action="store_true", help="只报告会发现什么，不写任何行")
+    p_import.add_argument("--worker-id", help="处理阶段的 worker 标识")
+    p_import.add_argument("--root", help="仓库根目录（默认自动查找，用于读 config/app.yaml）")
+    p_import.add_argument("--path", help=db_path_help)
+    p_import.set_defaults(func=cmd_import)
+
+    p_work = sub.add_parser("work", help="跑 worker：取字节、扫描、去重、落库")
+    p_work.add_argument("--once", action="store_true", help="只处理一条")
+    p_work.add_argument("--max", type=int, help="最多处理这么多条")
+    p_work.add_argument("--loop", action="store_true", help="常驻轮询（Ctrl+C 退出）")
+    p_work.add_argument("--interval", type=int, default=5, help="--loop 时的轮询间隔秒数（默认 5）")
+    p_work.add_argument("--worker-id", help="worker 标识（默认 pid@主机名）")
+    p_work.add_argument("--root", help="仓库根目录（默认自动查找，用于读 config/app.yaml）")
+    p_work.add_argument("--path", help=db_path_help)
+    p_work.set_defaults(func=cmd_work)
+
+    p_item = sub.add_parser("item", help="内容项：查看库里到底有什么")
+    p_item_sub = p_item.add_subparsers(dest="item_command", required=True)
+    p_item_list = p_item_sub.add_parser("list", help="列出最近的内容项")
+    p_item_list.add_argument("--limit", type=int, default=20, help="最多显示多少条（默认 20）")
+    p_item_list.add_argument("--source", help="只看某个来源")
+    p_item_list.add_argument(
+        "--status", choices=["active", "quarantined", "archived", "deleted"], help="只看某个状态"
+    )
+    p_item_list.add_argument("--json", action="store_true", help="输出 JSON")
+    p_item_list.add_argument("--path", help=db_path_help)
+    p_item_list.set_defaults(func=cmd_item_list)
 
     return parser
 

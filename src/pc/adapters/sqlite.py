@@ -596,7 +596,18 @@ def database_file_of(conn: sqlite3.Connection) -> Path | None:
 
 def _begin(conn: sqlite3.Connection) -> None:
     """显式开启写事务：``BEGIN IMMEDIATE`` 立刻取写锁，避免升级锁时的死锁窗口。"""
-    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        # SQLite 的原话是 "cannot start a transaction within a transaction"，
+        # 它几乎总是意味着调用方嵌了两层 db.transaction —— 直接说清楚，省一轮排查。
+        if "within a transaction" in str(exc):
+            raise DatabaseError(
+                "已经在事务里了，不能嵌套 db.transaction()。\n"
+                "  常见原因：在 with db.transaction(...) 里又调了一个自己开事务的辅助函数。\n"
+                "  请把那次写入挪到外层事务之外（DESIGN §2.3 要求写事务尽量短）。"
+            ) from exc
+        raise
 
 
 def _commit(conn: sqlite3.Connection) -> None:

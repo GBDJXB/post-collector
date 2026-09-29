@@ -25,6 +25,7 @@ EXPECTED_TABLE_COUNT = 34
 EXPECTED_MIGRATION_NAMES = {
     1: "0001_init.sql",
     2: "0002_content_hash_not_unique.sql",
+    3: "0003_message_media_refs.sql",
 }
 
 

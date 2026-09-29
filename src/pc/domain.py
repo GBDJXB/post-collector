@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from typing import Any
@@ -291,6 +292,26 @@ class SourceNotAuthorizedError(RuntimeError):
     """
 
 
+# ---------------------------------------------------------------------------
+# 文本规范化
+# ---------------------------------------------------------------------------
+
+
+def normalize_text(text: str) -> str:
+    """文本规范化：NFKC + 空白折叠 + 去首尾空白（DESIGN §4.2 的 normalize 步骤）。
+
+    只做**无损**变换，不改写内容：全角转半角、兼容字符归并、连续空白折成一个空格。
+    ``text_raw`` 保留原文，这里的结果写进 ``text_normalized`` 与检索文本，
+    所以这一步必须是确定性的——同一段文本任何时候都要得到同一个结果，
+    否则"同一份内容"在去重与检索里会分裂成两份。
+
+    刻意不做的：分词（那是检索层的事，见 DESIGN §5.1）、大小写折叠（中文场景下
+    折叠 ASCII 大小写会让 URL 与代码片段变形，等检索层按需处理）。
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    return " ".join(normalized.split())
+
+
 __all__ = [
     "AiInvolvement",
     "AuthzMode",
@@ -312,4 +333,5 @@ __all__ = [
     "TagCandidate",
     "TagNamespace",
     "TagSource",
+    "normalize_text",
 ]

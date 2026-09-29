@@ -417,6 +417,7 @@ message(message_id INTEGER PRIMARY KEY, uuid TEXT, source_id INTEGER REFERENCES 
      lang TEXT,                                             -- 派生
      reply_to_platform_id TEXT, repost_of_message_id INTEGER REFERENCES message(message_id),
      forward_chain TEXT,                                    -- JSON: [{platform, sender, channel, url}]
+     media_refs TEXT,                                       -- JSON: 平台侧媒体引用（file_id/URL/路径），顺序即内容项顺序
      permalink TEXT, raw_payload TEXT,                      -- 原始载荷 JSON（保留策略见下）
      raw_payload_hash TEXT,
      source_trust INTEGER, nsfw_gate INTEGER,               -- 摄入时的门控判定副本
@@ -431,7 +432,7 @@ CREATE INDEX message_sender_sent_idx ON message (sender_identity_id, sent_at DES
 
 `raw_payload` 保留策略（**v3.1 细化为三档**）。它是本库体积的最大变量——平台原始载荷通常 2–5 KB/条，10 万条即 200–500 MB，比结构化数据本身还大。三档分别是：
 
-1. **最小规范化信封（默认，始终保留）**：就是 `message` 表的结构化列本身（来源、发送者、时间、文本、转发链、消息类型、平台消息 ID）。连接器解析升级与字段修复所需的信息在这一档里基本够用。
+1. **最小规范化信封（默认，始终保留）**：就是 `message` 表的结构化列本身（来源、发送者、时间、文本、转发链、媒体引用、消息类型、平台消息 ID）。连接器解析升级与字段修复所需的信息在这一档里基本够用。**`media_refs` 属于这一档**：取媒体发生在 L3，而 `message` 行是 L2 落的，少了它 worker 拿不到任何引用（拉取型平台等于重放整个同步，推送型平台根本做不到），所以它无论哪一档都必须留（v3.1 实现时以 `0003_message_media_refs.sql` 补上——0001 漏了这一列）。
 2. **原始载荷（默认关闭，可选开启）**：`raw_payload`，**开启时必须加密存储**（与 6.1 的密钥体系同一套），并带独立保留期（例如"保留最近 90 天"）。适用于精确重放、审计或争议处理。
 3. **仅哈希（`raw_payload_hash`，始终保留）**：用于校验"这条消息的原始载荷是否变过"，不占空间、不涉隐私。
 
@@ -2126,6 +2127,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
 | **迁移器支持多文件 + 文本重复改为归组**（阶段 1 前置） | 动手实现"适配器 + 手动上传"时发现两个结构问题：① 迁移器只接受**单个**文件、版本号写死为 1，任何第二个 schema 改动都无从落地；② `content_item.content_hash` 的**唯一**索引无法表示"同一段文本出现在两条消息里"（`message_id` 是 NOT NULL），与 v3.1 修掉的 `media` 多对多缺陷同源 | `apply_migration` 改为**按序号应用整个 `migrations/sqlite/` 目录**：每个文件一个显式事务（某文件失败只回滚它自己）、只应用未记账的版本、**逐版本**比对结构指纹、`applied`/`skipped`/`drifted`/`checksum_backfilled` 分列报告；新增 `MigrationState.PENDING`（"已应用一部分"是正常升级路径），`PARTIAL` 收窄为"有业务表却零记账"；记账表 `schema_migration` 由适配器兜底创建；新增 `0002_content_hash_not_unique.sql` 把该索引降级为普通部分索引；§3.2 的索引定义与 §3.8 的"文本精确重复归组"语义同步；`pc db apply/status` 的 `--file` 改为 `--dir`；新增 `tests/test_migrations.py`（15 条） |
 | **L2 配置段有了真正的消费者**（阶段 1 前置） | `config/app.yaml` 里 `ingest` / `security` / `jobs` / `paths` 四段此前**没有任何代码读它们**：限额、安全开关与队列节拍只存在于文件与设计里，`paths.*` 留空"从数据根派生"这句话也无人执行 | 新增 `pc.config.load_app_config()`：整个文件按 `APP_CONFIG_SECTIONS` 的已知键清单严格校验（未知段名与未知键报错并给出最接近的键名建议），`ingest_limits()` / `security_policy()` / `job_settings()` 给类型化取值（整数字段写 `true`、布尔字段写 `"false"` 都报错），`config_warnings()` 报告缺段缺键；新增 `pc.adapters.sqlite.resolve_paths()`：数据根目录 + 六个运行时目录逐项解析并**带来源**，与 `resolve_db_path()` 同处一个模块以保证"数据根在哪"只有一个答案，**媒体目录跟着数据根走、不跟着库文件走**（`PC__DB__PATH` 只挪库文件）；`pc doctor` 的运行时目录段改用解析结果并打印来源。设计侧对应 §6.2 的"L2 段不进设置页"与 §10.2 的目录派生规则，`pc.config` 成为这两条规则的唯一落点 |
 | **连接器端口补齐取字节与推送两条路**（阶段 1 首发适配器） | §9.1 的 `Connector` 只有 `list_new` / `capabilities` / `authorize` / `rate_limit_hint`：**取媒体这件事在契约里没有归口**（§2.1 把 fetch 放在 L3，但只有平台适配器知道怎么取），推送型平台（Discord 网关、微信/QQ 回调）也没有入口。照这个契约写，第一个真实平台适配器就得绕过端口 | `Connector` 增加 `fetch_media(ref) -> bytes`（自己带鉴权与限流，超上限抛 `MediaTooLargeError`）与 `parse_event(payload) -> [SourceMessage]`（推送型入口），`capabilities()` 增加 `supports_pull` / `supports_push` / `supports_media_fetch` 三个开关，不适用的那条路抛 `NotImplementedError`；**只加方法不加协议，接口数量仍是 13**。同时落地三个本地适配器（`local_files` / `local_storage` / `magic_scan`）与工厂 `registry.connector_for()`（`source.kind` 分派，也是唯一解密凭证的位置），`source.config` 约定 `{"roots": [...]}` |
+| **第一条端到端链路：本地文件 → 库**（阶段 1 首个可用切片） | 设计里 L2/L3 的职责边界（落信封 / 取字节）、任务的幂等与重试策略、隔离区的物理分离都只有文字描述，没有可运行的判据；`media_refs` 也没有落脚点 | 新增 `src/pc/services/`：`sources`（source + authorization 同生共死、默认存储后端、目录持久化）、`ingest`（L2 幂等落信封 + 入队，`raw_payload` 默认只留哈希）、`pipeline`（L3 单进程 worker：`BEGIN IMMEDIATE` 原子抢占、`attempts` 抢占即 +1、崩溃恢复、确定性失败进死信 / 偶发退避重试、幂等护栏、扫描不通过写进独立后端行 `local-quarantine`）。新增 `0003_message_media_refs.sql`（§3.2 的 `media_refs`，三档保留策略的第一档）。CLI 新增 `source add/list`、`import`、`work`、`item list`。新增测试 6 个文件（服务层、worker 管线、CLI 端到端、文本规范化、出网守卫），并把「全库不存在外发代码路径」（§9 验收⑦）从口号变成每次提交都在跑的断言 |
 | **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 
 ## 附录 B：参考组件
