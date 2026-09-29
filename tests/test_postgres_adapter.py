@@ -82,12 +82,28 @@ class TestResolveDsn:
         assert resolved.source == "explicit"
         assert resolved.dsn.endswith("@explicit/db")
 
-    def test_env_container_dsn_wins_over_test_dsn(self, tmp_path: Path) -> None:
+    def test_host_dsn_wins_when_both_are_present(self, tmp_path: Path) -> None:
+        """宿主侧工具必须拿到 localhost 那条。
+
+        两者同时存在是常态：``.env`` 被进程环境加载时（本仓库的开发环境就是这样），
+        ``PC__DB__DSN`` 与 ``PC_TEST_DSN`` 都会在 environ 里。若先取前者，
+        宿主机就会去解析容器服务名 ``db`` 并失败。
+        """
         resolved = pg.resolve_dsn(
             env={
                 "PC__DB__DSN": "postgresql://x@db:5432/pc",
                 "PC_TEST_DSN": "postgresql://x@localhost:5432/pc",
             },
+            env_file=tmp_path / "none",
+            app_config=tmp_path / "none",
+        )
+        assert resolved.source == "env:PC_TEST_DSN"
+        assert "@localhost:5432" in resolved.dsn
+
+    def test_container_uses_container_dsn_when_alone(self, tmp_path: Path) -> None:
+        """容器里只有 PC__DB__DSN（compose 只注入它），此时必须用它。"""
+        resolved = pg.resolve_dsn(
+            env={"PC__DB__DSN": "postgresql://x@db:5432/pc"},
             env_file=tmp_path / "none",
             app_config=tmp_path / "none",
         )

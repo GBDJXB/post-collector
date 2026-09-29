@@ -89,7 +89,7 @@ post-collector/
 - `migrations/` 下按序号追加 SQL，不修改已应用的版本。`0001_init.sql` 已于 2026-09-28 在 PostgreSQL 16.15 上执行成功并**冻结**：后续任何结构改动一律以 `0002_*.sql` 追加。
 - 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`（最后这条是 0001 首次真实执行时才暴露的）。全部偏差都写在 `0001_init.sql` 文件头。
 - 执行迁移请**整条语句执行**，两条等价路径：`uv run pc db apply`（纯 Python，单事务、失败整体回滚）与容器内 `psql -f`。不要用 `text.split(';')` 之类的方式切分语句，文件内既有分号又有相邻字面量拼接。
-- 连接串分两处且不可混用：容器内用 `PC__DB__DSN`（主机名是服务名 `db`），宿主机侧用 `.env` 的 `PC_TEST_DSN`（主机名 `localhost`），两者密码必须一致。`pc db` 在宿主机上刻意忽略 `.env` 里的 `PC__DB__DSN`，因为它指向容器网络。
+- 连接串分两处且不可混用：容器内用 `PC__DB__DSN`（主机名是服务名 `db`），宿主机侧用 `.env` 的 `PC_TEST_DSN`（主机名 `localhost`），两者密码必须一致。解析优先级里 **`PC_TEST_DSN` 排在 `PC__DB__DSN` 之前**：宿主侧两者常常同时存在于进程环境（`.env` 会被 harness 注入子进程），先取后者就会去解析服务名 `db`，报出费解的 `failed to resolve host 'db'`。`pc db` 另外刻意不读 `.env` 里的 `PC__DB__DSN`。
 - 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移。
 - 派生数据（索引、向量、标签、caption）一律可重建；`PostgreSQL` 与媒体目录是唯一需要认真备份的东西。
 

@@ -123,6 +123,8 @@ post-collector/
 
 两处的密码必须一致。`.env` 已被 `.gitignore` 忽略，不要提交，也不要把真实密码写进 `.env.example`。
 
+工具在宿主机上**优先认 `PC_TEST_DSN`**：`.env` 常会被开发环境整份加载进进程，两个变量因此同时存在；若先认容器那条，宿主机就会去解析服务名 `db` 并失败（报 `failed to resolve host 'db'`）。只有容器里没有 `PC_TEST_DSN`，那时才用 `PC__DB__DSN`。
+
 一件事需要说清楚：**数据库和媒体目录是唯一必须认真备份的两样东西**，其它一切（检索索引、向量、派生标签）都能从这两样重建。另外，删除功能不会追溯清理已有的备份，所以「删除后最长 N 天内仍可能存在于备份中」这句必须写进你的隐私策略。
 
 ## 日常操作
@@ -183,6 +185,7 @@ PC__SEARCH__DEFAULT_PAGE_SIZE=80
 | `pc db status` 报密码/认证失败 | 改了 `POSTGRES_PASSWORD` 却没同步 DSN | `.env` 里两处 DSN 的密码必须与 `POSTGRES_PASSWORD` 一致 |
 | 5432 端口被占用 | 本机已有别的 PostgreSQL | 停掉它，或改 `docker-compose.yml` 的端口映射（改了要同步 `.env` 的 `PC_TEST_DSN`） |
 | `pc db status` 提示结构指纹漂移 | 迁移文件在应用之后被改过 | 本工具不会自动改库；若改动确有必要，请以新迁移追加，而不是改已应用的版本 |
+| 报 `failed to resolve host 'db'` | 在宿主机上拿到了容器内的连接串 | 正常解析已优先取 `PC_TEST_DSN`；出现即说明显式传了 `--dsn`（改成 `localhost`），或环境里只剩 `PC__DB__DSN` |
 | 集成测试被跳过 | 没提供测试连接串 | 属预期行为；要跑就在 `.env` 里设 `PC_TEST_DSN` |
 | 想用 psql 但提示找不到 | 应用容器里没有 psql 客户端 | 用 `docker compose exec -T db psql -U pc -d pc -c '\dt'`，或改用 `uv run pc db status` |
 | 启动报端口被占用 | 8080 有别的程序 | 换端口 `--port 8081` |

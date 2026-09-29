@@ -177,25 +177,30 @@ def resolve_dsn(
 ) -> ResolvedDsn:
     """按优先级解析出要用的连接串。
 
-    优先级：``explicit`` > 环境变量 ``PC__DB__DSN`` > 环境变量 ``PC_TEST_DSN``
+    优先级：``explicit`` > 环境变量 ``PC_TEST_DSN`` > 环境变量 ``PC__DB__DSN``
     > ``.env`` 里的 ``PC_TEST_DSN`` > ``config/app.yaml`` 的 ``db.dsn`` > 内置默认。
 
-    注意 ``.env`` 里的 ``PC__DB__DSN`` **刻意不读**：那是给容器用的，主机名是容器服务名
-    ``db``，在宿主机上解析不了。宿主机侧请用同一份凭据、主机名为 ``localhost`` 的
-    ``PC_TEST_DSN``（见 ``.env.example`` 的注释）。
+    为什么 ``PC_TEST_DSN`` 排在 ``PC__DB__DSN`` **前面**：前者是宿主侧工具专用
+    （主机名 ``localhost``），后者是容器内应用用的（主机名是服务名 ``db``）。
+    容器里只会存在 ``PC__DB__DSN``；而宿主机上两者**可能同时存在**——当 ``.env``
+    被进程环境加载时（本仓库的开发环境就是这样，harness 会把 .env 注入子进程）
+    就会两者都有。此时若先取 ``PC__DB__DSN``，宿主机就会去解析 ``db`` 这个主机名，
+    报出令人费解的 ``failed to resolve host 'db'``。
+
+    同理，``.env`` 里的 ``PC__DB__DSN`` **刻意不读**：它指向容器网络。
     """
     environ = os.environ if env is None else env
 
     if explicit:
         return ResolvedDsn(explicit, "explicit")
 
-    value = environ.get("PC__DB__DSN")
-    if value:
-        return ResolvedDsn(value, "env:PC__DB__DSN")
-
     value = environ.get("PC_TEST_DSN")
     if value:
         return ResolvedDsn(value, "env:PC_TEST_DSN")
+
+    value = environ.get("PC__DB__DSN")
+    if value:
+        return ResolvedDsn(value, "env:PC__DB__DSN")
 
     value = read_env_file(env_file).get("PC_TEST_DSN")
     if value:
@@ -280,19 +285,36 @@ def connect(dsn: str, *, autocommit: bool = False, connect_timeout: int = 5) -> 
     try:
         return psycopg.connect(dsn, connect_timeout=connect_timeout, autocommit=autocommit)
     except psycopg.OperationalError as exc:
-        raise DatabaseUnavailableError(_connect_hint(exc)) from exc
+        raise DatabaseUnavailableError(_connect_hint(exc, dsn)) from exc
 
 
-def _connect_hint(exc: Exception) -> str:
+def _hostname_of(dsn: str) -> str:
+    try:
+        return (urlsplit(dsn).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _connect_hint(exc: Exception, dsn: str = "") -> str:
     text = str(exc).strip()
     detail = text.splitlines()[0] if text else exc.__class__.__name__
-    return (
-        f"连不上数据库：{detail}\n"
-        "  按顺序排查：\n"
-        "    1) 数据库是否在跑：docker compose ps（应显示 db healthy）\n"
-        "    2) 宿主机侧的连接串主机名必须是 localhost；容器内才是服务名 db\n"
-        "    3) .env 的 PC_TEST_DSN 是否已改掉 change-me，且与 POSTGRES_PASSWORD 一致"
+    lines = [f"连不上数据库：{detail}", "  按顺序排查："]
+    if _hostname_of(dsn) == "db":
+        # 这是最常见也最费解的一种：宿主机上拿了容器内的连接串
+        lines.extend(
+            [
+                "    0) 当前连接串的主机名是 db —— 那是容器网络里的服务名，宿主机解析不了。",
+                "       宿主机侧要用 .env 里的 PC_TEST_DSN（主机名 localhost），不是 PC__DB__DSN。",
+            ]
+        )
+    lines.extend(
+        [
+            "    1) 数据库是否在跑：docker compose ps（应显示 db healthy）",
+            "    2) 宿主机侧的连接串主机名必须是 localhost；容器内才是服务名 db",
+            "    3) .env 的 PC_TEST_DSN 是否已改掉 change-me，且与 POSTGRES_PASSWORD 一致",
+        ]
     )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
