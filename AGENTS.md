@@ -13,7 +13,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实建起**（PostgreSQL 16.15，32 张表，宿主侧与容器侧两条路径都验证过）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层与 schema 红线；**但业务功能仍未实现**。
 
-**设计与实现存在已知偏差（迁移进行中）**：`DESIGN.md` 已升级为 **v3**——以 SQLite 取代 PostgreSQL、解除 Docker 硬依赖、把分发限定在 GitHub 内完成。代码当前仍运行在 PostgreSQL 上（`src/pc/adapters/postgres.py`、`migrations/0001_init.sql`、`pyproject.toml` 的 `psycopg` 依赖）。**SQLite 迁移尚未执行**；迁移完成前，本文件的「开发命令」与「关键目录」描述的是**当前代码事实**，照旧有效。
+**设计与实现存在已知偏差（迁移进行中）**：`DESIGN.md` 已升级为 **v3.1**——以 SQLite 取代 PostgreSQL、解除 Docker 硬依赖、把应用代码与发布产物的分发收敛到 GitHub（原生安装仍需 PyPI 取依赖，已如实写入文档），**并把阶段 1 的范围收窄为"root + 邀请制用户"，匿名提报入口后置到阶段 2**。代码当前仍运行在 PostgreSQL 上（`src/pc/adapters/postgres.py`、`migrations/0001_init.sql`、`pyproject.toml` 的 `psycopg` 依赖）。**SQLite 迁移尚未执行**；迁移完成前，本文件的「开发命令」与「关键目录」描述的是**当前代码事实**，照旧有效。
 
 设计事实源是 [`DESIGN.md`](DESIGN.md)。它是只读基线：改动实现前先读对应章节；若实现结论与它冲突，修改 `DESIGN.md` 并同步其附录 C 的变更记录，不要只在代码里悄悄偏离。
 
@@ -77,7 +77,7 @@ post-collector/
 **两条红线（需以断言级测试守住）**
 
 1. **不外发**：当前阶段不得引入任何第三方 AI 调用的代码路径。阶段 2 引入外发网关时，所有调用必须收敛到单一内部函数并逐条落 `egress_log`；`egress_state='cleared'` 不是免检通行证。
-2. **匿名提报零副作用**：`inbox_item` 在审查通过前不得写入 `message` / `content_item`，不得打标、不得进索引、不得出现在任何检索结果里；隔离区字节与主存储物理分离。
+2. **匿名提报零副作用**：`inbox_item` 在审查通过前不得写入 `message` / `content_item`，不得打标、不得进索引、不得出现在任何检索结果里；隔离区字节与主存储物理分离。**该入口后置到阶段 2**（阶段 1 不开放任何公开入口），但红线本身不弱化：一旦启用就必须以断言级测试守住。
 
 **分层与解耦**
 
@@ -166,4 +166,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本。测试套件已覆盖数据库适配层、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
