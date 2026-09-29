@@ -30,11 +30,12 @@ description: "post-collector 使用手册：这个工具能做什么、需要准
 | 目录结构、13 个可替换的接口、设置项声明 | 已完成 |
 | 环境体检命令 `pc doctor`（含只读数据库段） | 已完成，现在就能用 |
 | 数据库：PostgreSQL 建库、32 张表、迁移应用与结构校验 | **已完成**，见第 3 步与「日常操作」 |
-| 测试套件（数据库适配层与 schema 红线） | 已完成，`uv run pytest` |
+| 设置层：生效值与来源可查、首次启动播种（命令行） | **已完成**，见「参数怎么调」；设置页界面在阶段 1 |
+| 测试套件（数据库适配层、设置层与 schema 红线） | 已完成，`uv run pytest` |
 | 接口服务（存活检查、运行模式查询） | 已完成，需先装依赖 |
 | 采集来源、去重、打标、检索、Web 界面 | **尚未实现**，见文末「当前版本还不能做什么」 |
 
-也就是说：现在可以把环境搭好、把数据库真正建起来并逐项验证，把服务点着，但还搜不到东西。
+也就是说：现在可以把环境搭好、把数据库真正建起来并逐项验证，把服务点着，把每个参数「现在是多少、为什么是这个值」查清楚，但还搜不到东西。
 
 ## 你需要准备什么
 
@@ -71,15 +72,18 @@ description: "post-collector 使用手册：这个工具能做什么、需要准
    docker compose up -d db       # 等它变成 healthy；首次会拉取约 250 MB 镜像
    uv run pc db apply            # 建表：整篇单事务执行，失败整体回滚
    uv run pc db status           # 只读复核：32 张表、pg_trgm、记账版本、结构指纹
+   uv run pc config seed         # 首次播种设置项：只插不改，重复运行安全
+   uv run pc config show         # 逐项查看生效值与来源（--explain 带含义与影响）
    ```
 
-   四点说明：
+   六点说明：
 
    - 迁移脚本是**整条语句执行**的写法（文件里既有含分号的注释，也有相邻字符串字面量拼接），所以请用 `pc db apply`，或在容器里 `psql -f`，**不要**自己按分号切分。
    - 容器内没有 `psql` 客户端，而 `pc db apply` 是纯 Python 路径，不依赖 psql——在容器里同样能用。
    - 想在容器里直接看表：`docker compose exec -T db psql -U pc -d pc -c '\dt'`。
    - 迁移脚本随镜像分发，所以在容器内同样能应用与复核：`docker compose run --rm app pc db apply`、`docker compose run --rm app pc db status`。
    - 数据库只绑 `127.0.0.1:5432`，局域网里其它机器连不上；`.env` 里的 `PC_TEST_DSN` 是给宿主机上的工具用的，主机名必须是 `localhost`。
+   - `pc config seed` 把设置项的初始值写进数据库，**只插入缺失的、绝不覆盖已有的**；此后这个实例以数据库为准，再改 `config/app.yaml` 不会影响它。
 
 4. 启动服务：
 
@@ -131,9 +135,11 @@ post-collector/
 
 | 我想… | 怎么做 |
 | --- | --- |
-| 看现在状态如何 | `uv run pc doctor`（含只读数据库段） |
+| 看现在状态如何 | `uv run pc doctor`（含只读数据库段与设置项播种状态） |
 | 看数据库结构对不对 | `uv run pc db status`：表数、扩展、记账版本、结构指纹；不符时退出码 2 |
 | 建表 / 重放迁移 | `uv run pc db apply`（已应用会自动短路，不会重复建表，也不会动已存在的数据） |
+| 看某个参数现在是多少、从哪来 | `uv run pc config show`；`--key dedup` 只看一项，`--explain` 带含义与改动后果，`--json` 给脚本用 |
+| 把设置项的初始值写进数据库 | `uv run pc config seed`（只插不改，重复运行安全） |
 | 起 / 停数据库 | `docker compose up -d db` / `docker compose stop db` |
 | 跑测试 | `uv run pytest`（集成测试需要数据库，取不到连接串会自动跳过） |
 | 启动 / 停止服务 | `docker compose up -d app` / `docker compose down` |
@@ -148,17 +154,29 @@ post-collector/
 
 | 层 | 位置 | 改它的方式 | 生效 |
 | --- | --- | --- | --- |
-| 设置页 | 数据库 `setting` 表，字段说明来自 `config/settings-registry.yaml` | 界面点选，中文标签 + 一句大白话说明 + 改了会怎样 | 立刻生效，不用重启 |
-| 开发配置 | `config/app.yaml` | 直接编辑（带注释） | 校验通过后热重载 |
+| 设置页 | 数据库 `setting` 表，字段说明来自 `config/settings-registry.yaml` | 界面点选，中文标签 + 一句大白话说明 + 改了会怎样。**界面在阶段 1**；现在可以用 `uv run pc config show` 看、`uv run pc config seed` 播种 | 立刻生效，不用重启 |
+| 开发配置 | `config/app.yaml` | 直接编辑（带注释）。它的 `defaults` 段只在**尚未播种**的实例上生效 | 校验通过后热重载 |
 | 部署配置 | `docker-compose.yml` / `.env` | 编辑后重启容器 | 需要重启 |
 
-规则是：第一次启动时，`config/app.yaml` 里的 `defaults` 段会被用来给数据库写入初始值；此后一切以数据库为准。想改默认值就改注册表，别去改已经初始化过的实例。
+规则是：第一次启动时，`config/app.yaml` 里的 `defaults` 段会被用来给数据库写入初始值（这就是 `pc config seed` 做的事）；此后一切以数据库为准。想改默认值就改注册表，别去改已经初始化过的实例。
+
+拿不准某个值是哪来的，就问工具——它逐项回答「现在是多少、为什么是这个值」：
+
+```bash
+uv run pc config show              # 六项：相似图片判定严格度、AI 参与程度、内容库最大占用、检索每页条数、匿名提报开关、全局仅本地开关
+uv run pc config show --key dedup  # 只看某一项（也可以给命名空间前缀）
+uv run pc config show --explain    # 附上「含义 / 影响 / 类型与范围 / 改动后果」
+```
+
+输出里的来源只可能是四种之一，按优先级从高到低是：**环境变量 > 数据库 > `config/app.yaml` > 注册表默认值**。看到「数据库 setting 表」就说明这一项已经由设置页接管，改 YAML 对它不再有影响；这也是为什么改了文件没生效时，第一件事应该是跑一次 `pc config show`。
 
 每个设置项都能用环境变量临时覆盖，形式为 `PC__` 加双下划线，例如把检索每页条数改成 80：
 
 ```bash
 PC__SEARCH__DEFAULT_PAGE_SIZE=80
 ```
+
+环境变量写错了不会静默失效：如果名字落在某个设置项的命名空间下、但注册表里没有这一项，`pc config show` 会点名报出来并给出可能的正确写法。（`PC__DB__DSN`、`PC__PATHS__MEDIA_ROOT` 这类属于部署与开发配置段，不在此列。）
 
 现在能调的设置项：相似图片判定严格度、AI 参与程度、内容库最大占用、检索每页条数、匿名提报开关、全局仅本地开关。数据库地址、端口、并发数这类「改错了后果不容易一句话说清」的参数，刻意只留在配置文件里，不放界面。
 
@@ -180,7 +198,11 @@ PC__SEARCH__DEFAULT_PAGE_SIZE=80
 | `doctor` 报某个文件不存在 | 不在仓库根目录运行 | 回到仓库根，或用 `--root` 指定路径 |
 | `python -m pc doctor` 报 `No module named pc` | 用的是系统 Python，没走项目虚拟环境 | 加 `uv run`：`uv run python -m pc doctor`；或临时设 `PYTHONPATH=src` |
 | `config show` 提示缺 PyYAML | 还没装依赖 | 跑 `uv sync` |
-| `config show` 退出码 3 | 该功能骨架阶段尚未实现 | 属预期；实现指引见 DESIGN.md §6.2 |
+| `config show` 报数据库不可达 | 数据库没起 | 属正常降级：它照样显示文件与环境层的值，并打印一行说明；要看到数据库层就先 `docker compose up -d db` |
+| 改了 `config/app.yaml` 却没生效 | 这个实例已经播种过，一切以数据库为准 | 属设计行为；用 `pc config show` 看来源那一行。要改它的值，等阶段 1 的设置页 |
+| 环境变量设了却没生效 | 名字拼错了，或它不属于设置项 | `pc config show` 会点名报出可疑的 `PC__` 变量并提示可能想写哪个；`PC__DB__DSN` 这类部署层变量不在检查范围内 |
+| `pc config seed` 说「保留既有 N 项」 | 播种只插不改 | 正常：重复运行不会覆盖任何已有值 |
+| `pc config seed` 说库里没有 `setting` 表 | 还没建表 | 先跑 `uv run pc db apply` |
 | `pc db status` 报连不上数据库 | 数据库没起，或用了错的连接串 | `docker compose ps` 看 `db` 是否 healthy；宿主机侧要用 `.env` 的 `PC_TEST_DSN`（`localhost`），不是容器里的 `PC__DB__DSN`（`db`） |
 | `pc db status` 报密码/认证失败 | 改了 `POSTGRES_PASSWORD` 却没同步 DSN | `.env` 里两处 DSN 的密码必须与 `POSTGRES_PASSWORD` 一致 |
 | 5432 端口被占用 | 本机已有别的 PostgreSQL | 停掉它，或改 `docker-compose.yml` 的端口映射（改了要同步 `.env` 的 `PC_TEST_DSN`） |
@@ -194,7 +216,9 @@ PC__SEARCH__DEFAULT_PAGE_SIZE=80
 
 ## 当前版本还不能做什么
 
-这些不是「忘了写」，而是按阶段排期：链接自动抓取、AI 外发、向量检索、以图搜图、多租户、Meilisearch 与 MinIO、Web 界面、后台 worker 与调度器、备份脚本。测试已经有了，但目前只覆盖数据库适配层与 schema 红线——**没有任何业务逻辑测试，因为还没有业务逻辑**。
+这些不是「忘了写」，而是按阶段排期：链接自动抓取、AI 外发、向量检索、以图搜图、多租户、Meilisearch 与 MinIO、Web 界面（包括**设置页**：现在只能用命令行查看与播种设置项，改值要等界面）、后台 worker 与调度器、备份脚本。测试已经有了，覆盖数据库适配层、设置层与 schema 红线——**没有任何业务逻辑测试，因为还没有业务逻辑**。
+
+设置项的写入路径已经在代码里就绪（带前后值审计、失败整体回滚、危险项二次确认与「改动前先 dry-run」的闸门，都有集成测试盯着），但**没有从命令行改设置的入口**：审计表要求写清「这次改动从哪来」，而它的取值里目前没有「命令行」这一类，硬塞进去只会让审计记录失真。设置页（界面）是它的第一个正经消费者。
 
 阶段 1 要做的是打通第一个可用闭环：**采集 → 安全扫描与去重 → 存储 → 打标 → 检索 → 人工纠错**，全部本机运行。它的验收标准写在 DESIGN.md §9，其中两条与安全直接相关，会用断言级测试守住：匿名提报在审查前零副作用；全库不存在任何外发调用路径。后者的数据模型部分**已经守住**：三张阶段 2 的表（`content_embedding`、`ai_provider_policy`、`egress_log`）在库里必须缺席，`content_item.egress_state` 的默认值必须是 `local_only`，`inbox_item` 不允许存在任何通往 `content_item` 的列或外键——这三条都有集成测试盯着。
 

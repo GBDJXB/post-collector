@@ -14,7 +14,8 @@
 #   recompute               改后哪些派生数据需要重算，用于主动提示
 #   requires                依赖的其他设置项，防止无效组合
 #
-# 加载器与校验器见 src/pc/config.py（骨架阶段为签名占位）。
+# 加载器与校验器见 src/pc/config.py（已实现：加载期 fail closed，报错会点名缺哪个字段、
+# 建议正确的键名，并拦住越界默认值）。生效值的四层解析与来源说明见 `pc config show`。
 # ---------------------------------------------------------------------------
 
 schema_version: 1
@@ -41,9 +42,11 @@ settings:
     help: 决定系统在多大程度上自动帮你判断内容和打标签。选「完全不参与」时不会下载或加载任何模型，所有内容都进待人工分类队列，由你自己判断该不该存、该归到哪个分类。
     default: local_only
     type: enum
-    values: [off, local_only, assist, advisory_auto]
+    # 注意：取值必须加引号。YAML 1.1 会把裸写的 off / on / yes / no 解析成布尔值，
+    # 于是 `off` 会变成 False，注册表校验会直接报错（这是刻意 fail closed 的行为）。
+    values: ["off", local_only, assist, advisory_auto]
     value_labels:
-      off: 完全不参与（纯手动）
+      "off": 完全不参与（纯手动）
       local_only: 仅本机模型（推荐）
       assist: 本机模型 + 云端给出建议（需人工确认）
       advisory_auto: 本机模型 + 云端建议自动采信（仅高可信时）

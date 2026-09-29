@@ -1,12 +1,15 @@
-"""PostgreSQL 适配器：连接串解析、迁移应用与 schema 校验。
+"""PostgreSQL 适配器：连接串解析、迁移应用、schema 校验与设置层读写。
 
-本模块是 adapters 层的第一个实现，职责刻意收窄到三件事：
+本模块是 adapters 层的第一个实现，职责刻意收窄到四件事：
 
 * 解析连接串，并回答「这个连接串是从哪来的」（对应 DESIGN §6.2.4 的来源可解释性）；
 * 把 ``migrations/*.sql`` 应用到数据库；
-* 报告库里的结构与迁移是否一致（表、扩展、记账版本、checksum 漂移）。
+* 报告库里的结构与迁移是否一致（表、扩展、记账版本、checksum 漂移）；
+* ``setting`` / ``setting_change`` 两张表的读写（首次播种与带审计的变更）。
 
-查询构造、业务规则与领域逻辑都不在这里。
+查询构造、业务规则与领域逻辑都不在这里：设置项的**语义**（类型、范围、依赖、
+危险项闸门）属于 ``pc.config``，本模块只负责把它们落表，并保证「要么都写、要么
+都不写」。
 
 两条硬约束：
 
@@ -25,9 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -89,6 +93,14 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
 DEFERRED_TABLES: frozenset[str] = frozenset(
     {"content_embedding", "ai_provider_policy", "egress_log"}
 )
+
+#: ``setting.source`` 的允许取值，与 0001 的 CHECK 约束保持一致。
+#: 语义是「这一行的值从哪来」：注册表默认值 / app.yaml 的 defaults 段 /
+#: 有人在数据库里改过 / 被环境变量覆盖过。
+SETTING_SOURCES: tuple[str, ...] = ("default", "yaml", "db", "env")
+
+#: ``setting_change.changed_via`` 的允许取值，与 0001 的 CHECK 约束保持一致。
+SETTING_CHANGE_VIA: tuple[str, ...] = ("ui", "yaml", "env", "migration")
 
 
 class DatabaseError(RuntimeError):
@@ -523,6 +535,200 @@ def _scalar(conn: Any, sql: str) -> str | None:
     return str(row[0]) if row and row[0] is not None else None
 
 
+# ---------------------------------------------------------------------------
+# 设置层读写（DESIGN §6.2）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SettingRow:
+    """``setting`` 表的一行：值 + 它是怎么来的。"""
+
+    key: str
+    value: Any
+    value_type: str
+    source: str
+
+
+def _jsonb(value: Any) -> str:
+    """把任意值渲染成 jsonb 字面量。
+
+    刻意走 ``json.dumps`` + ``%s::jsonb`` 而不是 psycopg 的 Jsonb 适配器：
+    后者要求本模块依赖驱动类型，而这里只需要一个纯文本参数。
+    """
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _ensure_table(conn: Any, table: str, hint: str) -> None:
+    """确认某张表存在；不存在时给人话提示，而不是把驱动报错原样抛给用户。"""
+    if table not in public_tables(conn):
+        raise DatabaseError(f"库里没有 {table} 表。{hint}")
+
+
+def read_settings(conn: Any) -> dict[str, SettingRow]:
+    """读出全部设置项行（只读）。
+
+    Raises:
+        DatabaseError: 库里没有 ``setting`` 表——那说明迁移还没应用。
+    """
+    _ensure_table(conn, "setting", "请先应用迁移：uv run pc db apply")
+    rows = conn.execute(
+        "SELECT key, value, value_type, source FROM setting ORDER BY key"
+    ).fetchall()
+    return {
+        str(row[0]): SettingRow(
+            key=str(row[0]), value=row[1], value_type=str(row[2]), source=str(row[3])
+        )
+        for row in rows
+    }
+
+
+def settings_revision(conn: Any) -> int:
+    """当前配置版本号：``setting_change`` 的最大编号（0 表示从未改过）。
+
+    对应 DESIGN §6.2.2 里那条「发布单调递增的配置版本号」：进程之间靠它判断
+    「我手里这份快照是不是旧的」。播种不算变更，所以干净实例是 0。
+    """
+    if "setting_change" not in public_tables(conn):
+        return 0
+    row = conn.execute("SELECT COALESCE(MAX(change_id), 0) FROM setting_change").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def seed_settings(conn: Any, seeds: Iterable[tuple[str, Any, str, str]]) -> dict[str, list[str]]:
+    """首次启动播种 ``setting`` 表：**只插入缺失的键，绝不覆盖已有值**。
+
+    Args:
+        seeds: ``(key, value, value_type, source)`` 四元组（``pc.config.setting_seeds``
+            生成）。``source`` 必须是 :data:`SETTING_SOURCES` 里的取值。
+
+    Returns:
+        ``{"inserted": [...], "existing": [...]}``：本次真正插入的键，与因为
+        已经存在而原样保留的键。幂等——重复运行不会改动任何已初始化的实例。
+
+    刻意**不写** ``setting_change``：播种不是谁做的一次改动，而是一次初始化。
+    审计表留给真正的变更，否则「谁把值改了」会被初始化噪音淹没。
+    """
+    inserted: list[str] = []
+    existing: list[str] = []
+    _ensure_table(conn, "setting", "请先应用迁移：uv run pc db apply")
+    try:
+        for key, value, value_type, source in seeds:
+            if source not in SETTING_SOURCES:
+                raise DatabaseError(
+                    f"播种 {key} 的 source={source!r} 不合法；可用取值：{', '.join(SETTING_SOURCES)}。"
+                )
+            cursor = conn.execute(
+                "INSERT INTO setting (key, value, value_type, source) "
+                "VALUES (%s, %s::jsonb, %s, %s) ON CONFLICT (key) DO NOTHING",
+                (key, _jsonb(value), value_type, source),
+            )
+            (inserted if cursor.rowcount else existing).append(key)
+        conn.commit()
+    except DatabaseError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise DatabaseError(
+            f"播种设置项失败，已在单事务内整体回滚，数据库未被改动。\n原始错误：{exc}"
+        ) from exc
+    return {"inserted": inserted, "existing": existing}
+
+
+def write_setting_change(
+    conn: Any,
+    *,
+    key: str,
+    value: Any,
+    value_type: str,
+    source: str = "db",
+    changed_via: str = "ui",
+    actor: int | None = None,
+    precheck: Mapping[str, Any] | None = None,
+    dangerous: bool = False,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """写入一个设置项并留下审计记录：**两张表同生共死**。
+
+    设计约束（DESIGN §6.2.2）：
+
+    * ``setting`` 的新值与 ``setting_change`` 的前后值在一个事务里落库；
+      任何一步失败都整体回滚，界面据此显示错误原因，而不是留下「值变了但没记录」
+      或「记录写了但值没变」。
+    * ``dangerous`` 的项必须 ``confirmed=True`` —— 这个闸门在适配器里再拦一次，
+      因为它是「误操作会毁数据」的那一类，不该只靠调用方自觉。
+    * 校验（类型、范围、依赖、dry-run 预览）由 ``pc.config.plan_setting_change``
+      负责，本函数收到的应当已经是校验过的值；``precheck`` 原样存档，供日后
+      回答「当时按什么影响面确认的」。
+
+    Returns:
+        含 ``change_id`` / ``before`` / ``after`` / ``applied`` 的结果字典。
+
+    Raises:
+        DatabaseError: 参数不合法、危险项未确认，或写库失败（已回滚）。
+    """
+    if changed_via not in SETTING_CHANGE_VIA:
+        raise DatabaseError(
+            f"changed_via={changed_via!r} 不合法；可用取值：{', '.join(SETTING_CHANGE_VIA)}。"
+        )
+    if source not in SETTING_SOURCES:
+        raise DatabaseError(
+            f"source={source!r} 不合法；可用取值：{', '.join(SETTING_SOURCES)}。"
+        )
+    if dangerous and not confirmed:
+        raise DatabaseError(
+            f"{key} 是危险项，必须显式确认（confirmed=True）后才能写入。未经确认的改动一律不落库。"
+        )
+
+    _ensure_table(conn, "setting", "请先应用迁移：uv run pc db apply")
+    _ensure_table(conn, "setting_change", "请先应用迁移：uv run pc db apply")
+
+    try:
+        row = conn.execute("SELECT value FROM setting WHERE key = %s FOR UPDATE", (key,)).fetchone()
+        before = row[0] if row else None
+
+        conn.execute(
+            "INSERT INTO setting (key, value, value_type, source, last_validated_at) "
+            "VALUES (%s, %s::jsonb, %s, %s, now()) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+            "value_type = EXCLUDED.value_type, source = EXCLUDED.source, "
+            "updated_at = now(), last_validated_at = now()",
+            (key, _jsonb(value), value_type, source),
+        )
+
+        change = conn.execute(
+            "INSERT INTO setting_change "
+            "(key, before_state, after_state, changed_by, changed_via, precheck_result, applied, applied_at) "
+            "VALUES (%s, %s::jsonb, %s::jsonb, %s, %s, %s::jsonb, true, now()) "
+            "RETURNING change_id",
+            (
+                key,
+                _jsonb(before),
+                _jsonb(value),
+                actor,
+                changed_via,
+                _jsonb(dict(precheck or {})),
+            ),
+        ).fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise DatabaseError(
+            f"写入设置项 {key} 失败，已在单事务内整体回滚（值与审计记录都没有改动）。\n"
+            f"原始错误：{exc}"
+        ) from exc
+
+    return {
+        "key": key,
+        "change_id": int(change[0]) if change else None,
+        "before": before,
+        "after": value,
+        "changed_via": changed_via,
+        "applied": True,
+    }
+
+
 __all__ = [
     "DEFAULT_APP_CONFIG",
     "DEFAULT_DSN",
@@ -531,12 +737,15 @@ __all__ = [
     "DEFERRED_TABLES",
     "EXPECTED_TABLES",
     "MIGRATION_VERSION",
+    "SETTING_CHANGE_VIA",
+    "SETTING_SOURCES",
     "DatabaseError",
     "DatabaseUnavailableError",
     "MigrationError",
     "MigrationState",
     "ResolvedDsn",
     "SchemaMismatchError",
+    "SettingRow",
     "applied_versions",
     "apply_migration",
     "connect",
@@ -547,6 +756,10 @@ __all__ = [
     "psycopg_available",
     "public_tables",
     "read_env_file",
+    "read_settings",
     "recorded_checksum",
     "resolve_dsn",
+    "seed_settings",
+    "settings_revision",
+    "write_setting_change",
 ]

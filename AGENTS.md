@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实建起**（PostgreSQL 16.15，32 张表，宿主侧与容器侧两条路径都验证过），测试套件已建立并覆盖数据库适配层与 schema 红线；**但业务功能仍未实现**。
+当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实建起**（PostgreSQL 16.15，32 张表，宿主侧与容器侧两条路径都验证过）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层与 schema 红线；**但业务功能仍未实现**。
 
 设计事实源是 [`DESIGN.md`](DESIGN.md)。它是只读基线：改动实现前先读对应章节；若实现结论与它冲突，修改 `DESIGN.md` 并同步其附录 C 的变更记录，不要只在代码里悄悄偏离。
 
@@ -28,6 +28,8 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 起数据库 | `docker compose up -d db` | 需要 Docker Desktop（已安装并验证）。`db` 只绑 `127.0.0.1:5432`；容器内互访走服务名 `db`，宿主侧工具用 `.env` 的 `PC_TEST_DSN` |
 | 建表 / 应用迁移 | `uv run pc db apply` | **整篇单事务执行，失败整体回滚**；已应用则短路并补记结构指纹。等价路径（容器内，需要 psql）：`docker compose exec -T db psql -U pc -d pc -v ON_ERROR_STOP=1 -f /migrations/0001_init.sql`。已在 PostgreSQL 16.15 上真实执行成功 |
 | 校验库结构 | `uv run pc db status` | 只读：表数、`pg_trgm`、记账版本、结构指纹是否漂移；结构不符时退出码 2 |
+| 看设置项生效值 | `uv run pc config show [--explain] [--key K] [--json]` | 逐项打印生效值 + **来源**（env / db / yaml / default），回答「这个值为什么是 8」。数据库不可达不影响退出码，只降级成文件与环境层并打印一行说明 |
+| 首次播种设置项 | `uv run pc config seed` | 只插入缺失的键，**绝不覆盖已有值**；重复运行安全。播种不写 `setting_change`（那不是谁做的改动） |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -49,13 +51,13 @@ post-collector/
 │   └── 0001_init.sql             核心建表脚本（32 张表 + 索引/约束；已真实执行并冻结）
 ├── data/                         运行时产物：PG 数据（data/db）、媒体、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
-├── tests/                        conftest（集成测试开关）+ 适配器单元测试 + schema 集成测试
+├── tests/                        conftest（集成测试开关）+ 适配器与设置层单元测试 + schema/设置集成测试
 └── src/pc/
     ├── domain.py                 状态枚举与跨层数据结构（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
-    ├── config.py                 注册表加载与分层解析（签名就位，实现留空）
-    ├── cli.py                    doctor / db 已接线；config show 为占位
-    ├── adapters/                 适配器实现（postgres.py：连接串解析、迁移应用、schema 校验）
+    ├── config.py                 设置层：注册表加载与校验、四层解析、变更闸门、不可变快照
+    ├── cli.py                    doctor / db apply,status / config show,seed 已接线
+    ├── adapters/                 适配器实现（postgres.py：连接串解析、迁移应用、schema 校验、setting 表读写）
     └── api/                      FastAPI 工厂与路由
 ```
 
@@ -63,10 +65,10 @@ post-collector/
 | --- | --- | --- |
 | `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定，无实现 |
 | `src/pc/domain.py` | 状态取值与传输结构；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
-| `src/pc/config.py` | `env > db > yaml > default` 四层解析与快照 | 待实现 |
-| `src/pc/adapters/` | PostgreSQL：DSN 解析、迁移应用、schema 校验（`pc db apply/status`） | 首个适配器，可用 |
-| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status`（可用）、`config show`（占位，退出码 2/3） | 部分可用 |
-| `tests/` | 适配器单元测试 + schema 集成测试（`integration` marker 需真实数据库，连不上则跳过） | 32 条，全绿 |
+| `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照 | 可用（单元测试覆盖） |
+| `src/pc/adapters/` | PostgreSQL：DSN 解析、迁移应用、schema 校验、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
+| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status`、`config show/seed` | 可用 |
+| `tests/` | 适配器与设置层单元测试 + schema/设置集成测试（`integration` marker 需真实数据库，连不上则跳过） | 101 条，全绿 |
 
 ## 边界约束
 
@@ -92,6 +94,15 @@ post-collector/
 - 连接串分两处且不可混用：容器内用 `PC__DB__DSN`（主机名是服务名 `db`），宿主机侧用 `.env` 的 `PC_TEST_DSN`（主机名 `localhost`），两者密码必须一致。解析优先级里 **`PC_TEST_DSN` 排在 `PC__DB__DSN` 之前**：宿主侧两者常常同时存在于进程环境（`.env` 会被 harness 注入子进程），先取后者就会去解析服务名 `db`，报出费解的 `failed to resolve host 'db'`。`pc db` 另外刻意不读 `.env` 里的 `PC__DB__DSN`。
 - 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移。
 - 派生数据（索引、向量、标签、caption）一律可重建；`PostgreSQL` 与媒体目录是唯一需要认真备份的东西。
+
+**设置层（DESIGN §6.2）**
+
+- 设置项的**语义**只写在 `src/pc/config.py`：类型、范围、enum 取值、`requires` 依赖链、危险项与 dry-run 闸门都在那里；适配器只负责落表，并保证 `setting` 与 `setting_change` 同生共死。
+- `config/settings-registry.yaml` 里的 enum 取值**必须加引号**：YAML 1.1 会把裸写的 `off` / `on` / `yes` / `no` 解析成布尔值，于是 `off` 变成 `False`。加载器直接报错并提示加引号（fail closed），不会静默把取值改名。
+- 注册表与 `app.yaml` 的加载规则：未知字段、未知键、键名重复、默认值越界都**直接报错**；`defaults` 段的值与注册表默认值不同**只提示**（它就是 L2 层的值），因为已播种的实例一律以数据库为准。
+- 播种（`pc config seed`）只插不改、不写 `setting_change`：它不是谁做的一次改动。环境变量覆盖**永不播种**，否则会留下「环境变量撤掉后值还在」的幽灵配置。
+- 命令行**没有**设置写入路径，这是刻意的：`setting_change.changed_via` 的 CHECK 只允许 `ui|yaml|env|migration`，从 CLI 写入就得先把审计字段编出来。写入路径 `pc.adapters.postgres.write_setting_change` 已就绪（带审计、回滚、危险项二次确认断言），等设置页来接。
+- `pc config show` 只读数据库层，且**数据库不可达不影响退出码**：它会把生效值降级成文件与环境层并打印说明，避免让人误以为看到的就是在跑实例的值。
 
 **文档与提交**
 
@@ -146,4 +157,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本。测试套件已建立，但目前只覆盖数据库适配层与 schema 红线，**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本。测试套件已覆盖数据库适配层、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。

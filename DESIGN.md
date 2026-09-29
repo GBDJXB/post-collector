@@ -1120,6 +1120,19 @@ query
 - 提供 `pc config show --explain` 之类的命令行工具：显示每个生效值的来源（默认 / YAML / 数据库 / 环境变量）与它的含义。**"这个值为什么是 8"必须能被回答**，否则调试配置会变成猜谜。
 - 派生数据的重算入口必须存在且可脚本化（重跑打标、重算去重、重建索引），因为开发者最需要的能力是"改了参数之后批量重新处理"。
 
+#### 6.2.5 落地记录（骨架阶段实现）
+
+以下几条是写代码时才需要拍板、而前面没写死的地方。结论记在这里，实现见 `src/pc/config.py` 与 `pc.adapters.postgres` 的 `setting` / `setting_change` 读写：
+
+- **注册表加载 fail closed**：未知字段、未知键名、键名重复、默认值越界都在加载时就报错，并尽量给出"是不是想写 X"的建议。这些错误全都属于"改了没生效"那一类，越晚发现越难查。
+- **`requires` 不在加载期校验**：依赖是否满足要看运行期其它项的值，而且依赖可以指向一个"状态标志"（如 `ai.provider_policy_registered`）而不是设置项。因此加载期只校验类型与范围；依赖校验放在 `validate_value` / `plan_setting_change`，并且**拿不到依赖值一律视为未满足**（fail closed）。
+- **enum 取值必须加引号**：YAML 1.1 会把裸写的 `off` / `on` / `yes` / `no` 解析成布尔值，于是 `off` 变成 `False`。加载器直接报错并提示加引号，不替用户猜。
+- **`setting.source` 与四层解析的关系**：`source` 记录**这一行的值从哪来**（`default` / `yaml` / `db` / `env`）；生效值则按 `env > db > yaml > default` 逐层取。`pc config show` 报的是生效值所在的那一层，并说明它意味着什么（例如"数据库 setting 表：此项由设置页管理"）。
+- **`app.yaml` 的 `defaults` 段**：出现注册表里没有的键 -> 报错（拼错的键会被静默忽略）；值与注册表默认值不同 -> 只提示。它是解析链里的 `yaml` 层，本来就允许开发者改；已经播种过的实例以数据库为准。
+- **播种只插不改、不写审计**：`pc config seed` 用 `ON CONFLICT DO NOTHING`，来源标成 `yaml` 或 `default`；`setting_change` 留给真正的变更，否则"谁把值改了"会被初始化噪音淹没。环境变量覆盖**永不播种**。
+- **危险项与 dry-run 闸门收在一处**：`plan_setting_change(spec, value, confirmed=..., precheck=...)` 是设置页、CLI、脚本共用的入口；适配器再拦一次危险项，避免"只靠调用方自觉"。
+- **命令行只读**：`setting_change.changed_via` 的 CHECK 目前没有"命令行"这一类，所以不提供 `pc config set`——硬塞 `ui` 进去会让审计记录失真。写入路径（`write_setting_change`，带审计与整体回滚）已经就绪，等设置页来消费。
+
 ### 6.3 AI 外发安全网关与"待审放行"工作流（核心设计）
 
 **先接受一个现实**：只要需要外部 AI 服务商（云端 LLM/视觉模型）参与，内容就一定会离开本机，而"内容可能敏感"与"服务商会留存/可能用于训练"之间存在无法用技术消除的张力。可选的策略只有四类，本项目采用**第三类的加强版**：
@@ -1587,6 +1600,7 @@ expose:
 | 新增 `egress_review` 与 `inbox_submission` 审查类型 | 上述两项带来的新工作流 | `review_task.kind` 扩展；2.3 复核位置分类；3.3 三类队列分开呈现 |
 | root 用户画像包含非技术使用者，需要易懂且可深改的参数 | 用户说明 root 同时是开发者与网络小白 | 新增 6.2（配置分层、设置注册表、热更新、首次运行向导、模型档位、错误信息规范）；新增 `setting`/`setting_change` 表；新增 `SettingsRegistry` 接口；6.1 的 root 行更新；8.1 增加配置与设置行；MVP 增加设置页与首次运行向导及两条可用性验收 |
 | 新增 LLM 参与度分级与纯手动模式 | 用户要求保留"LLM 判定不介入、由用户自己判断该不该存与归到哪个分类"的选项，并作为早期调试方式 | 新增 4.7（能力边界矩阵、敏感度向上取整、四档参与度、纯手动模式形态、Classifier 接口可互换、判定记录表）；新增设置项 `ai.involvement`；4.1 与 4.2 的分类步骤改为按档位可选；1.5 的 MVP 与推荐版本、9 的阶段 1 与阶段 2 推进顺序、6.2 的暴露项同步更新；`source='suggested'` 与 `tag_assignment` 的关系明确化；修正 4.5 与 6.3 的编号引用 |
+| 设置层落地暴露的取舍 | 实现 §6.2 时才发现的具体判断（注册表 fail closed 的报错清单、`requires` 延后到运行期校验、YAML 把裸写 `off` 当布尔值的陷阱、`setting.source` 与四层解析的关系、`defaults` 漂移只提示、播种只插不改且不写审计、危险项与 dry-run 闸门收在一处、命令行刻意只读） | 新增 6.2.5；实现 `src/pc/config.py`（注册表加载与校验、四层解析、`plan_setting_change`、不可变快照）与 `pc.adapters.postgres` 的 `setting` / `setting_change` 读写；CLI 新增 `config show` / `config seed`；`config/settings-registry.yaml` 的 `ai.involvement` 取值改为带引号 |
 
 ## 附录 B：参考组件
 

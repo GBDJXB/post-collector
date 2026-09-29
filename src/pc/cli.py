@@ -11,7 +11,8 @@
     0  成功
     2  环境问题（缺依赖、缺配置文件、数据库不可达、库结构与迁移不一致）
        —— 提示里会给出可操作的动作
-    3  功能尚未实现（骨架阶段已知的未完成项）
+    3  保留给「功能尚未实现」：当前所有子命令都已接线，因此暂时没有路径会返回它
+       —— 留着是为了让将来新增的半成品子命令有一个区别于「环境坏了」的退出码
     1  argparse 用法错误（由 argparse 自行返回）
 """
 
@@ -20,10 +21,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.util
+import os
 import platform
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from pc import __version__
 
@@ -146,25 +149,177 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
-    """显示设置项的生效值与来源（``--explain`` 时附带含义与影响的解释）。"""
+    """显示设置项的生效值与来源（``--explain`` 时附带含义与影响的解释）。
+
+    回答的是 DESIGN §6.2.4 那个问题：「这个值为什么是 8」。来源按
+    env > db > yaml > default 解析，并明确写出每一层分别是什么。
+
+    数据库不可达**不影响退出码**（与 ``pc doctor`` 一致）：文件层与环境层的值
+    照样能看，只是会打印一行说明，避免让人误以为看到的就是在跑实例的值。
+    """
     from pc import config as config_mod
 
+    root = Path(args.root).resolve() if args.root else find_repo_root()
     try:
-        specs = config_mod.load_registry()
+        specs = config_mod.load_registry(root / config_mod.DEFAULT_REGISTRY_PATH)
+        index = config_mod.registry_index(specs)
+        yaml_defaults = config_mod.load_app_defaults(
+            root / config_mod.DEFAULT_APP_CONFIG_PATH, registry=index
+        )
     except config_mod.SettingsRegistryError as exc:
         print(f"无法读取设置项注册表：{exc}", file=sys.stderr)
         return 2
-    except NotImplementedError as exc:
-        print(f"该功能尚未实现（骨架阶段）：{exc}", file=sys.stderr)
-        print("实现指引：DESIGN §6.2.1（注册表）与 §6.2.4（来源可解释性）。", file=sys.stderr)
-        return 3
+    except config_mod.ConfigError as exc:
+        print(f"无法读取开发配置：{exc}", file=sys.stderr)
+        return 2
 
-    for spec in specs:
-        print(f"{spec.key} = {spec.default!r}  (来源: default)")
-        if args.explain:
-            print(f"    {spec.label}")
-            print(f"    说明：{spec.help}")
-            print(f"    影响：{spec.impact}")
+    db_rows, revision, notes = _read_setting_layer(args)
+    try:
+        snap = config_mod.snapshot(
+            registry=index,
+            yaml_defaults=yaml_defaults,
+            db_values=db_rows,
+            env=os.environ,
+            revision=revision,
+        )
+    except config_mod.ConfigError as exc:
+        print(f"解析设置项失败：{exc}", file=sys.stderr)
+        return 2
+
+    keys = _select_keys(snap, args.key)
+    if keys is None:
+        print(f"没有匹配的设置项：{args.key}", file=sys.stderr)
+        print("用 `pc config show` 看全部键名。", file=sys.stderr)
+        return 2
+
+    if args.json:
+        payload = snap.as_dict()
+        payload["settings"] = {key: payload["settings"][key] for key in keys}
+        print(config_mod.dump_json(payload))
+        return 0
+
+    print(f"设置项生效值（优先级 env > db > yaml > default），共 {len(keys)} 项")
+    if revision:
+        print(f"配置版本号：{revision}（setting_change 的最大编号）")
+    for note in notes:
+        print(f"  · {note}")
+    print()
+    for key in keys:
+        resolved = config_mod.resolve(
+            key,
+            registry=index,
+            yaml_defaults=yaml_defaults,
+            db_values=db_rows,
+        )
+        print(f"  {key} = {resolved.humanize()}")
+        print(f"      来源：{resolved.explain()}")
+        if args.explain and resolved.spec is not None:
+            spec = resolved.spec
+            bounds = ""
+            if spec.range:
+                low, high = spec.range
+                bounds = f"，范围 {low} ~ {high}" if high is not None else f"，下限 {low}"
+            unit = f"（单位：{spec.unit}）" if spec.unit else ""
+            print(f"      含义：{spec.label} —— {spec.help}")
+            print(f"      影响：{spec.impact}")
+            print(f"      类型：{spec.type}{bounds}{unit}")
+            check = config_mod.validate_value(spec, resolved.value, registry=index, values=snap.values)
+            if check["warning"]:
+                print(f"      提示：{check['warning']}")
+            if spec.note:
+                print(f"      备注：{spec.note}")
+
+    warnings = config_mod.app_default_warnings(yaml_defaults, index)
+    for message in warnings:
+        print(f"\n  ! {message}")
+    for message in snap.env_warnings:
+        print(f"\n  ! {message}")
+    for key in snap.orphans:
+        print(f"\n  ! 数据库里有 {key}，但注册表里已经没有这一项（界面不会再显示它）")
+    return 0
+
+
+def _read_setting_layer(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], int, list[str]]:
+    """读取数据库层（``setting`` 表）；不可达时降级为空并附一句说明。"""
+    from pc.adapters import postgres as pg
+
+    notes: list[str] = []
+    if not pg.psycopg_available():
+        notes.append("缺少依赖 psycopg，未读取数据库层（运行 uv sync 后可见）")
+        return {}, 0, notes
+
+    resolved = pg.resolve_dsn(getattr(args, "dsn", None))
+    try:
+        with pg.connect(resolved.dsn, connect_timeout=3) as conn:
+            rows = pg.read_settings(conn)
+            revision = pg.settings_revision(conn)
+    except pg.DatabaseError as exc:
+        detail = str(exc).splitlines()[0]
+        notes.append(f"数据库不可达，本次只显示文件与环境层的值（{detail}）")
+        return {}, 0, notes
+
+    if rows:
+        notes.append(f"数据库层：已播种 {len(rows)} 项（{pg.mask_dsn(resolved.dsn)}）")
+    else:
+        notes.append("数据库层：setting 表还没有内容，可运行 `uv run pc config seed` 播种")
+    return dict(rows), revision, notes
+
+
+def _select_keys(snap: Any, selector: str | None) -> list[str] | None:
+    """按 ``--key`` 过滤；支持给命名空间前缀（如 ``dedup``）。"""
+    keys = list(snap.values)
+    if not selector:
+        return keys
+    exact = [key for key in keys if key == selector]
+    if exact:
+        return exact
+    prefix = [key for key in keys if key.startswith(f"{selector}.")]
+    return prefix or None
+
+
+def cmd_config_seed(args: argparse.Namespace) -> int:
+    """首次播种 ``setting`` 表：只插入缺失的键，绝不覆盖已有值。"""
+    from pc import config as config_mod
+    from pc.adapters import postgres as pg
+
+    root = Path(args.root).resolve() if args.root else find_repo_root()
+    try:
+        index = config_mod.registry_index(
+            config_mod.load_registry(root / config_mod.DEFAULT_REGISTRY_PATH)
+        )
+        yaml_defaults = config_mod.load_app_defaults(
+            root / config_mod.DEFAULT_APP_CONFIG_PATH, registry=index
+        )
+        seeds = config_mod.setting_seeds(index, yaml_defaults)
+    except config_mod.ConfigError as exc:
+        print(f"无法准备播种数据：{exc}", file=sys.stderr)
+        return 2
+
+    resolved = pg.resolve_dsn(args.dsn)
+    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    print(f"  {resolved.explain()}")
+
+    if not pg.psycopg_available():
+        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
+        return 2
+
+    try:
+        with pg.connect(resolved.dsn) as conn:
+            result = pg.seed_settings(conn, seeds)
+    except pg.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    inserted, existing = result["inserted"], result["existing"]
+    print(f"  ✓ 已播种 {len(inserted)} 项，保留既有 {len(existing)} 项（播种不会覆盖任何已有值）")
+    if inserted:
+        print(f"    新写入：{', '.join(inserted)}")
+    if existing:
+        print(f"    已存在：{', '.join(existing)}")
+    print("    播种来源：config/app.yaml 的 defaults 段优先，其余取注册表默认值；")
+    print("    此后一切以数据库为准，改 YAML 不再影响这个实例。")
     return 0
 
 
@@ -190,6 +345,10 @@ def _doctor_database_section() -> None:
     try:
         with pg.connect(resolved.dsn, connect_timeout=3) as conn:
             status = pg.database_status(conn)
+            try:
+                setting_rows: dict[str, Any] | None = pg.read_settings(conn)
+            except pg.DatabaseError:
+                setting_rows = None
     except pg.DatabaseError as exc:
         detail = str(exc).splitlines()[0]
         print(f"  · 不可达：{detail}")
@@ -201,6 +360,12 @@ def _doctor_database_section() -> None:
         f"  ✓ 可达：server {status['server_version']}，表 {len(status['tables'])} 张，"
         f"迁移 0001 {applied}"
     )
+    if setting_rows is None:
+        print("  · 设置项：读不到（setting 表缺失，先应用迁移）")
+    elif setting_rows:
+        print(f"  · 设置项：已播种 {len(setting_rows)} 项")
+    else:
+        print("  · 设置项：尚未播种（uv run pc config seed）")
 
 
 def cmd_db_status(args: argparse.Namespace) -> int:
@@ -303,7 +468,7 @@ def cmd_db_apply(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc",
-        description="post-collector 命令行（骨架阶段；doctor、config show、db 已接线）",
+        description="post-collector 命令行（骨架阶段；doctor、config、db 已接线）",
     )
     parser.add_argument("--version", action="version", version=f"post-collector {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -314,9 +479,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="配置相关操作")
     p_config_sub = p_config.add_subparsers(dest="config_command", required=True)
-    p_show = p_config_sub.add_parser("show", help="显示设置项及其来源")
-    p_show.add_argument("--explain", action="store_true", help="附带含义与影响的解释")
+
+    p_show = p_config_sub.add_parser("show", help="显示设置项的生效值与来源")
+    p_show.add_argument("--explain", action="store_true", help="附带含义、影响与改动后果")
+    p_show.add_argument("--key", help="只看某一项；也可给命名空间前缀（如 dedup）")
+    p_show.add_argument("--json", action="store_true", help="输出 JSON，便于脚本与贴 issue")
+    p_show.add_argument("--root", help="指定仓库根目录（默认自动查找）")
+    p_show.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
     p_show.set_defaults(func=cmd_config_show)
+
+    p_seed = p_config_sub.add_parser(
+        "seed", help="首次播种 setting 表（只插入缺失的键，不覆盖已有值）"
+    )
+    p_seed.add_argument("--root", help="指定仓库根目录（默认自动查找）")
+    p_seed.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
+    p_seed.set_defaults(func=cmd_config_seed)
 
     p_db = sub.add_parser("db", help="数据库：应用迁移与查看结构状态")
     p_db_sub = p_db.add_subparsers(dest="db_command", required=True)
