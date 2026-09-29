@@ -76,10 +76,10 @@ settings:
 
   - key: search.default_page_size
     label: 检索结果每页条数
-    help: 打开检索页时一次显示多少条结果。条数越多，单次加载越慢，但在手机上翻页次数更少。
+    help: 打开检索页时一次显示多少条结果。条数越多，单次加载越慢，但在手机上翻页次数更少。上限 50 是检索性能预算的一部分（见 DESIGN §5.6）：超过它，返回一页的时间不再受承诺约束。
     default: 40
     type: int
-    range: [10, 200]
+    range: [10, 50]
     unit: 条
     impact: 调大 → 单页信息更多但加载更慢；调小 → 翻页更频繁
     cost: none
@@ -87,7 +87,7 @@ settings:
     dangerous: false
     recompute: null
     requires: []
-    note: 仅影响展示，不影响检索本身。
+    note: 仅影响展示，不影响检索本身的写法。上限与 DESIGN §5.6 的检索性能预算绑定，不对外开放到 200。
 
   - key: inbox.enabled
     label: 开放匿名提报入口
