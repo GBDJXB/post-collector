@@ -6,15 +6,22 @@
 migrations/
 ├── sqlite/
 │   └── 0001_init.sql      ← **权威**：当前使用的 schema（SQLite 方言）
-├── postgres/
-│   └── 0001_init.sql      ← 历史：PostgreSQL 版，已冻结，随 PG 路径一起退役
 └── README.md              本文件
 ```
 
-## 为什么有两套
+## 历史：PostgreSQL 版去哪了
 
-项目最初用 PostgreSQL，v3 起换成 SQLite 单文件（DESIGN §3.2、§3.4）。两版**逻辑
-schema 是同一套**（表名、列名、约束一一对应），差别只在方言：
+项目最初用 PostgreSQL，v3 起换成 SQLite 单文件（DESIGN §3.2、§3.4）。迁移完成后，
+PostgreSQL 版建表脚本（`migrations/postgres/0001_init.sql`）**已随 PG 路径一起删除**：
+
+- 它的执行证据与七条偏差记录（`user` → `app_user`、`authorization` →
+  `source_authorization` 等为避开保留字而做的改名）保留在 git 历史里，
+  也在 `sqlite/0001_init.sql` 的文件头有摘要；
+- 数据库里没有任何业务数据（迁移前实测：只有 `schema_migration` 1 行、`setting` 6 行），
+  所以**不存在数据搬迁**——那 32 张表在 SQLite 侧重建成 34 张（新增 `content_media`
+  与 `hash_tombstone`）。
+
+两版方言的对照关系（保留在这里，方便读旧提交或旧 issue 时换算）：
 
 | 维度 | PostgreSQL 版 | SQLite 版 |
 | --- | --- | --- |
@@ -27,10 +34,6 @@ schema 是同一套**（表名、列名、约束一一对应），差别只在�
 | 全文检索 | `pg_trgm` + `tsvector` | FTS5 双虚拟表（`trigram` / `unicode61`） |
 | 类型纪律 | 引擎强类型 | 全部 `STRICT` 表 |
 | 注释 | `COMMENT ON` | 文件内 `--` 注释（SQLite 无该语句） |
-
-`postgres/0001_init.sql` 已在 PostgreSQL 16.15 上真实执行成功并冻结，其文件头记录了
-当时的执行证据与七条偏差（`user` → `app_user` 等保留字改名）。它保留在这里是为了
-可追溯；PG 路径退役时会删除整个目录。**不要再改它。**
 
 ## 执行方式
 

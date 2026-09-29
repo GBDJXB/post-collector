@@ -140,9 +140,6 @@ description: "post-collector 使用手册：这个工具能做什么、需要准
 优先级从高到低是：`--path` > `PC__DB__PATH` > `PC_DATA_ROOT` > `.env` 里的同名两项 >
 `config/app.yaml` 的 `db.path` / `db.data_root` > 平台默认。
 
-老版本留下的连接串变量（`PC__DB__DSN`、`PC_TEST_DSN`、`POSTGRES_*`）已经不再被读取，
-可以从 `.env` 里删掉。
-
 仓库里的 `data/` 只有在你把数据根目录指向它时才会被用到；默认不用它——运行时产物不放在安装目录，因为安装目录可能只读。
 
 **备份**：库文件用自带命令，不需要停写：

@@ -53,8 +53,7 @@ post-collector/
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
 │   ├── sqlite/0001_init.sql      **权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器
-│   ├── postgres/0001_init.sql    历史：PG 版，已冻结（随 PG 路径退役删除）
-│   └── README.md                 两套 schema 的关系、执行语义与写迁移的规矩
+│   └── README.md                 执行语义、方言历史与写迁移的规矩
 ├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
 ├── tests/                        conftest（临时库夹具）+ 适配器/行为单元测试 + schema 与设置层测试
@@ -94,8 +93,8 @@ post-collector/
 
 **迁移与数据**
 
-- `migrations/sqlite/` 下按序号追加 SQL，不修改已应用的版本。权威脚本是 `0001_init.sql`（34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器），后续结构改动一律以 `0002_*.sql` 追加，并同步更新 `pc.adapters.sqlite.EXPECTED_TABLES`（否则新表会被 `pc db status` 报成"计划外的表"）。`migrations/postgres/` 是**已冻结的历史版本**，不要再改，它随 PG 路径退役删除。
-- 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`。全部偏差写在 PG 版文件头，SQLite 版沿用同一套名字。
+- `migrations/sqlite/` 下按序号追加 SQL，不修改已应用的版本。权威脚本是 `0001_init.sql`（34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器），后续结构改动一律以 `0002_*.sql` 追加，并同步更新 `pc.adapters.sqlite.EXPECTED_TABLES`（否则新表会被 `pc db status` 报成"计划外的表"）。**PostgreSQL 版的建表脚本已经随 PG 路径一起删除**（记在 git 历史与 `migrations/README.md` 的方言对照表里），本项目现在只有一套 schema。
+- 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`。这三处改名沿用 PG 时期的决定，理由与全部偏差记录留在 git 历史与 `migrations/README.md` 里。
 - **迁移文件里不得出现 `PRAGMA`**：PRAGMA 基线（`journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout=5000`、`synchronous=NORMAL`、`temp_store=MEMORY`）由 `pc.adapters.sqlite.connect()` 在建立连接时执行。`journal_mode` 在事务内无法切换，写进 `.sql` 会直接报错——适配器会拒绝这种迁移文件（`split_statements` 里拦）。
 - 执行迁移是**整篇单事务**：语句用 `sqlite3.complete_statement()` 切分（**不要**用 `text.split(';')`，字符串字面量与注释里都可能有分号），在 `BEGIN IMMEDIATE` 内逐条执行，成功才写记账行并提交，失败整体回滚。适配器刻意用 `isolation_level=None` 自己管事务——Python 3.12 起 DDL 不再隐式开启事务，依赖隐式机制会让 `CREATE TABLE` 落到自动提交里，"失败整体回滚"当场失效。
 - **`foreign_keys` 默认关闭，任何一处漏设都会让外键静默失效**，因此数据库访问必须收敛在 `pc.adapters.sqlite`：业务代码不得自己 `sqlite3.connect()`。另外 `sqlite3.Connection` 的 `with` 协议管的是**事务**而不是关闭连接，一律用 `db.open_db()`。

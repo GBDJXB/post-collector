@@ -83,7 +83,8 @@ def test_seed_rejects_a_source_outside_the_check_constraint(applied_schema: Any)
 def test_read_settings_keeps_json_types(applied_schema: Any) -> None:
     """``TEXT`` 列里的 JSON 文本由适配器 ``_decode`` 解回 Python 对象。
 
-    与 PostgreSQL 版（psycopg 解 jsonb）行为一致，所以这里的断言写法原样保留。
+    这条断言刻意写得与存储形态无关：调用方拿到的应当是 Python 对象（字符串、数字、
+    布尔、对象），而不是需要自己 ``json.loads`` 的原始文本。
     """
     rows = db.read_settings(applied_schema)
     assert rows["ai.involvement"].value == "local_only"
