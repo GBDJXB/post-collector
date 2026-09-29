@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；**配置层已经真实可用**（`config/app.yaml` 全部段严格校验、数据根与六个运行时目录可解析且带来源）；测试套件覆盖数据库适配层、设置层、配置段与路径解析、SQLite 行为契约、迁移器与 schema 红线，**176 条、0.6 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
+当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层与配置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集侧的第一个适配器已经可用但还没接线**（本地文件连接器、本地内容寻址存储、魔数扫描器与连接器工厂都有单测，CLI 命令在下一个提交里接上）；测试套件覆盖数据库适配层、设置层、配置段与路径解析、连接器/存储/扫描器、SQLite 行为契约、迁移器与 schema 红线，**296 条 + 1 条环境跳过、1.0 秒、不依赖任何外部服务**；**但端到端的业务功能仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **176 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.6 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **296 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（1.0 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR]` | **按文件名序号应用 `migrations/sqlite/` 下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -57,24 +57,29 @@ post-collector/
 │   └── README.md                 执行语义、方言历史与写迁移的规矩
 ├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
-├── tests/                        conftest（临时库夹具）+ 适配器/行为/迁移器/配置段/路径/设置层测试
+├── tests/                        conftest（临时库夹具）+ 适配器/行为/迁移器/配置段/路径/连接器/存储/扫描器/设置层测试
 └── src/pc/
-    ├── domain.py                 状态枚举与跨层数据结构（零第三方依赖）
+    ├── domain.py                 状态枚举、跨层数据结构与跨层错误（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
     ├── config.py                 设置层与 L2 配置段：注册表校验、四层解析、变更闸门、快照、限额与安全策略
     ├── cli.py                    doctor / db apply,status,backup,reindex / config show,seed 已接线
-    ├── adapters/                 适配器实现（sqlite.py：库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写）
+    ├── adapters/
+    │   ├── sqlite.py             库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写
+    │   ├── local_storage.py      本地目录存储后端（内容寻址 ab/cd/<sha256>，原子写入、幂等）
+    │   ├── magic_scan.py         魔数嗅探扫描器（白名单 + 字节上限 + fail closed）
+    │   ├── local_files.py        本地文件连接器（手工上传与官方导包共用）
+    │   └── registry.py           连接器工厂：source.kind → 实现，唯一解密凭证处
     └── api/                      FastAPI 工厂与路由
 ```
 
 | 路径 | 职责 | 状态 |
 | --- | --- | --- |
-| `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定，无实现 |
-| `src/pc/domain.py` | 状态取值与传输结构；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
+| `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定；`Connector` 的取字节与推送两条路已补齐，其余无实现 |
+| `src/pc/domain.py` | 状态取值、传输结构与跨层错误（`MediaTooLargeError` / `SourceNotAuthorizedError`）；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
-| `src/pc/adapters/` | SQLite：数据库文件与**六个运行时目录**的解析（都带来源）、PRAGMA 基线、迁移应用、结构校验、备份与 FTS5 重建、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
+| `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/cli.py` | `doctor`（含只读数据库段与运行时目录段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
-| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + 配置段与路径解析 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 176 条，0.6 秒全绿 |
+| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + 配置段与路径解析 + 连接器/存储/扫描器 + schema 红线 + 设置层（全部在临时目录上跑，无外部依赖） | 296 条 + 1 条跳过（Windows 无符号链接权限），1.0 秒全绿 |
 
 ## 边界约束
 
@@ -91,6 +96,9 @@ post-collector/
 - `StorageManager` 的 `plan` 与 `apply` 必须分离：计划默认 dry-run，确认后才执行。
 - `ModelProvider` 必须支持「仅本地」模式：缺模型是正常状态，不是故障，管线跳过而非产生失败任务。
 - 外部内容永远是数据、永不进入指令位置；模型输出不能直接触发写操作。
+- **连接器只有两条路，且必须自己声明走哪条**：拉取型实现 `list_new`，推送型实现 `parse_event`，另一条抛 `NotImplementedError`；`capabilities()` 里的 `supports_pull` / `supports_push` / `supports_media_fetch` 是调用方唯一的判据（微信/QQ 这类回调型来源与 Telegram 这类拉取型来源因此产出同一个信封）。
+- **适配器不自己开数据库连接**：连接器由 `pc.adapters.registry.connector_for()` 构造，来源行与它的授权行由服务层读好后注入，`authorize()` 只对注入的记录做判断。凭证解密将来也只加在 `registry.py` 这一处（DESIGN §6.1）。
+- **扫描是 fail closed 的**：`MagicNumberScanner` 对未知类型、压缩包、可执行文件、PDF、脚本一律 `passed=False`，把 SVG 与"扩展名与魔数不符"标成 `gray=True`；`passed=False` 的含义是"不许直接落盘"，调用方应当隔离并开复核任务，**不是丢弃**。
 
 **迁移与数据**
 
@@ -180,4 +188,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、连接器/存储/扫描器、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。

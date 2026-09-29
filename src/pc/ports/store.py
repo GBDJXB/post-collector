@@ -79,8 +79,9 @@ class SearchIndex(Protocol):
 class VectorStore(Protocol):
     """向量库（DESIGN §5.2、§5.3）。
 
-    本项目 10 万条量级下 pgvector 是**终局选择而非过渡**，
-    仅在向量数 > 50 万或需要多向量/量化时才考虑 Qdrant。
+    阶段 3 才会定选型：默认期望是 SQLite 内建向量检索能力（或扩展），
+    只有向量规模或量化需求超出单文件能力时才考虑 Qdrant 这类独立服务。
+    本阶段（阶段 1）不写任何向量代码路径。
     """
 
     def upsert(self, vec_id: str, vector: Sequence[float], payload: dict[str, Any]) -> None:

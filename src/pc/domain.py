@@ -258,6 +258,39 @@ class ObjectKey:
         return self.value
 
 
+# ---------------------------------------------------------------------------
+# 跨层错误
+#
+# 放在领域层（而不是某个适配器里）：抛出方是连接器实现，捕获方是摄入层，
+# 两者都不该 import 对方的模块。
+# ---------------------------------------------------------------------------
+
+
+class MediaTooLargeError(RuntimeError):
+    """媒体本体超过 ``ingest.max_media_bytes``（DESIGN §6.5 的硬上限）。
+
+    这是**永久失败**：重试同样的字节只会得到同样的结论，所以摄入层会直接把它
+    记成死信而不是退避重试。
+    """
+
+    def __init__(self, ref: str, size_bytes: int, limit_bytes: int) -> None:
+        self.ref = ref
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(
+            f"媒体超过上限：{ref} 有 {size_bytes} 字节，上限是 {limit_bytes} 字节"
+            f"（约 {size_bytes / 1048576:.1f} MB / {limit_bytes / 1048576:.1f} MB）。"
+            "上限由 config/app.yaml 的 ingest.max_media_bytes 决定。"
+        )
+
+
+class SourceNotAuthorizedError(RuntimeError):
+    """来源的「凭证 + 授权范围 + 授权证明」三者不齐备（DESIGN §1.3）。
+
+    三者缺一不可采集：不齐备时**不得**继续，也不该"先收下来再说"。
+    """
+
+
 __all__ = [
     "AiInvolvement",
     "AuthzMode",
@@ -266,12 +299,14 @@ __all__ = [
     "EgressState",
     "InboxStatus",
     "JobStatus",
+    "MediaTooLargeError",
     "ObjectKey",
     "RatingVerdict",
     "ReviewKind",
     "ScanVerdict",
     "SettingsSource",
     "SourceMessage",
+    "SourceNotAuthorizedError",
     "StorageClass",
     "SubmissionTier",
     "TagCandidate",
