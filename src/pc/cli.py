@@ -123,7 +123,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             missing_deps.append(module)
     print()
     print("[数据库]（只读探测；不可达不影响本次体检结论）")
-    _doctor_database_section()
+    _doctor_database_section(root)
     print()
     print("[运行时目录]（运行时产物，已被 .gitignore 忽略）")
     _doctor_runtime_dirs(root)
@@ -240,7 +240,7 @@ def _read_setting_layer(
     from pc.adapters import sqlite as db
 
     notes: list[str] = []
-    resolved = db.resolve_db_path(getattr(args, "path", None))
+    resolved, _ = _db_and_paths(args)
     if not resolved.path.is_file():
         notes.append(f"数据库文件还不存在（{resolved.path}），本次只显示文件与环境层的值")
         return {}, 0, notes
@@ -291,7 +291,7 @@ def cmd_config_seed(args: argparse.Namespace) -> int:
         print(f"无法准备播种数据：{exc}", file=sys.stderr)
         return 2
 
-    resolved = db.resolve_db_path(args.path)
+    resolved, _ = _db_and_paths(args)
     print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
@@ -324,7 +324,9 @@ def _doctor_runtime_dirs(root: Path) -> None:
     from pc.adapters import sqlite as db
 
     try:
-        resolved = db.resolve_paths()
+        resolved = db.resolve_paths(
+            env_file=root / ".env", app_config=root / "config/app.yaml"
+        )
     except Exception as exc:  # pragma: no cover - 适配器不可导入时的兜底
         print(f"  · 无法解析数据根目录：{exc}")
         return
@@ -357,7 +359,7 @@ def _doctor_runtime_dirs(root: Path) -> None:
         print(f"  · {message}")
 
 
-def _doctor_database_section() -> None:
+def _doctor_database_section(root: Path) -> None:
     """doctor 的数据库段：只报告状态，**绝不因数据库问题改变退出码**。
 
     README 承诺过「体检命令不依赖数据库」，而 ``/healthz`` 也刻意不校验数据库
@@ -377,7 +379,9 @@ def _doctor_database_section() -> None:
         print(f"  · {str(exc).splitlines()[0]}")
         return
 
-    resolved = db.resolve_db_path(None)
+    resolved = db.resolve_db_path(
+        None, env_file=root / ".env", app_config=root / "config/app.yaml"
+    )
     if not resolved.path.is_file():
         print(f"  · 文件 {resolved.path}（{resolved.source}）：尚未创建")
         print("    建库：uv run pc db apply")
@@ -425,7 +429,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     """只读报告「库里的结构是否与迁移一致」（不改任何东西）。"""
     from pc.adapters import sqlite as db
 
-    resolved = db.resolve_db_path(args.path)
+    resolved, _ = _db_and_paths(args)
     print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
@@ -436,7 +440,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         )
         return 2
 
-    directory = args.dir or db.DEFAULT_MIGRATIONS_DIR
+    directory = _migrations_dir(args)
     try:
         with db.open_db(resolved.path, expect_exists=True) as conn:
             status = db.database_status(conn, directory)
@@ -529,11 +533,12 @@ def cmd_db_apply(args: argparse.Namespace) -> int:
     """应用迁移：逐个文件在各自的事务内执行，失败只回滚该文件。"""
     from pc.adapters import sqlite as db
 
-    resolved = db.resolve_db_path(args.path)
+    resolved, _ = _db_and_paths(args)
     print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
-    directory = args.dir or db.DEFAULT_MIGRATIONS_DIR
+    directory = _migrations_dir(args)
+    print(f"[迁移] {directory}")
     try:
         with db.open_db(resolved.path) as conn:
             result = db.apply_migration(conn, directory)
@@ -574,7 +579,7 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
     """用 ``VACUUM INTO`` 生成事务一致的快照，并校验它能打开、结构自洽（DESIGN §7.1）。"""
     from pc.adapters import sqlite as db
 
-    resolved = db.resolve_db_path(args.path)
+    resolved, _ = _db_and_paths(args)
     if not resolved.path.is_file():
         print(f"  ✗ 数据库文件还不存在：{resolved.path}", file=sys.stderr)
         return 2
@@ -606,7 +611,7 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
     """全量重建两个 FTS5 索引（索引是派生数据，随时可重建，DESIGN §9.1）。"""
     from pc.adapters import sqlite as db
 
-    resolved = db.resolve_db_path(args.path)
+    resolved, _ = _db_and_paths(args)
     try:
         with db.open_db(resolved.path, expect_exists=True) as conn:
             result = db.reindex_fts(conn)
@@ -620,11 +625,44 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_root(args: argparse.Namespace) -> Path:
+    """定位项目根目录：``--root`` 优先，否则按 ``pyproject.toml`` + ``DESIGN.md`` 向上查找。
+
+    **凡是依赖仓库文件的东西都必须经过这里**（迁移目录、``config/app.yaml``、``.env``）。
+    之前只有 doctor 与 config 走了这套查找，db 子命令用的是「当前工作目录 + 相对路径」，
+    于是从别的目录运行时会报「找不到迁移目录」——那是实现缺陷，不是使用姿势问题。
+    """
+    explicit = getattr(args, "root", None)
+    return Path(explicit).resolve() if explicit else find_repo_root()
+
+
 def _db_and_paths(args: argparse.Namespace) -> tuple[Any, Any]:
-    """一次性解析库文件与运行时目录——写命令都需要这两者，且必须来自同一份配置。"""
+    """一次性解析库文件与运行时目录——写命令都需要这两者，且必须来自同一份配置。
+
+    ``env_file`` 与 ``app_config`` 传**绝对路径**：相对路径会跟着当前工作目录变，
+    于是「从别的目录运行」会安静地少掉两层配置（DESIGN §6.2 的分层就白设了）。
+    """
     from pc.adapters import sqlite as db
 
-    return db.resolve_db_path(getattr(args, "path", None)), db.resolve_paths()
+    root = _project_root(args)
+    return (
+        db.resolve_db_path(
+            getattr(args, "path", None),
+            env_file=root / ".env",
+            app_config=root / "config/app.yaml",
+        ),
+        db.resolve_paths(env_file=root / ".env", app_config=root / "config/app.yaml"),
+    )
+
+
+def _migrations_dir(args: argparse.Namespace) -> Path:
+    """迁移目录：``--dir`` 优先，否则 ``<项目根>/migrations/sqlite``。"""
+    from pc.adapters import sqlite as db
+
+    explicit = getattr(args, "dir", None)
+    if explicit:
+        return Path(explicit).expanduser()
+    return _project_root(args) / db.DEFAULT_MIGRATIONS_DIR
 
 
 def _require_database(resolved: Any) -> bool:
@@ -1052,24 +1090,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_sub = p_db.add_subparsers(dest="db_command", required=True)
 
     db_path_help = "显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析"
-    migrations_dir_help = "迁移目录（默认 migrations/sqlite；按文件名序号顺序应用全部 .sql）"
+    root_help = "项目根目录（默认自动查找；找不到仓库文件时用它指定）"
+    migrations_dir_help = (
+        "迁移目录（默认 <项目根>/migrations/sqlite；按文件名序号顺序应用全部 .sql）"
+    )
 
     p_db_apply = p_db_sub.add_parser(
         "apply", help="应用迁移（逐个文件各自一个事务；已应用则安全短路）"
     )
     p_db_apply.add_argument("--path", help=db_path_help)
     p_db_apply.add_argument("--dir", help=migrations_dir_help)
+    p_db_apply.add_argument("--root", help=root_help)
     p_db_apply.set_defaults(func=cmd_db_apply)
 
     p_db_status = p_db_sub.add_parser("status", help="只读报告库结构与迁移是否一致")
     p_db_status.add_argument("--path", help=db_path_help)
     p_db_status.add_argument("--dir", help=migrations_dir_help)
+    p_db_status.add_argument("--root", help=root_help)
     p_db_status.set_defaults(func=cmd_db_status)
 
     p_db_backup = p_db_sub.add_parser(
         "backup", help="生成事务一致的快照并校验（VACUUM INTO）"
     )
     p_db_backup.add_argument("--path", help=db_path_help)
+    p_db_backup.add_argument("--root", help=root_help)
     p_db_backup.add_argument(
         "--to",
         help="快照输出路径（默认 <data_root>/backup/pc-<UTC 时间戳>.sqlite3）；已存在则拒绝覆盖",
@@ -1078,6 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_db_reindex = p_db_sub.add_parser("reindex", help="全量重建两个 FTS5 索引")
     p_db_reindex.add_argument("--path", help=db_path_help)
+    p_db_reindex.add_argument("--root", help=root_help)
     p_db_reindex.set_defaults(func=cmd_db_reindex)
 
     # -- 来源与导入 ---------------------------------------------------------

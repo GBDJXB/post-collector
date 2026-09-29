@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 3 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 本地文件连接器 → L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**424 条 + 1 条环境跳过、3.4 秒、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 3 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 本地文件连接器 → L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**432 条 + 1 条环境跳过、7 秒、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,9 +26,9 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **424 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（3.4 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
-| 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR]` | **按文件名序号应用 `migrations/sqlite/` 下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
-| 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
+| 运行测试 | `uv run pytest` | **432 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（7 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
+| 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
 | 重建检索索引 | `uv run pc db reindex` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段 |
 | 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
@@ -87,7 +87,7 @@ post-collector/
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/services/` | 来源登记（source + authorization 同生共死）、L2 摄入（幂等落信封 + 入队）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端 + 迁移器 + 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 424 条 + 1 条跳过（Windows 无符号链接权限），3.4 秒全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端与项目根解析 + 迁移器 + 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 432 条 + 1 条跳过（Windows 无符号链接权限），7 秒全绿 |
 
 ## 边界约束
 
@@ -115,6 +115,7 @@ post-collector/
 - **迁移文件里不得出现 `PRAGMA`**：PRAGMA 基线（`journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout=5000`、`synchronous=NORMAL`、`temp_store=MEMORY`）由 `pc.adapters.sqlite.connect()` 在建立连接时执行。`journal_mode` 在事务内无法切换，写进 `.sql` 会直接报错——适配器会拒绝这种迁移文件（`split_statements` 里拦）。
 - 执行迁移是**逐文件事务**：语句用 `sqlite3.complete_statement()` 切分（**不要**用 `text.split(';')`，字符串字面量与注释里都可能有分号），每个文件在它自己的 `BEGIN IMMEDIATE` 内整篇执行，成功才写该版本的记账行并提交；某个文件失败只回滚它自己，**已成功的版本保持已应用**。适配器刻意用 `isolation_level=None` 自己管事务——Python 3.12 起 DDL 不再隐式开启事务，依赖隐式机制会让 `CREATE TABLE` 落到自动提交里，"失败整体回滚"当场失效。记账表 `schema_migration` 由适配器兜底创建（它不计入业务表，所以"只有它"仍是干净库）。
 - **`foreign_keys` 默认关闭，任何一处漏设都会让外键静默失效**，因此数据库访问必须收敛在 `pc.adapters.sqlite`：业务代码不得自己 `sqlite3.connect()`。另外 `sqlite3.Connection` 的 `with` 协议管的是**事务**而不是关闭连接，一律用 `db.open_db()`。
+- **仓库文件一律相对「项目根目录」解析，不相对当前工作目录**：迁移目录、`config/app.yaml`、`.env` 都走 `cli._project_root()`（`--root` 优先，否则按 `pyproject.toml` + `DESIGN.md` 向上查找，含 `__file__` 方向）。这条曾经只在 `doctor` / `config` 上成立，`db` 子命令用的是「当前目录 + 相对路径」，于是从仓库外运行会报「找不到迁移目录」，更糟的是**配置分层被静默跳过**（命令成功、库却建在平台默认目录）。现在有测试从仓库外运行并断言 `app.yaml:db.data_root` 仍然生效。**已知缺口**：`uv tool install` 装的包不带迁移文件，届时迁移目录必须打包进 wheel（`importlib.resources`），当前报错信息里已写明这一点。
 - 数据库位置优先级：`--path` > 环境变量 `PC__DB__PATH` > 环境变量 `PC_DATA_ROOT`（→ `<root>/pc.sqlite3`）> `.env` 里的同名两项 > `config/app.yaml` 的 `db.path`/`db.data_root` > 平台默认用户数据目录。**进程环境整层高于 `.env` 整层**——这条曾经写错（两层按同一个键混着查，导致 `.env` 压过环境变量），现在有回归测试钉着。
 - 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移，**只报告不覆盖**。
 - 时间戳默认值与 PG 版**逐列对齐**：PG 里带 `DEFAULT now()` 的列，这里是 `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`；PG 里没有默认值的列（`deleted_at`/`finished_at`/`snapshot_at`/`expires_at`/`setting_change.applied_at`）也一律不给。`updated_at` 由应用层在 UPDATE 时重写，不建触发器。UUID 由应用层生成（SQLite 没有 `gen_random_uuid()`）。

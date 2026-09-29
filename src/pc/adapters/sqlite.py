@@ -796,7 +796,13 @@ def discover_migrations(directory: Path | str = DEFAULT_MIGRATIONS_DIR) -> list[
     base = Path(directory)
     if not base.is_dir():
         raise MigrationError(
-            f"找不到迁移目录：{base}。请在仓库根目录运行，或用 --dir 指定路径。"
+            f"找不到迁移目录：{base}\n"
+            "  三种办法：\n"
+            "    1) 在仓库根目录运行（那里有 migrations/sqlite/）；\n"
+            "    2) 用 --dir 指定迁移目录的绝对路径；\n"
+            "    3) 用 --root 指定仓库根目录，迁移目录会从它下面找。\n"
+            "  如果是用 uv tool install 装的，那是它没有随包带上迁移文件（已知的分发缺口），"
+            "请从仓库源码运行。"
         )
 
     found: dict[int, Path] = {}
