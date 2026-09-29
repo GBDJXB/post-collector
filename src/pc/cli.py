@@ -42,19 +42,18 @@ _EXPECTED_FILES: tuple[str, ...] = (
     ".gitignore",
     "config/app.yaml",
     "config/settings-registry.yaml",
-    "migrations/0001_init.sql",
+    "migrations/sqlite/0001_init.sql",
 )
 
 #: 依赖检查：import 名 → 用途说明
 _REQUIRED_DEPS: dict[str, str] = {
     "fastapi": "Web API（api/app.py）",
     "yaml": "设置项注册表解析（config.py）",
-    "psycopg": "PostgreSQL 访问（adapters/postgres.py、pc db）",
     "pydantic": "数据校验（实现阶段）",
 }
 
-#: 运行时数据目录：不存在时应提示，但不视为错误
-_RUNTIME_DIRS: tuple[str, ...] = ("data", "data/media", "data/cold", "data/quarantine", "data/backup", "models")
+#: 数据根目录下应当存在的子目录（实际位置由 resolve_db_path 决定，见 DESIGN §10.2）
+_RUNTIME_SUBDIRS: tuple[str, ...] = ("media", "thumbs", "cold", "quarantine", "backup", "models")
 
 
 def _force_utf8_stdio() -> None:
@@ -130,9 +129,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     _doctor_database_section()
     print()
     print("[运行时目录]（运行时产物，已被 .gitignore 忽略）")
-    for rel in _RUNTIME_DIRS:
-        exists = (root / rel).is_dir()
-        print(f"  {'✓' if exists else '·'} {rel}")
+    _doctor_runtime_dirs(root)
     print()
 
     if missing_files:
@@ -243,25 +240,25 @@ def _read_setting_layer(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], int, list[str]]:
     """读取数据库层（``setting`` 表）；不可达时降级为空并附一句说明。"""
-    from pc.adapters import postgres as pg
+    from pc.adapters import sqlite as db
 
     notes: list[str] = []
-    if not pg.psycopg_available():
-        notes.append("缺少依赖 psycopg，未读取数据库层（运行 uv sync 后可见）")
+    resolved = db.resolve_db_path(getattr(args, "path", None))
+    if not resolved.path.is_file():
+        notes.append(f"数据库文件还不存在（{resolved.path}），本次只显示文件与环境层的值")
         return {}, 0, notes
 
-    resolved = pg.resolve_dsn(getattr(args, "dsn", None))
     try:
-        with pg.connect(resolved.dsn, connect_timeout=3) as conn:
-            rows = pg.read_settings(conn)
-            revision = pg.settings_revision(conn)
-    except pg.DatabaseError as exc:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            rows = db.read_settings(conn)
+            revision = db.settings_revision(conn)
+    except db.DatabaseError as exc:
         detail = str(exc).splitlines()[0]
         notes.append(f"数据库不可达，本次只显示文件与环境层的值（{detail}）")
         return {}, 0, notes
 
     if rows:
-        notes.append(f"数据库层：已播种 {len(rows)} 项（{pg.mask_dsn(resolved.dsn)}）")
+        notes.append(f"数据库层：已播种 {len(rows)} 项（{resolved.path}）")
     else:
         notes.append("数据库层：setting 表还没有内容，可运行 `uv run pc config seed` 播种")
     return dict(rows), revision, notes
@@ -282,7 +279,7 @@ def _select_keys(snap: Any, selector: str | None) -> list[str] | None:
 def cmd_config_seed(args: argparse.Namespace) -> int:
     """首次播种 ``setting`` 表：只插入缺失的键，绝不覆盖已有值。"""
     from pc import config as config_mod
-    from pc.adapters import postgres as pg
+    from pc.adapters import sqlite as db
 
     root = Path(args.root).resolve() if args.root else find_repo_root()
     try:
@@ -297,18 +294,14 @@ def cmd_config_seed(args: argparse.Namespace) -> int:
         print(f"无法准备播种数据：{exc}", file=sys.stderr)
         return 2
 
-    resolved = pg.resolve_dsn(args.dsn)
-    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    resolved = db.resolve_db_path(args.path)
+    print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
-    if not pg.psycopg_available():
-        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
-        return 2
-
     try:
-        with pg.connect(resolved.dsn) as conn:
-            result = pg.seed_settings(conn, seeds)
-    except pg.DatabaseError as exc:
+        with db.open_db(resolved.path) as conn:
+            result = db.seed_settings(conn, seeds)
+    except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
 
@@ -323,42 +316,78 @@ def cmd_config_seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_runtime_dirs(root: Path) -> None:
+    """报告数据根目录及其子目录。
+
+    刻意**不再**写死仓库相对的 ``data/``：从 PostgreSQL 换到 SQLite 之后，运行时
+    产物默认落在平台用户数据目录（DESIGN §10.2），仓库里的 ``data/`` 只有在你把
+    ``PC_DATA_ROOT`` 指过去时才会用到。写死路径会让人以为"数据在仓库里"。
+    """
+    try:
+        from pc.adapters import sqlite as db
+
+        data_root = db.resolve_db_path(None).path.parent
+        source = db.resolve_db_path(None).source
+    except Exception as exc:  # pragma: no cover - 适配器不可导入时的兜底
+        print(f"  · 无法解析数据根目录：{exc}")
+        return
+    print(f"  数据根目录：{data_root}（来源 {source}）")
+    for name in _RUNTIME_SUBDIRS:
+        path = data_root / name
+        print(f"    {'✓' if path.is_dir() else '·'} {name}/")
+    if data_root != (root / "data"):
+        print("  提示：仓库内的 data/ 只有把 PC_DATA_ROOT 指过去时才会用到。")
+
+
 def _doctor_database_section() -> None:
     """doctor 的数据库段：只报告状态，**绝不因数据库问题改变退出码**。
 
     README 承诺过「体检命令不依赖数据库」，而 ``/healthz`` 也刻意不校验数据库
     （避免把依赖故障误报成进程死亡）。这里保持一致：数据库只是体检报告的一行，
-    不是体检的判据。
+    不是体检的判据。数据库改成 SQLite 本机文件后，「不可达」基本只剩三种：
+    SQLite 版本过旧、文件还不存在、目录不可写。
     """
     try:
-        from pc.adapters import postgres as pg
+        from pc.adapters import sqlite as db
     except Exception as exc:  # pragma: no cover - 适配器层不可导入时的兜底
         print(f"  · 适配器不可用：{exc}")
         return
 
-    if not pg.psycopg_available():
-        print("  · 缺少依赖 psycopg，跳过（运行 uv sync 后可见）")
+    try:
+        db.ensure_version_gate()
+    except db.DatabaseError as exc:
+        print(f"  · {str(exc).splitlines()[0]}")
         return
 
-    resolved = pg.resolve_dsn(None)
-    print(f"  · 连接串 {pg.mask_dsn(resolved.dsn)}（{resolved.source}）")
+    resolved = db.resolve_db_path(None)
+    if not resolved.path.is_file():
+        print(f"  · 文件 {resolved.path}（{resolved.source}）：尚未创建")
+        print("    建库：uv run pc db apply")
+        return
+    size_mb = resolved.path.stat().st_size / (1024 * 1024)
+    print(f"  · 文件 {resolved.path}（{resolved.source}，{size_mb:.1f} MB）")
+
     try:
-        with pg.connect(resolved.dsn, connect_timeout=3) as conn:
-            status = pg.database_status(conn)
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            status = db.database_status(conn)
             try:
-                setting_rows: dict[str, Any] | None = pg.read_settings(conn)
-            except pg.DatabaseError:
+                setting_rows: dict[str, Any] | None = db.read_settings(conn)
+            except db.DatabaseError:
                 setting_rows = None
-    except pg.DatabaseError as exc:
-        detail = str(exc).splitlines()[0]
-        print(f"  · 不可达：{detail}")
-        print("    提示：docker compose up -d db；宿主机侧连接串见 .env 的 PC_TEST_DSN")
+    except db.DatabaseError as exc:
+        print(f"  · 打不开：{str(exc).splitlines()[0]}")
         return
 
     applied = "已应用" if status["migration_version"] else "未应用"
     print(
-        f"  ✓ 可达：server {status['server_version']}，表 {len(status['tables'])} 张，"
+        f"  ✓ SQLite {status['sqlite_version']}，表 {len(status['tables'])} 张，"
         f"迁移 0001 {applied}"
+    )
+    print(
+        f"  · journal_mode={status['journal_mode']}"
+        f"  foreign_keys={'ON' if status['foreign_keys'] else 'OFF'}"
+        f"  FTS5 {len(status['fts_tables'])}/2"
+        f"  完整性 {status['integrity']}"
     )
     if setting_rows is None:
         print("  · 设置项：读不到（setting 表缺失，先应用迁移）")
@@ -370,31 +399,40 @@ def _doctor_database_section() -> None:
 
 def cmd_db_status(args: argparse.Namespace) -> int:
     """只读报告「库里的结构是否与迁移一致」（不改任何东西）。"""
-    from pc.adapters import postgres as pg
+    from pc.adapters import sqlite as db
 
-    resolved = pg.resolve_dsn(args.dsn)
-    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    resolved = db.resolve_db_path(args.path)
+    print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
-    if not pg.psycopg_available():
-        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
+    if not resolved.path.is_file():
+        print(
+            f"  ✗ 数据库文件还不存在。建库：uv run pc db apply --path \"{resolved.path}\"",
+            file=sys.stderr,
+        )
         return 2
 
-    path = args.file or pg.DEFAULT_MIGRATION_FILE
+    path = args.file or db.DEFAULT_MIGRATION_FILE
     try:
-        with pg.connect(resolved.dsn) as conn:
-            status = pg.database_status(conn, path)
-    except pg.DatabaseError as exc:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            status = db.database_status(conn, path)
+    except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
 
-    print(f"  服务器 {status['server_version']} / 库 {status['database']} / 用户 {status['user']}")
-    print(f"  pg_trgm：{'已安装' if status['pg_trgm'] else '缺失'}")
-    print(f"  表：{len(status['tables'])} 张（预期 {len(pg.EXPECTED_TABLES)} 张）")
+    print(f"  SQLite {status['sqlite_version']} / 库 {status['db_path']}")
+    print(f"  journal_mode：{status['journal_mode']}")
+    print(f"  foreign_keys：{'ON' if status['foreign_keys'] else 'OFF（外键会静默失效）'}")
+    print(f"  完整性检查：{status['integrity']}")
+    print(
+        f"  FTS5 索引：{len(status['fts_tables'])}/2"
+        f"（{'、'.join(status['fts_tables']) or '无'}）"
+    )
+    print(f"  表：{len(status['tables'])} 张（预期 {len(db.EXPECTED_TABLES)} 张）")
     if status["migration_version"]:
         print(f"  迁移记账：version {status['migration_version']} 已应用")
     else:
-        print(f"  迁移记账：version {pg.MIGRATION_VERSION} 未应用（库状态：{status['state']}）")
+        print(f"  迁移记账：version {db.MIGRATION_VERSION} 未应用（库状态：{status['state']}）")
 
     if not status["migration_file_present"]:
         print(f"  结构指纹：无法比对（找不到迁移文件 {path}）")
@@ -407,7 +445,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
 
     if not status["migration_file_present"]:
         print(f"  ✗ 找不到迁移文件：{path}")
-        print("     用 --file 指定路径，或确认在仓库根目录运行（容器内路径是 /app/migrations/）")
+        print("     用 --file 指定路径，或确认在仓库根目录运行")
     if status["missing_tables"]:
         print(f"  ✗ 缺少表：{', '.join(status['missing_tables'])}")
     if status["deferred_present"]:
@@ -415,12 +453,21 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         print("     这三张表属阶段 2（向量与外发），出现即触碰「无外发」红线，见 DESIGN §8.1")
     if status["unexpected_tables"]:
         print(f"  · 计划外的表：{', '.join(status['unexpected_tables'])}")
+    if not status["fts_ok"]:
+        print(
+            f"  ✗ FTS5 索引不完整（预期 {'、'.join(db.FTS_VIRTUAL_TABLES)}）；"
+            "可运行 `pc db reindex` 重建"
+        )
+    if str(status["journal_mode"]).lower() != "wal":
+        print("  ✗ journal_mode 不是 WAL：并发读会退化成互斥，见 DESIGN §3.2")
+    if not status["foreign_keys"]:
+        print("  ✗ foreign_keys 未开启：外键约束会静默失效，见 DESIGN §3.2")
     if status["checksum_drift"]:
         print("  · 迁移文件在应用之后被改过（结构指纹变化）。本工具不会自动改数据库；")
         print("    若改动确有必要，请以新迁移追加，而不是改已应用的版本。")
 
     if status["ok"]:
-        print("结论：结构就绪，与 migrations/0001_init.sql 一致。")
+        print(f"结论：结构就绪，与 {db.DEFAULT_MIGRATION_FILE.as_posix()} 一致。")
         return 0
     print("结论：结构未就绪，见上面的 ✗ 项。", file=sys.stderr)
     return 2
@@ -428,29 +475,29 @@ def cmd_db_status(args: argparse.Namespace) -> int:
 
 def cmd_db_apply(args: argparse.Namespace) -> int:
     """应用迁移：整篇在单事务内执行，失败整体回滚；已应用则安全短路。"""
-    from pc.adapters import postgres as pg
+    from pc.adapters import sqlite as db
 
-    resolved = pg.resolve_dsn(args.dsn)
-    print(f"[数据库] {pg.mask_dsn(resolved.dsn)}")
+    resolved = db.resolve_db_path(args.path)
+    print(f"[数据库] {resolved.path}")
     print(f"  {resolved.explain()}")
 
-    if not pg.psycopg_available():
-        print("  缺少依赖 psycopg，无法连接。请先在仓库根运行 `uv sync`。", file=sys.stderr)
-        return 2
-
-    path = args.file or pg.DEFAULT_MIGRATION_FILE
+    path = args.file or db.DEFAULT_MIGRATION_FILE
     try:
-        with pg.connect(resolved.dsn) as conn:
-            result = pg.apply_migration(conn, path)
-    except pg.DatabaseError as exc:
+        with db.open_db(resolved.path) as conn:
+            result = db.apply_migration(conn, path)
+    except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
 
     fingerprint = str(result.get("checksum", ""))[:12]
     reason = result["reason"]
     if reason == "applied":
-        print(f"  ✓ 已应用 {Path(path).name}（结构指纹 {fingerprint}…）")
-        print(f"    共 {len(pg.EXPECTED_TABLES)} 张表；可用 `pc db status` 复核。")
+        statements = result.get("statements", 0)
+        print(f"  ✓ 已应用 {Path(path).name}（结构指纹 {fingerprint}…，{statements} 条语句）")
+        print(
+            f"    共 {len(db.EXPECTED_TABLES)} 张表 + "
+            f"{len(db.FTS_VIRTUAL_TABLES)} 个 FTS5 索引；可用 `pc db status` 复核。"
+        )
         return 0
     if reason == "already_applied":
         print("  · 迁移已应用，本次未改动数据库。")
@@ -463,6 +510,56 @@ def cmd_db_apply(args: argparse.Namespace) -> int:
     print(f"    记账 {recorded}… / 现在 {fingerprint}…", file=sys.stderr)
     print("    没有改动数据库。请确认改动是否应以新迁移追加。", file=sys.stderr)
     return 2
+
+
+def cmd_db_backup(args: argparse.Namespace) -> int:
+    """用 ``VACUUM INTO`` 生成事务一致的快照，并校验它能打开、结构自洽（DESIGN §7.1）。"""
+    from pc.adapters import sqlite as db
+
+    resolved = db.resolve_db_path(args.path)
+    if not resolved.path.is_file():
+        print(f"  ✗ 数据库文件还不存在：{resolved.path}", file=sys.stderr)
+        return 2
+
+    target = (
+        Path(args.to).expanduser()
+        if args.to
+        else resolved.path.parent / "backup" / db.backup_filename()
+    )
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            result = db.backup_to(conn, target)
+    except db.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    size_mb = result["size_bytes"] / (1024 * 1024)
+    print(f"  ✓ 已备份到 {result['target']}（{size_mb:.1f} MB，{result['tables']} 张表）")
+    print(f"    完整性检查：{result['integrity']}")
+    if result["integrity"] != "ok":
+        print("    ! 备份完整性检查未通过，请勿依赖这份备份。", file=sys.stderr)
+        return 2
+    print("    恢复方式：停掉 pc 进程，把这份文件复制成 pc.sqlite3（确认没有 -wal 残留）。")
+    return 0
+
+
+def cmd_db_reindex(args: argparse.Namespace) -> int:
+    """全量重建两个 FTS5 索引（索引是派生数据，随时可重建，DESIGN §9.1）。"""
+    from pc.adapters import sqlite as db
+
+    resolved = db.resolve_db_path(args.path)
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            result = db.reindex_fts(conn)
+    except db.DatabaseError as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    for name in sorted(result["after"]):
+        before = result["before"].get(name, 0)
+        print(f"  ✓ {name}：{before} 行 → {result['after'][name]} 行")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -485,30 +582,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--key", help="只看某一项；也可给命名空间前缀（如 dedup）")
     p_show.add_argument("--json", action="store_true", help="输出 JSON，便于脚本与贴 issue")
     p_show.add_argument("--root", help="指定仓库根目录（默认自动查找）")
-    p_show.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
+    p_show.add_argument("--path", help="显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析")
     p_show.set_defaults(func=cmd_config_show)
 
     p_seed = p_config_sub.add_parser(
         "seed", help="首次播种 setting 表（只插入缺失的键，不覆盖已有值）"
     )
     p_seed.add_argument("--root", help="指定仓库根目录（默认自动查找）")
-    p_seed.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
+    p_seed.add_argument(
+        "--path", help="显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析"
+    )
     p_seed.set_defaults(func=cmd_config_seed)
 
-    p_db = sub.add_parser("db", help="数据库：应用迁移与查看结构状态")
+    p_db = sub.add_parser("db", help="数据库：应用迁移、查看结构、备份与重建索引")
     p_db_sub = p_db.add_subparsers(dest="db_command", required=True)
+
+    db_path_help = "显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析"
+    file_help = "迁移文件路径（默认 migrations/sqlite/0001_init.sql）"
 
     p_db_apply = p_db_sub.add_parser(
         "apply", help="应用迁移（整篇单事务执行；已应用则安全短路）"
     )
-    p_db_apply.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
-    p_db_apply.add_argument("--file", help="迁移文件路径（默认 migrations/0001_init.sql）")
+    p_db_apply.add_argument("--path", help=db_path_help)
+    p_db_apply.add_argument("--file", help=file_help)
     p_db_apply.set_defaults(func=cmd_db_apply)
 
     p_db_status = p_db_sub.add_parser("status", help="只读报告库结构与迁移是否一致")
-    p_db_status.add_argument("--dsn", help="显式连接串；默认按 env > .env > app.yaml > 默认解析")
-    p_db_status.add_argument("--file", help="迁移文件路径（默认 migrations/0001_init.sql）")
+    p_db_status.add_argument("--path", help=db_path_help)
+    p_db_status.add_argument("--file", help=file_help)
     p_db_status.set_defaults(func=cmd_db_status)
+
+    p_db_backup = p_db_sub.add_parser(
+        "backup", help="生成事务一致的快照并校验（VACUUM INTO）"
+    )
+    p_db_backup.add_argument("--path", help=db_path_help)
+    p_db_backup.add_argument(
+        "--to",
+        help="快照输出路径（默认 <data_root>/backup/pc-<UTC 时间戳>.sqlite3）；已存在则拒绝覆盖",
+    )
+    p_db_backup.set_defaults(func=cmd_db_backup)
+
+    p_db_reindex = p_db_sub.add_parser("reindex", help="全量重建两个 FTS5 索引")
+    p_db_reindex.add_argument("--path", help=db_path_help)
+    p_db_reindex.set_defaults(func=cmd_db_reindex)
 
     return parser
 

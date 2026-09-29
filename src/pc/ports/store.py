@@ -1,7 +1,7 @@
 """存储、检索与容量管理端口（DESIGN §9.1）。
 
 四个接口的共同要求：**派生数据一律可重建**。检索索引、向量库都可以从
-PostgreSQL + 媒体目录全量重建，因此它们的实现可以被随时替换。
+SQLite 单文件 + 媒体目录全量重建，因此它们的实现可以被随时替换。
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ class StorageBackend(Protocol):
 class SearchIndex(Protocol):
     """检索索引（DESIGN §5.1、§5.3、§9.1）。
 
-    阶段 1 用 PostgreSQL FTS + pg_trgm；阶段 2 换 Meilisearch；
-    PostgreSQL 始终是事实源，索引只是**可重建的派生层**。
+    阶段 1 用 SQLite FTS5（trigram + 预分词 unicode61 双索引）；阶段 2 可换
+    Meilisearch；数据库始终是事实源，索引只是**可重建的派生层**。
     查询构造在接口内完成，不让上层依赖某个引擎的专有语法。
     """
 

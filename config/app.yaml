@@ -2,9 +2,9 @@
 # config/app.yaml —— L2 开发配置（带注释，进 git，由开发者直接编辑）
 #
 # 配置分层（DESIGN §6.2）：
-#   L1 设置页   → PostgreSQL setting 表（面向所有 root，热更新）
+#   L1 设置页   → SQLite setting 表（面向所有 root，热更新）
 #   L2 本文件   → 开发者直接改，校验通过后热重载
-#   L3 .env / docker-compose.yml → 部署参数，需重启容器栈
+#   L3 .env     → 部署参数（数据存放位置、行为开关），需重启进程
 #
 # 单一来源原则：本文件的 defaults 段只在「首次启动」时用于播种 setting 表，
 # 之后以数据库为准。凡是被设置页接管的键，界面会显示「此项由设置页管理」。
@@ -48,22 +48,26 @@ defaults:
 
 # ---------------------------------------------------------------------------
 # db —— 刻意只留在 L2/L3，不进设置页（改错无法用一句大白话说明后果）
+#
+# 数据库就是一个文件：<data_root>/pc.sqlite3。两项都留空 = 用平台默认的用户数据
+# 目录（DESIGN §10.2）；部署层可用 PC_DATA_ROOT / PC__DB__PATH 覆盖这里。
+# PRAGMA 基线（WAL、foreign_keys、busy_timeout、synchronous）不在这里配置：
+# 它们是设计不变量，由适配器在建立连接时统一执行（见 DESIGN §3.2）。
 # ---------------------------------------------------------------------------
 db:
-  dsn: "postgresql://pc:change-me@localhost:5432/pc"   # 容器内由 PC__DB__DSN 覆盖
-  pool_min_size: 1
-  pool_max_size: 5
-  statement_timeout_ms: 30000
+  path: ""          # 直接指定数据库文件；留空则用 <data_root>/pc.sqlite3
+  data_root: ""     # 数据根目录；留空则用平台默认（%LOCALAPPDATA% / XDG / Application Support）
 
 # ---------------------------------------------------------------------------
-# paths —— 与 docker-compose.yml 的卷映射保持一致（DESIGN §10）
+# paths —— 留空 = 从数据根目录派生（DESIGN §10.2）。容器与多盘部署可显式指定。
 # ---------------------------------------------------------------------------
 paths:
-  media_root: "/data/media"           # 内容寻址媒体本体 ab/cd/<sha256>，热层
-  cold_root: "/data/cold"             # 冷层，可指向 NAS 挂载
-  quarantine_root: "/data/quarantine" # L2 提报隔离区，必须与 media_root 物理分离
-  backup_root: "/data/backup"         # 备份目标
-  models_root: "/app/models"          # 本地模型权重（阶段 2 起使用）
+  media_root: ""      # 留空 = <data_root>/media  内容寻址媒体本体 ab/cd/<sha256>
+  thumb_root: ""      # 留空 = <data_root>/thumbs 派生缩略图，建议留在 SSD（检索热路径）
+  cold_root: ""       # 留空 = <data_root>/cold   冷层，可指向 NAS 挂载
+  quarantine_root: "" # 留空 = <data_root>/quarantine  L2 提报隔离区，必须与 media 物理分离
+  backup_root: ""     # 留空 = <data_root>/backup 备份落点，**必须与库文件不同物理介质**
+  models_root: ""     # 留空 = <data_root>/models 本地模型权重（阶段 2 起使用）
 
 # ---------------------------------------------------------------------------
 # jobs —— 队列并发与批大小，刻意不暴露到设置页（DESIGN §6.2 末段）

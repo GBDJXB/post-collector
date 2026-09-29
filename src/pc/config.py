@@ -13,8 +13,8 @@
 「改了文件没生效」「界面上改了但重启被覆盖」这类最让人困惑的故障。
 
 本模块刻意**只依赖标准库与领域层**：注册表校验是纯函数，可以在没有数据库、
-没有 psycopg、甚至没有 PyYAML（会给出「先 uv sync」的人话提示）的环境里被测试。
-与数据库的读写留在 ``pc.adapters.postgres``，组合它们的活儿交给 CLI / 服务层。
+甚至没有 PyYAML（会给出「先 uv sync」的人话提示）的环境里被测试。
+与数据库的读写留在 ``pc.adapters.sqlite``，组合它们的活儿交给 CLI / 服务层。
 
 几个刻意的判断（已记入 DESIGN 附录 C）：
 
@@ -815,7 +815,7 @@ def resolve(
 ) -> ResolvedSetting:
     """解析一个键的生效值与来源，优先级 env > db > yaml > default。
 
-    ``db_values`` 可以是普通映射，也可以是 ``pc.adapters.postgres.SettingRow``
+    ``db_values`` 可以是普通映射，也可以是 ``pc.adapters.sqlite.SettingRow``
     这类带 ``value`` 属性的行对象（``setting`` 表读出来的就是后者）。
     ``env`` 传**环境变量本身**（如 ``os.environ``），本函数负责把
     ``PC__DEDUP__NEAR_DUPLICATE_DISTANCE`` 这类名字映射回设置项键名。
@@ -1048,7 +1048,7 @@ def env_overrides_by_key(
         必须报出来。
 
     刻意不把「不属于设置项」的 ``PC__`` 变量都报成可疑：``PC__`` 前缀同时服务于
-    L2/L3 配置键（``PC__DB__DSN``、``PC__PATHS__MEDIA_ROOT`` 等），它们由各自的
+    L2/L3 配置键（``PC__DB__PATH``、``PC__PATHS__MEDIA_ROOT`` 等），它们由各自的
     配置段消费。判定规则是**看命名空间**：落在注册表已有的命名空间下、却不在注册表
     里 -> 大概率是拼错了，报出来；命名空间本身就不属于设置项 -> 安静跳过。
     """

@@ -11,9 +11,9 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实建起**（PostgreSQL 16.15，32 张表，宿主侧与容器侧两条路径都验证过）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层与 schema 红线；**但业务功能仍未实现**。
+当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/0001_init.sql`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层、SQLite 行为契约与 schema 红线，**128 条、0.5 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
 
-**设计与实现存在已知偏差（迁移进行中）**：`DESIGN.md` 已升级为 **v3.1**——以 SQLite 取代 PostgreSQL、解除 Docker 硬依赖、把应用代码与发布产物的分发收敛到 GitHub（原生安装仍需 PyPI 取依赖，已如实写入文档），**并把阶段 1 的范围收窄为"root + 邀请制用户"，匿名提报入口后置到阶段 2**。代码当前仍运行在 PostgreSQL 上（`src/pc/adapters/postgres.py`、`migrations/0001_init.sql`、`pyproject.toml` 的 `psycopg` 依赖）。**SQLite 迁移尚未执行**；迁移完成前，本文件的「开发命令」与「关键目录」描述的是**当前代码事实**，照旧有效。
+设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
 设计事实源是 [`DESIGN.md`](DESIGN.md)。它是只读基线：改动实现前先读对应章节；若实现结论与它冲突，修改 `DESIGN.md` 并同步其附录 C 的变更记录，不要只在代码里悄悄偏离。
 
@@ -26,10 +26,12 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | `tests/` 已建立。单元测试随时可跑；标了 `integration` 的需要真实数据库，连接串取 `PC_TEST_DSN`（宿主机）或 `PC__DB_DSN`（容器内），**取不到则跳过**。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
-| 起数据库 | `docker compose up -d db` | 需要 Docker Desktop（已安装并验证）。`db` 只绑 `127.0.0.1:5432`；容器内互访走服务名 `db`，宿主侧工具用 `.env` 的 `PC_TEST_DSN` |
-| 建表 / 应用迁移 | `uv run pc db apply` | **整篇单事务执行，失败整体回滚**；已应用则短路并补记结构指纹。等价路径（容器内，需要 psql）：`docker compose exec -T db psql -U pc -d pc -v ON_ERROR_STOP=1 -f /migrations/0001_init.sql`。已在 PostgreSQL 16.15 上真实执行成功 |
-| 校验库结构 | `uv run pc db status` | 只读：表数、`pg_trgm`、记账版本、结构指纹是否漂移；结构不符时退出码 2 |
+| 运行测试 | `uv run pytest` | **128 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.5 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 建库 / 应用迁移 | `uv run pc db apply [--path PATH]` | **整篇在单个显式事务内执行**（`BEGIN IMMEDIATE` … `COMMIT`），失败整体回滚；已应用则短路并补记结构指纹。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
+| 校验库结构 | `uv run pc db status [--path PATH]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、记账版本与结构指纹漂移；结构不符时退出码 2 |
+| 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
+| 重建检索索引 | `uv run pc db reindex` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段 |
+| 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
 | 看设置项生效值 | `uv run pc config show [--explain] [--key K] [--json]` | 逐项打印生效值 + **来源**（env / db / yaml / default），回答「这个值为什么是 8」。数据库不可达不影响退出码，只降级成文件与环境层并打印一行说明 |
 | 首次播种设置项 | `uv run pc config seed` | 只插入缺失的键，**绝不覆盖已有值**；重复运行安全。播种不写 `setting_change`（那不是谁做的改动） |
 
@@ -43,23 +45,25 @@ post-collector/
 ├── DESIGN.md                     设计基线（架构/数据模型/算法/安全/路线图）
 ├── README.md                     面向使用者的手册
 ├── pyproject.toml                包元数据、依赖、ruff 与 pytest 配置
-├── Dockerfile / docker-compose.yml   单机编排：db + app
+├── Dockerfile / docker-compose.yml   可选隔离路径：单个 app 容器（没有数据库容器）
 ├── .env.example                  部署层变量样例（复制为 .env，后者不入库）
 ├── .gitattributes                行尾统一：仓库内一律 LF（覆盖 Windows 的 autocrlf）
 ├── config/
 │   ├── app.yaml                  L2 开发配置 + 首次启动播种用的 defaults 段
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
-│   └── 0001_init.sql             核心建表脚本（32 张表 + 索引/约束；已真实执行并冻结）
-├── data/                         运行时产物：PG 数据（data/db）、媒体、冷层、隔离区、备份
+│   ├── sqlite/0001_init.sql      **权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器
+│   ├── postgres/0001_init.sql    历史：PG 版，已冻结（随 PG 路径退役删除）
+│   └── README.md                 两套 schema 的关系、执行语义与写迁移的规矩
+├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
-├── tests/                        conftest（集成测试开关）+ 适配器与设置层单元测试 + schema/设置集成测试
+├── tests/                        conftest（临时库夹具）+ 适配器/行为单元测试 + schema 与设置层测试
 └── src/pc/
     ├── domain.py                 状态枚举与跨层数据结构（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
     ├── config.py                 设置层：注册表加载与校验、四层解析、变更闸门、不可变快照
-    ├── cli.py                    doctor / db apply,status / config show,seed 已接线
-    ├── adapters/                 适配器实现（postgres.py：连接串解析、迁移应用、schema 校验、setting 表读写）
+    ├── cli.py                    doctor / db apply,status,backup,reindex / config show,seed 已接线
+    ├── adapters/                 适配器实现（sqlite.py：路径解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写）
     └── api/                      FastAPI 工厂与路由
 ```
 
@@ -68,9 +72,9 @@ post-collector/
 | `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定，无实现 |
 | `src/pc/domain.py` | 状态取值与传输结构；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照 | 可用（单元测试覆盖） |
-| `src/pc/adapters/` | PostgreSQL：DSN 解析、迁移应用、schema 校验、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
-| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status`、`config show/seed` | 可用 |
-| `tests/` | 适配器与设置层单元测试 + schema/设置集成测试（`integration` marker 需真实数据库，连不上则跳过） | 101 条，全绿 |
+| `src/pc/adapters/` | SQLite：路径解析、PRAGMA 基线、迁移应用、结构校验、备份与 FTS5 重建、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
+| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
+| `tests/` | 适配器单测 + SQLite 行为契约 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 128 条，0.5 秒全绿 |
 
 ## 边界约束
 
@@ -90,12 +94,16 @@ post-collector/
 
 **迁移与数据**
 
-- `migrations/` 下按序号追加 SQL，不修改已应用的版本。`0001_init.sql` 已于 2026-09-28 在 PostgreSQL 16.15 上执行成功并**冻结**：后续任何结构改动一律以 `0002_*.sql` 追加。
-- 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`（最后这条是 0001 首次真实执行时才暴露的）。全部偏差都写在 `0001_init.sql` 文件头。
-- 执行迁移请**整条语句执行**，两条等价路径：`uv run pc db apply`（纯 Python，单事务、失败整体回滚）与容器内 `psql -f`。不要用 `text.split(';')` 之类的方式切分语句，文件内既有分号又有相邻字面量拼接。
-- 连接串分两处且不可混用：容器内用 `PC__DB__DSN`（主机名是服务名 `db`），宿主机侧用 `.env` 的 `PC_TEST_DSN`（主机名 `localhost`），两者密码必须一致。解析优先级里 **`PC_TEST_DSN` 排在 `PC__DB__DSN` 之前**：宿主侧两者常常同时存在于进程环境（`.env` 会被 harness 注入子进程），先取后者就会去解析服务名 `db`，报出费解的 `failed to resolve host 'db'`。`pc db` 另外刻意不读 `.env` 里的 `PC__DB__DSN`。
-- 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移。
-- 派生数据（索引、向量、标签、caption）一律可重建；`PostgreSQL` 与媒体目录是唯一需要认真备份的东西。
+- `migrations/sqlite/` 下按序号追加 SQL，不修改已应用的版本。权威脚本是 `0001_init.sql`（34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器），后续结构改动一律以 `0002_*.sql` 追加，并同步更新 `pc.adapters.sqlite.EXPECTED_TABLES`（否则新表会被 `pc db status` 报成"计划外的表"）。`migrations/postgres/` 是**已冻结的历史版本**，不要再改，它随 PG 路径退役删除。
+- 保留字落地改名：`user` → `app_user`；`before`/`after` → `before_state`/`after_state`；`authorization` → `source_authorization`。全部偏差写在 PG 版文件头，SQLite 版沿用同一套名字。
+- **迁移文件里不得出现 `PRAGMA`**：PRAGMA 基线（`journal_mode=WAL`、`foreign_keys=ON`、`busy_timeout=5000`、`synchronous=NORMAL`、`temp_store=MEMORY`）由 `pc.adapters.sqlite.connect()` 在建立连接时执行。`journal_mode` 在事务内无法切换，写进 `.sql` 会直接报错——适配器会拒绝这种迁移文件（`split_statements` 里拦）。
+- 执行迁移是**整篇单事务**：语句用 `sqlite3.complete_statement()` 切分（**不要**用 `text.split(';')`，字符串字面量与注释里都可能有分号），在 `BEGIN IMMEDIATE` 内逐条执行，成功才写记账行并提交，失败整体回滚。适配器刻意用 `isolation_level=None` 自己管事务——Python 3.12 起 DDL 不再隐式开启事务，依赖隐式机制会让 `CREATE TABLE` 落到自动提交里，"失败整体回滚"当场失效。
+- **`foreign_keys` 默认关闭，任何一处漏设都会让外键静默失效**，因此数据库访问必须收敛在 `pc.adapters.sqlite`：业务代码不得自己 `sqlite3.connect()`。另外 `sqlite3.Connection` 的 `with` 协议管的是**事务**而不是关闭连接，一律用 `db.open_db()`。
+- 数据库位置优先级：`--path` > 环境变量 `PC__DB__PATH` > 环境变量 `PC_DATA_ROOT`（→ `<root>/pc.sqlite3`）> `.env` 里的同名两项 > `config/app.yaml` 的 `db.path`/`db.data_root` > 平台默认用户数据目录。**进程环境整层高于 `.env` 整层**——这条曾经写错（两层按同一个键混着查，导致 `.env` 压过环境变量），现在有回归测试钉着。
+- 结构指纹：`schema_migration.checksum` 存的是**剔除整行注释后**的迁移 SHA-256，所以往文件头追加修订记录不会造成漂移；行尾注释算内容（保守取向，宁可多报一次也别漏掉真实 DDL 改动）。`pc db status` 会比对它并报告漂移，**只报告不覆盖**。
+- 时间戳默认值与 PG 版**逐列对齐**：PG 里带 `DEFAULT now()` 的列，这里是 `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`；PG 里没有默认值的列（`deleted_at`/`finished_at`/`snapshot_at`/`expires_at`/`setting_change.applied_at`）也一律不给。`updated_at` 由应用层在 UPDATE 时重写，不建触发器。UUID 由应用层生成（SQLite 没有 `gen_random_uuid()`）。
+- 时间戳一律 ISO-8601 UTC 毫秒（字典序即时间序）；布尔是 `INTEGER` + `CHECK (col IN (0,1))`，断言时写 `== 1` 而不是 `is True`；JSON 存 `TEXT` + `json_valid` 校验，直接 SQL 读会拿到字符串（适配器的 `_decode()` 只作用于 `read_settings`）。
+- 派生数据（FTS5 索引、向量、标签、caption、缩略图）一律可重建；**`pc.sqlite3` 与媒体目录是唯一需要认真备份的东西**，且备份必须与库放在**不同物理介质**上（`pc db backup` 产出的快照也一样）。
 
 **设置层（DESIGN §6.2）**
 
@@ -103,13 +111,13 @@ post-collector/
 - `config/settings-registry.yaml` 里的 enum 取值**必须加引号**：YAML 1.1 会把裸写的 `off` / `on` / `yes` / `no` 解析成布尔值，于是 `off` 变成 `False`。加载器直接报错并提示加引号（fail closed），不会静默把取值改名。
 - 注册表与 `app.yaml` 的加载规则：未知字段、未知键、键名重复、默认值越界都**直接报错**；`defaults` 段的值与注册表默认值不同**只提示**（它就是 L2 层的值），因为已播种的实例一律以数据库为准。
 - 播种（`pc config seed`）只插不改、不写 `setting_change`：它不是谁做的一次改动。环境变量覆盖**永不播种**，否则会留下「环境变量撤掉后值还在」的幽灵配置。
-- 命令行**没有**设置写入路径，这是刻意的：`setting_change.changed_via` 的 CHECK 只允许 `ui|yaml|env|migration`，从 CLI 写入就得先把审计字段编出来。写入路径 `pc.adapters.postgres.write_setting_change` 已就绪（带审计、回滚、危险项二次确认断言），等设置页来接。
+- 命令行**没有**设置写入路径，这是刻意的：`setting_change.changed_via` 的 CHECK 只允许 `ui|yaml|env|migration`，从 CLI 写入就得先把审计字段编出来。写入路径 `pc.adapters.sqlite.write_setting_change` 已就绪（带审计、回滚、危险项二次确认断言），等设置页来接。
 - `pc config show` 只读数据库层，且**数据库不可达不影响退出码**：它会把生效值降级成文件与环境层并打印说明，避免让人误以为看到的就是在跑实例的值。
 
 **性能预算（回归红线）**
 
 - 检索路径有明确的性能承诺：**10 万条规模下，任意关键词与过滤器组合的检索 P50 < 150 ms、P99 < 500 ms**（50 条/页、热缓存、单用户或 ≤4 并发读者；缩略图字节与 AI 解析不计入；口径与机制见 DESIGN §5.6）。
-- **任何改动检索路径的提交都必须跑基准脚本**（脚本随 SQLite 迁移计划落地，命令届时登记进「开发命令」表），确认 P50 / P99 没有越过预算；越过就必须在同一个提交里修回或给出书面解释。
+- **任何改动检索路径的提交都必须跑基准脚本**（`uv run python tools/bench_search.py --scale 100000 --assert`，见「开发命令」表），确认 P50 / P99 没有越过预算；越过就必须在同一个提交里修回或给出书面解释。首次 10 万条实测见 DESIGN §3.7（最慢场景 P99 16.8 ms，余量约 30 倍）。
 - 三个最容易击穿预算的实现错误，评审时优先看：**组装结果出现 N+1**、**缩略图在查询时同步生成或内联 base64**、**数据库调用写在 `async def` 端点里**。
 - 分页上限 50 与预算绑定：`search.default_page_size` 的 `range` 不得放宽到 50 以上，除非同步重写 §5.6 的预算与口径。
 
@@ -150,7 +158,7 @@ post-collector/
 | 任务 | 章节 |
 | --- | --- |
 | 判断某功能是否属于本项目 | §1 项目范围与可行性（含非目标清单） |
-| 改数据模型、加表、加索引 | §3 数据模型与存储设计（§3.2 字段级设计、§3.3 状态机与可见性矩阵） |
+| 改数据模型、加表、加索引 | §3 数据模型与存储设计（§3.2 字段级设计、§3.3 状态机与可见性矩阵、**§3.8 删除与引用计数的可测试语义**） |
 | 写连接器、接入新平台 | §1.3 接入模式分级、§9.1 `Connector` 契约 |
 | 写处理管线、打标、角色识别 | §4 内容处理与算法方案（§4.7 参与度档位、§4.9 角色兜底归档） |
 | 写检索 | §5 搜索与推荐设计（阶段 1 用 FTS5 双索引；**性能预算见 §5.6**；接口需可替换） |
@@ -166,4 +174,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、备份脚本、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。

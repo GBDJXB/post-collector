@@ -5,7 +5,7 @@
 分层（DESIGN §2.2）：
     domain   纯数据类型与状态取值，无外部依赖
     ports    端口接口（Protocol），业务代码只依赖这一层
-    adapters 适配器实现（PG / 本地目录 / 各平台连接器），阶段 1 逐步加入
+    adapters 适配器实现（SQLite / 本地目录 / 各平台连接器），阶段 1 逐步加入
     api      FastAPI 应用与路由
     jobs     任务队列与 worker（阶段 1 加入）
 

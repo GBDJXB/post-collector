@@ -1,6 +1,6 @@
 # post-collector 可行性评估与方案设计
 
-版本：v3 设计基线（以 SQLite 单文件取代 PostgreSQL，解除 Docker 硬依赖，下载到使用全在 GitHub 内完成）
+版本：v3.1 设计基线（以 SQLite 单文件取代 PostgreSQL、解除 Docker 硬依赖、把应用代码与发布产物的分发收敛到 GitHub；阶段 1 只启用 root 与邀请制用户）
 受众：后续开发者、维护者、root 用户
 范围：架构、数据模型、算法与安全方案。本文不含实现代码，不含测试。
 
@@ -297,7 +297,9 @@ user ─< user_source_scope >── source                     (L1 用户可读�
 
 ### 3.2 字段级设计（SQLite）
 
-**命名沿用既有实现**：本节沿用已经落地的表名与列名，包括三处为避开保留字而做的改名（`user` → `app_user`、`before`/`after` → `before_state`/`after_state`、`authorization` → `source_authorization`；详见 `migrations/0001_init.sql` 文件头与 AGENTS.md 的偏差声明）。本次重写**只换类型与语法，不换名字**，让后续迁移与全仓库引用都是机械替换。
+**命名沿用既有实现**：本节沿用已经落地的表名与列名，包括三处为避开保留字而做的改名（`user` → `app_user`、`before`/`after` → `before_state`/`after_state`、`authorization` → `source_authorization`；详见 `migrations/postgres/0001_init.sql` 文件头与 AGENTS.md 的偏差声明）。本次重写**只换类型与语法，不换名字**，让后续迁移与全仓库引用都是机械替换。
+
+**本节是骨架摘录，可执行的权威定义在 `migrations/sqlite/0001_init.sql`**：下面的 DDL 片段为了可读性省略了部分 `NOT NULL`、`DEFAULT`、`CONSTRAINT` 命名与索引清单（例如 PG 版带 `DEFAULT now()` 的 61 处时间戳默认值，在这里全部写作 `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`）。**两者不一致时以迁移文件为准**，并应在同一次改动里回改本节——`pc db status` 与集成测试都以迁移文件为事实来源。两套 schema 的差异对照表见 `migrations/README.md`。
 
 通用约定：主键用 `INTEGER PRIMARY KEY`（rowid 别名，自增；对外暴露用 `uuid` 列避免枚举）；时间戳统一 `TEXT`（ISO-8601 UTC，毫秒精度，字典序即时间序）；软删除用 `deleted_at TEXT`；所有表带 `created_at`/`updated_at`；布尔用 `INTEGER` + `CHECK (col IN (0,1))`；JSON 用 `TEXT`（`json_valid` 校验、`json_extract` 读取）；数组用 `TEXT` 存 JSON 数组。
 
@@ -422,8 +424,8 @@ message(message_id INTEGER PRIMARY KEY, uuid TEXT, source_id INTEGER REFERENCES 
      UNIQUE(source_id, platform_msg_id),
      CHECK (message_type IN ('text','media','mixed','link','system','repost')))
 
-CREATE INDEX message_source_time_idx ON message (source_id, sent_at DESC);
-CREATE INDEX message_sender_time_idx ON message (sender_identity_id, sent_at DESC);
+CREATE INDEX message_source_sent_idx ON message (source_id, sent_at DESC);
+CREATE INDEX message_sender_sent_idx ON message (sender_identity_id, sent_at DESC);
 -- 原 pg_trgm GIN 索引取消：中文子串检索改由 FTS5 的 content_fts 承担（见 5.1）
 ```
 
@@ -444,6 +446,8 @@ content_item(content_id INTEGER PRIMARY KEY, uuid TEXT, message_id INTEGER REFER
      text_content TEXT,                                     -- 文本项正文或媒体项的说明文本
      ocr_text TEXT,                                         -- 派生
      caption TEXT,                                          -- 派生（VLM/LLM）
+     text_search TEXT,                                      -- 派生：应用层分词结果（空格连接），喂给 FTS5 的 content_word
+     search_extra TEXT,                                     -- 派生：tag/同义词/来源/发送者/链接标题的拼接，喂给 FTS5 的 content_fts
      content_hash TEXT,                                     -- 规范化内容的 SHA-256（文本项）
      phash INTEGER, dhash INTEGER, ahash INTEGER,           -- 感知哈希（图片项；64 位有符号）
      embedding_id TEXT, vector_ref TEXT,                    -- 阶段 3 再定实现（见 5.2）
@@ -468,7 +472,7 @@ content_item(content_id INTEGER PRIMARY KEY, uuid TEXT, message_id INTEGER REFER
      CHECK (submission_tier IN (0,1,2)),
      CHECK (egress_state IN ('local_only','pending','cleared','denied','expired')))
 
-CREATE UNIQUE INDEX content_item_hash_key ON content_item (content_hash)
+CREATE UNIQUE INDEX content_item_content_hash_key ON content_item (content_hash)
     WHERE content_hash IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX content_item_dup_group_idx ON content_item (dup_group_id) WHERE dup_group_id IS NOT NULL;
 CREATE INDEX content_item_nsfw_idx ON content_item (nsfw_level) WHERE nsfw_level >= 2;
@@ -501,7 +505,7 @@ inbox_item(inbox_id INTEGER PRIMARY KEY, uuid TEXT,
      CHECK (channel IN ('web','telegram_bot','email','api')),
      CHECK (status IN ('pending','reviewing','promoted','rejected','expired')))
 
-CREATE INDEX inbox_item_status_time_idx ON inbox_item (status, received_at);
+CREATE INDEX inbox_item_status_idx ON inbox_item (status, received_at);
 CREATE UNIQUE INDEX inbox_item_pending_blob_key ON inbox_item (blob_sha256) WHERE status = 'pending';
 ```
 
@@ -516,7 +520,7 @@ CREATE UNIQUE INDEX inbox_item_pending_blob_key ON inbox_item (blob_sha256) WHER
 ```sql
 media(media_id INTEGER PRIMARY KEY, uuid TEXT,
      first_seen_content_id INTEGER REFERENCES content_item(content_id),  -- 仅记录"首次入库归属"，不是唯一的从属关系
-     sha256 TEXT UNIQUE, blake3 TEXT, size_bytes INTEGER,
+     sha256 TEXT NOT NULL UNIQUE, blake3 TEXT, size_bytes INTEGER,
      mime_detected TEXT, mime_declared TEXT, extension TEXT, width INTEGER, height INTEGER,
      duration_ms INTEGER, frame_count INTEGER, is_animated INTEGER,
      storage_backend_id INTEGER REFERENCES storage_backend(backend_id),
@@ -561,9 +565,9 @@ link(link_id INTEGER PRIMARY KEY, content_id INTEGER REFERENCES content_item(con
      title TEXT, description TEXT, site_name TEXT,
      og_image_media_id INTEGER REFERENCES media(media_id),
      snapshot_key TEXT,                                     -- 本地/Wayback 快照引用
-     risk_level INTEGER, risk_reasons TEXT, blocked_reason TEXT,      -- risk_reasons 为 JSON 数组
+     risk_level INTEGER NOT NULL DEFAULT 0, risk_reasons TEXT NOT NULL DEFAULT '[]', blocked_reason TEXT,   -- risk_reasons 为 JSON 数组
      created_at TEXT, updated_at TEXT, expires_at TEXT, deleted_at TEXT,
-     CHECK (risk_level IS NULL OR risk_level BETWEEN 0 AND 3))
+     CHECK (risk_level BETWEEN 0 AND 3))
 ```
 
 **tag 体系**
@@ -618,14 +622,14 @@ model_version(model_version_id INTEGER PRIMARY KEY, capability TEXT,   -- tagger
      prompt_version TEXT, license TEXT, local INTEGER,
      cost_in_per_mtok REAL, cost_out_per_mtok REAL,
      active INTEGER, created_at TEXT, updated_at TEXT,
-     CHECK (capability IN ('tagger','ocr','nsfw','embed_image','embed_text','llm','vlm')))
+     CHECK (capability IN ('tagger','ocr','nsfw','embed_image','embed_text','llm','vlm','manual')))
 
 classification_run(run_id INTEGER PRIMARY KEY, content_id INTEGER REFERENCES content_item(content_id),
      capability TEXT, model_version_id INTEGER REFERENCES model_version(model_version_id),
      input_ref TEXT, output TEXT, confidence REAL, latency_ms INTEGER, cost_estimate REAL,
      status TEXT, error_class TEXT, created_at TEXT,
      CHECK (status IN ('succeeded','failed','skipped')))
-CREATE INDEX classification_run_cap_model_idx ON classification_run (capability, model_version_id, created_at);
+CREATE INDEX classification_run_lookup_idx ON classification_run (capability, model_version_id, created_at);
 ```
 
 `classification_run` 是模型迁移的关键：它让"当前标签是怎么来的"完全可追溯，也让"用新模型重跑哪些内容"变成一次查询。
@@ -738,6 +742,13 @@ stateDiagram-v2
 | `expired` | 放行失效 | 超过放行有效期（如 90 天）或服务商策略变更，需重新审阅 |
 
 设计要点：**`pending` 与 `cleared` 的区别必须体现在数据上**，因为"是否曾经把这条内容发给过第三方"是审计与隐私响应的核心事实。`egress_scope` 记录放行的服务商与用途，让"我们只把这条发给了 X 做打标"这类问题可被准确回答。
+
+**记账表与队列表**
+
+这两张表不承载业务语义，但同样是 schema 的一部分，完整 DDL 见 `migrations/sqlite/0001_init.sql`（本节只记要点，避免两处漂移）：
+
+- **`schema_migration`**（迁移记账）：`(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT, applied_at TEXT NOT NULL DEFAULT (strftime(...)))`。`checksum` 是迁移文件**剔除整行注释后**的 SHA-256（结构指纹），用来发现"已应用的文件被改过"；`pc db status` 比对它并报告漂移，且**只报告不覆盖**——漂移要被看见，不该被抹掉。记账行由适配器在**同一个事务内**写入，不由迁移文件自己 INSERT。
+- **`job`**（任务队列，见 2.3）：`(job_id INTEGER PRIMARY KEY, job_type, target_type, target_id, status, priority, attempts, max_attempts, run_after, locked_by, locked_at, idem_key, last_error, dead_reason, created_at, updated_at, finished_at)`，`status` 取值 `queued|running|succeeded|failed|dead|canceled`。靠 `BEGIN IMMEDIATE` 原子抢占 + `job_idem_key`（对 `idem_key` 的唯一部分索引）做幂等，靠 `job_claim_idx (status, priority, run_after) WHERE status IN ('queued','failed')` 支撑抢占查询。**没有 `FOR UPDATE SKIP LOCKED`**——SQLite 不支持，这正是"单写者 + 短事务"纪律的由来。
 
 ### 3.3 内容状态机与审查工作流
 
@@ -860,8 +871,33 @@ v2 曾判定 SQLite"超出舒适区、本项目不推荐"，**v3 反转了这个
 
 1. 连接必须集中创建并统一设置 PRAGMA；`foreign_keys=ON` 尤其容易漏，漏了外键会静默失效。
 2. 启动时校验 `sqlite3.sqlite_version_info >= (3, 40)`，不满足就 fail closed 并给人话提示。
-3. FTS5 用 external content 表时，**删除与更新索引行的语义必须在迁移计划里实测并写成断言**（本节探测只覆盖插入与查询）。
-4. 本节数字全部来自 5,000 条规模的单机实测；10 万条以上是线性外推。迁移完成后必须用真实数据复核，并把复核结果回写本节。
+3. FTS5 用 external content 表时，删除与更新索引行的语义**已经实测并写成断言**：迁移脚本带 6 个同步触发器，`tests/test_sqlite_behaviour.py` 覆盖 INSERT / UPDATE / DELETE 三种同步，并断言了 trigram 的 3 字门槛（2 字命中 0、3 字命中 1）。
+4. 本节最初的数字来自 5,000 条规模的单机实测；**10 万条规模已经在迁移落地后用合成库复核**，结果见下。
+
+**检索路径的实测基准（10 万条合成库）**
+
+首次在 10 万条规模上跑完整基准（`tools/bench_search.py`，每场景 200 次采样，50 条/页，且包含"主查询 → 批量取 tag → 批量取媒体"的完整组装，对齐 5.6 的计时口径）：
+
+| 场景 | P50 | P95 | P99 | 相对预算余量 |
+|---|---|---|---|---|
+| 纯过滤列表（时间倒序 50 条） | 0.3 ms | 0.5 ms | 0.7 ms | 约 700 倍 |
+| 纯关键词宽命中（1 字，走词级索引） | 11.3 ms | 13.1 ms | 15.4 ms | 约 32 倍 |
+| 中日文混排查询（2 字） | 11.6 ms | 13.7 ms | 15.2 ms | 约 33 倍 |
+| 短词（2 字，trigram 用不上） | 11.2 ms | 12.6 ms | 14.8 ms | 约 34 倍 |
+| 关键词 + 标签 + 时间 | 15.1 ms | 16.2 ms | 16.8 ms | 约 30 倍 |
+| 三标签交集（按集合大小升序求交） | 9.9 ms | 11.5 ms | 13.8 ms | 约 36 倍 |
+| 深分页（第 20 页，keyset） | 1.2 ms | 1.6 ms | 2.3 ms | 约 220 倍 |
+| 受限内容过滤（`nsfw_level`） | 0.3 ms | 0.4 ms | 0.6 ms | 约 830 倍 |
+| 4 个并发读者（160 次采样） | 3.9 ms | — | 7.2 ms | 约 70 倍 |
+| 后台写入同时发生（60 次采样） | 0.2 ms | — | 0.8 ms | 约 600 倍 |
+
+写入侧：10 万条内容（含 36.5 万条 `tag_assignment`、两个 FTS5 索引及其触发器）用 **29.8 秒**写完，约 **3,360 条/秒**；库体积 **225 MB**，即 **2.25 KB/条**。
+
+**三条必须连数字一起读的限定**：
+
+1. **这是合成数据，不是真实内容**：文本由词表拼接（每条 6–18 个词），没有真实的长 caption、OCR 文本与超长转发链。真实库的每条字节数与关键词查询耗时都会更高，因此 **2.25 KB/条 是下界，不能替代本节前面按真实形态估的约 6 KB/条**。
+2. **冷启动预热几乎没有收益**：冷启动首查 12.3 ms 对热缓存 11.6 ms，差异在噪声量级——库（225 MB）远小于可用内存，页本来就在系统缓存里。5.6 的 M4（预热）**保留但不是瓶颈**，等真实库接近内存上限时再评估。
+3. **预算余量约 30 倍**：结论是"10 万条规模下检索的瓶颈不在数据库"。真正会击穿 5.6 预算的仍是那三件事——组装时的 N+1、查询时生成缩略图、把数据库调用写进事件循环（M2 / M3 / M5）。
 
 ### 3.8 删除、去重与引用计数的可测试语义
 
@@ -1175,15 +1211,15 @@ WD tagger 输出（已带置信度）
 
 ### 5.1 阶段 1：BM25 / 倒排 / 过滤（SQLite FTS5）
 
-- **两个 FTS5 索引**，都用 external content 表（`content='content_item'`、`content_rowid='content_id'`，只存倒排表、不复制正文）：
-  - `content_fts`：`tokenize='trigram'`，承担子串与容错检索（前缀、错字、任意位置的字串）。
-  - `content_word`：`tokenize='unicode61'`，喂入**应用层分词结果**（jieba / pkuseg，空格连接后写入 `content_item.text_search`），承担词级检索。
+- **两个 FTS5 索引**，都用 external content 表（`content='content_item'`、`content_rowid='content_id'`，只存倒排表、不复制正文），并各配三个同步触发器（INSERT / DELETE / UPDATE）——索引由触发器维持，不指望应用层每次都记得更新：
+  - `content_fts`：`tokenize='trigram'`，索引 `content_item` 的四列 `text_content`、`ocr_text`、`caption`、`search_extra`（后者是 tag 名/同义词/来源名/发送者名/链接标题的拼接）。多列设计让 `bm25()` 的列权重有东西可加权。
+  - `content_word`：`tokenize='unicode61'`，只索引 `text_search`（**应用层分词结果**，空格连接后写入），承担词级检索。
 - **中文分词放在应用层**，不依赖任何数据库扩展。这是相对 v2 的实质简化：v2 需要核实 `zhparser` / `pg_bigm` 在目标 PG 版本上的可用性，并在不可用时降级到应用层分词；v3 直接把应用层分词定为唯一路径，少一个"需核实"项、少一处平台差异。
-- **必须知道的退化点**：FTS5 的 `trigram` 与 PG 的 `pg_trgm` 一样，**查询串少于 3 个字符时用不上索引**。中文里 2 字查询极常见（"蓝发"），因此 **2 字查询必须走 `content_word` 词级索引**，由应用层分词保证"蓝发"是一个词。查询构造要先看查询长度与分词结果，再决定查哪个索引——这条要写进实现，并在测试里用"2 字查询必须命中索引"的断言守住。
-- 检索字段合成一个 `search_document`：原始文本 + OCR 文本 + caption + tag 名 + 同义词 + 来源名 + 发送者名 + 链接标题/描述。分字段加权用 `bm25()` 的列权重参数（替代 v2 的 `setweight`）。
+- **必须知道的退化点（已实测）**：FTS5 的 `trigram` 与 PG 的 `pg_trgm` 一样，**查询串少于 3 个字符时命中 0 行且不报错**。实测：同一条 `text_content='蓝发精灵在雨里'` 的内容，`content_fts MATCH '蓝发'`（2 字）返回 **0**，`MATCH '蓝发精'`（3 字）返回 **1**；而 `content_word MATCH '蓝发'` 返回 **1**（因为 `text_search` 里"蓝发"是一个词）。中文里 2 字查询极常见，因此 **1~2 字查询必须走 `content_word` 词级索引**，由应用层分词保证它成词。查询构造要先看查询长度与分词结果，再决定查哪个索引——测试用「2 字在 `content_fts` 上命中 0、在 `content_word` 上命中 1」这组断言守住它。
+- 检索字段的合成方式：正文、OCR、caption 直接进 `content_fts`；tag 名/同义词/来源名/发送者名/链接标题拼进 `search_extra` 再进 `content_fts`（**改 tag 或来源名时要重算该列**，属于 2.3 的派生数据重算）；应用层分词结果写进 `text_search` 供 `content_word` 使用。分字段加权用 `bm25()` 的列权重参数（替代 v2 的 `setweight`）。
 - 过滤维度：`source_id`、`sender_identity_id`、时间范围、`item_type`、`lang`、`nsfw_level`、`status`、`namespace` 下的 tag 集合。`tag_assignment` 是**双向部分索引**（`(tag_id, content_id)` 与 `(content_id)`，都带 `revoked_at IS NULL`）：按标签取内容走前者，组装结果时批量取 tag 走后者；多 tag 过滤用交集（见 5.6 的候选集与求交规则）。
 - 排序：BM25 相关度（`bm25()`）× 时间衰减 × 来源信任度。搜索结果必须支持"仅看原图"（canonical 折叠）。
-- **索引同步**：external content 表要求索引行与正文行一致——软删、改 tag、重算 caption 都要同步更新索引行。**删除/更新语义在迁移计划里必须实测并写成断言**（见 3.7 的四条结论之一）。
+- **索引同步**：external content 表要求索引行与正文行一致——软删、改 tag、重算 caption 都要同步更新索引行。**这一条已经实测并写成断言**：迁移脚本带 6 个触发器负责搬运，`tests/test_sqlite_behaviour.py` 覆盖 INSERT / UPDATE / DELETE 三种同步（见 3.7 的四条结论之一）。派生列本身（`search_extra`、`text_search`）由应用层重算，触发器只把它们搬进索引——**改 tag 时必须触发重算，否则检索会落后于事实**。
 
 ### 5.2 阶段 2：混合检索
 
@@ -2081,6 +2117,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
 | **数据模型修正：媒体与内容项的多对多**（v3.1） | 我在核对评审意见时发现：v3 用单个 `media.content_id` 配 `sha256` 唯一约束，**根本无法表达 3.6 承诺的"多个 content_item 复用同一本体"** | 3.2：`media.content_id` → `first_seen_content_id`，新增联结表 **`content_media`** 与其双向索引；新增 **`hash_tombstone`**（兑现"硬删后仍拦截重复导入"，此前只写在附录 A 而没有落地表）；**新增 3.8**「删除、去重与引用计数的可测试语义」（引用计数规则、canonical 重选、哈希墓地、备份不追溯、五条断言清单）；3.6 的去重段同步。表数量由 32 变为 34 |
 | **保留策略与受限内容措辞修正**（v3.1） | 评审指出 `raw_payload` 只留哈希会失去重放能力；带盐 IP 哈希被描述为匿名；受限内容不能只靠自动识别 | 3.2 的 `raw_payload` 改为**三档**（最小规范化信封默认始终保留 + 原始载荷默认关闭且开启时加密带保留期 + 哈希始终保留），档位由待注册的设置项控制；`submitter_ip_hash` 的措辞改为"不存原始 IP，但带盐哈希属**假名化个人数据**，隐私策略不得称其为匿名"；6.6 新增受限内容的**五条保守默认**（来源准入、默认不可见、不生成派生、导出受限、人工判定留依据） |
 | **分发承诺收窄 + 基准场景扩充 + 模型供给流程**（v3.1） | 评审指出"全在 GitHub 内"不可字面兑现、分发成本被低估、模型供应链缺流程、搜索预算需真实数据验收 | 0 第 13 条与 10.1 改为**分路径说明自包含程度**（原生需 PyPI、单文件包自包含、镜像经 GHCR）并给出对照表；**阶段 1 只阻塞 uv 路径与 Windows 便携包**，macOS 公证与 Linux 打包移到阶段 2（9 阶段 1 验收⑫ 相应改写）；新增 **4.10**「本地模型的供给与升级」（固定 revision、许可证入注册表、权重哈希校验、离线导入、三档 Profile、CPU 预期、升级后重算）；5.6 增「验收方式」九类场景（中日文混排、2 字词、深分页、受限内容过滤、冷启动首查、后台写入并发、4 并发读者）；附录 A 增第 15、16 条 |
+| **存储引擎落地：设计与实现合并**（v3.1 实现） | 此前 v3/v3.1 只改了设计，代码仍跑在 PostgreSQL 上；评审把它列为 P0「设计与实现完全分叉」，本次把实现补齐 | 新增 `migrations/sqlite/0001_init.sql`（**权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个同步触发器 + 36 条索引）；原 `migrations/0001_init.sql` 移入 `migrations/postgres/` 并冻结；新增 `src/pc/adapters/sqlite.py` 取代 `postgres.py`（路径解析、PRAGMA 基线、单事务迁移、备份、FTS5 重建、设置层读写）；CLI 去掉 `--dsn`、新增 `pc db backup` 与 `pc db reindex`；测试从 101 条（需真实 PG、约 33 秒、Docker 未启动时 19 条报错）变为 **128 条（临时 SQLite 文件、0.5 秒、零外部依赖、永不跳过）**；`pyproject.toml` 去掉 `psycopg`；`docker-compose.yml` 去掉 `db` 服务；`.env.example`、`config/app.yaml`、`.gitignore`、`AGENTS.md`、`README.md`、`migrations/README.md` 同步。**回写** §3.2 与实现不一致的 5 个索引名、`content_item` 的两个派生列、`media.sha256` 的 NOT NULL、`link.risk_level`、`model_version.capability` 的 `manual`，并补 `job` 与 `schema_migration` 两张表；§5.1 的 FTS5 列划分与**实测**的 trigram 3 字门槛；§3.2 明确"本节是骨架摘录，权威定义在迁移文件" |
 | **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 
 ## 附录 B：参考组件

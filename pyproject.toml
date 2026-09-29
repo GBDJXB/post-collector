@@ -18,13 +18,13 @@ classifiers = [
 ]
 
 # 依赖清单对应 DESIGN §8.1「最适合 MVP」的选型。
-# 注意：不引入 ORM —— 迁移与查询走顺序 SQL（见 migrations/）。
+# 注意：不引入 ORM，也不引入数据库驱动 —— 迁移与查询走顺序 SQL（见 migrations/），
+# SQLite 由标准库 sqlite3 提供（Python 3.12 自带 ≥ 3.40，启动时校验）。
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "pydantic>=2.9",
   "pyyaml>=6.0",
-  "psycopg[binary]>=3.2",
 ]
 
 # 开发依赖使用 PEP 735 的 dependency-groups：`uv sync` 会默认装上它们，
@@ -63,7 +63,7 @@ ignore = [
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
-  "integration: 需要真实 PostgreSQL / 外部服务的测试（默认通过环境变量跳过）",
+  "integration: 需要外部服务（平台接口、模型下载、对象存储）的测试；数据库测试不再属于此类，它们在临时 SQLite 文件上运行、永不跳过",
 ]
 
 [tool.mypy]

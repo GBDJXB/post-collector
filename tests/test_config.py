@@ -7,7 +7,7 @@
 * 分层解析的来源可解释性（env > db > yaml > default，且能回答「为什么是这个值」）；
 * 不可变快照与「不对劲清单」（拼错的 ``PC__`` 环境变量、注册表外的孤儿键）。
 
-刻意不连数据库：设置项语义是纯函数，能在没有 psycopg 的环境里被验证。
+刻意不连数据库：设置项语义是纯函数，能在没有数据库、只有标准库的环境里被验证。
 """
 
 from __future__ import annotations
@@ -397,7 +397,7 @@ class TestEnvMapping:
     ) -> None:
         """db / paths 这类键属于 L2/L3 配置段，不该被报成「拼错了」。"""
         mapped, warnings = cfg.env_overrides_by_key(
-            {"PC__DB__DSN": "x", "PC__PATHS__MEDIA_ROOT": "/data/media"}, registry=specs
+            {"PC__DB__PATH": "x", "PC__PATHS__MEDIA_ROOT": "/data/media"}, registry=specs
         )
         assert mapped == {}
         assert warnings == ()

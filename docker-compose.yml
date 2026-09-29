@@ -1,7 +1,11 @@
 # ---------------------------------------------------------------------------
 # 单机部署编排（DESIGN §10 推荐默认架构的起点）
 #
-# 本阶段只启两个服务：db 与 app。
+# **只有一个服务**：从 PostgreSQL 换到 SQLite 之后，数据库不再是独立服务，而是
+# 数据卷里的一个文件（<data_root>/pc.sqlite3）。本文件因此从「编排」退化为
+# 「把应用跑起来」的便捷方式——Docker 在本项目里是**可选的隔离手段，不是安装前提**
+# （DESIGN §10.1 ③）。
+#
 # 骨架内尚不存在 worker / sync / retention 的可执行入口，因此它们以
 # 「注释 + 待加入」的形式列在文件末尾，而不是写成会立即崩溃的容器。
 #
@@ -12,52 +16,21 @@
 name: post-collector
 
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-pc}
-      POSTGRES_USER: ${POSTGRES_USER:-pc}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
-      # 中文检索需要 pg_trgm（创建扩展）；zhparser / pg_bigm 的可用性待核实
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
-    volumes:
-      - ./data/db:/var/lib/postgresql/data
-      # 迁移脚本挂进来，便于在容器内用 psql 应用；宿主侧也可以直接 `uv run pc db apply`
-      # 0001 已在 PostgreSQL 16.15 上执行成功，见 migrations/0001_init.sql 文件头的修订记录
-      - ./migrations:/migrations:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pc} -d ${POSTGRES_DB:-pc}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    # 只绑本机：宿主机侧的 `pc db status` / `pc db apply` 与集成测试需要连库。
-    # 容器内互访仍走服务名 db:5432，不受此映射影响；公网与内网其它机器依然连不上。
-    ports:
-      - "127.0.0.1:5432:5432"
-
   app:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
-      PC__DB__DSN: ${PC__DB__DSN:-postgresql://pc:change-me@db:5432/pc}
-      PC__PATHS__MEDIA_ROOT: /data/media
-      PC__PATHS__COLD_ROOT: /data/cold
-      PC__PATHS__QUARANTINE_ROOT: /data/quarantine
+      # 数据根目录：库文件、媒体、缩略图、备份都在它下面（DESIGN §10.2）
+      PC_DATA_ROOT: /data
       PC__AI__INVOLVEMENT: ${PC__AI__INVOLVEMENT:-local_only}
       PC__RETENTION__MAX_TOTAL_BYTES: ${PC__RETENTION__MAX_TOTAL_BYTES:-214748364800}
       PC__INBOX__ENABLED: ${PC__INBOX__ENABLED:-false}
     volumes:
       - ./config:/app/config:ro
-      - ./data/media:/data/media
-      # 冷层与隔离区在对应模块加入后再开放挂载（见 DESIGN §7.5、§6.1）
-      # - ./data/cold:/data/cold
-      # - ./data/quarantine:/data/quarantine
+      # 一个卷装下全部持久状态：pc.sqlite3（含 -wal/-shm）+ media + thumbs + backup
+      - ./data:/data
     ports:
       - "127.0.0.1:8080:8080"
 
@@ -68,11 +41,12 @@ services:
 #   sync        python -m pc.jobs.sync       每来源独立节拍的调度器（§2.3）
 #   retention   python -m pc.jobs.retention  保留策略执行器，默认 dry-run（§7.5）
 #
-# 届时需要一并启用的卷：
-#   ./data/cold       → /data/cold          冷层本体（可指向 NAS 挂载）
-#   ./data/quarantine → /data/quarantine    L2 提报隔离区，与主存储物理分离
-#   ./data/backup     → /data/backup        备份目标（可指向 NAS）
-#   ./models          → /app/models:ro      本地模型权重（阶段 2 起）
+# 它们与 app 共享同一个数据卷，靠 `BEGIN IMMEDIATE` 抢占任务（DESIGN §2.3、10.3），
+# 因此**不需要**额外的消息中间件，也不需要数据库服务。
+#
+# 冷层与备份建议指向 NAS 或另一块盘：把 /data/cold、/data/backup 换成挂载点即可。
+# 注意 DESIGN §7.1 的硬要求——**备份必须与库放在不同物理介质上**：单文件是 SQLite
+# 最大的优点，也是它最大的风险点。
 #
 # 阶段 2 才考虑加入的组件：meili（Meilisearch）、minio（MinIO）。
 # 按 DESIGN §8.2 的判断，10 万条量级下不需要 Qdrant / OpenSearch。

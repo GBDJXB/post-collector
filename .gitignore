@@ -47,8 +47,9 @@ config/*.local.yaml
 config/app.local.yaml
 config/settings-registry.local.yaml
 
-# --- 运行时数据（PostgreSQL 卷、媒体、冷层、隔离区、备份） ----------------
-# data/ 下永远是运行时产物，绝不入库；仅保留 .gitkeep 占位
+# --- 运行时数据（SQLite 单文件、媒体、缩略图、冷层、隔离区、备份） ----------
+# data/ 下永远是运行时产物，绝不入库；仅保留 .gitkeep 占位。
+# 注意：pc.sqlite3 会带出 -wal / -shm 两个同名附属文件，它们同样不入库。
 data/**
 !data/.gitkeep
 
