@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 #: 默认路径（相对仓库根）
@@ -365,6 +366,146 @@ def _db_paths_from_app_config(path: Path | str | None) -> dict[str, str]:
         if isinstance(value, str) and value.strip():
             result[key] = value.strip()
     return result
+
+
+#: 运行时目录：``(名字, app.yaml 键, 默认子目录名, 环境变量名)``（DESIGN §10.2）
+RUNTIME_DIR_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("media", "media_root", "media"),
+    ("thumb", "thumb_root", "thumbs"),
+    ("cold", "cold_root", "cold"),
+    ("quarantine", "quarantine_root", "quarantine"),
+    ("backup", "backup_root", "backup"),
+    ("models", "models_root", "models"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPaths:
+    """一次解析出来的运行时目录（数据根 + 六个派生目录）。
+
+    每个目录都带**来源**，这样「为什么媒体跑到了别处」不需要靠猜（DESIGN §6.2 的
+    可解释性要求，与 :class:`ResolvedPath` 同一套做法）。
+    """
+
+    data_root: Path
+    root_source: str
+    paths: Mapping[str, Path]
+    sources: Mapping[str, str]
+
+    def __getattr__(self, name: str) -> Path:
+        if name.endswith("_root"):
+            key = name[: -len("_root")]
+            if key in self.paths:
+                return self.paths[key]
+        raise AttributeError(name)
+
+    def explain(self) -> str:
+        lines = [f"数据根目录：{self.data_root}（来源 {self.root_source}）"]
+        for name in self.paths:
+            lines.append(f"  {name}_root：{self.paths[name]}（来源 {self.sources[name]}）")
+        return "\n".join(lines)
+
+
+def _paths_from_app_config(path: Path | str | None) -> dict[str, str]:
+    """从 ``config/app.yaml`` 读 ``db.data_root`` 与 ``paths.*``；缺文件时返回空。"""
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    result: dict[str, str] = {}
+    db_section = data.get("db")
+    if isinstance(db_section, dict):
+        value = db_section.get("data_root")
+        if isinstance(value, str) and value.strip():
+            result["data_root"] = value.strip()
+    paths_section = data.get("paths")
+    if isinstance(paths_section, dict):
+        for _, key, _ in RUNTIME_DIR_SPECS:
+            value = paths_section.get(key)
+            if isinstance(value, str) and value.strip():
+                result[key] = value.strip()
+    return result
+
+
+def resolve_paths(
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = DEFAULT_ENV_FILE,
+    app_config: Path | str | None = DEFAULT_APP_CONFIG,
+) -> ResolvedPaths:
+    """解析数据根目录与六个运行时目录。
+
+    优先级（逐项独立解析）：
+
+    * 数据根目录：环境变量 ``PC_DATA_ROOT`` > ``.env`` 里的同名项 >
+      ``config/app.yaml`` 的 ``db.data_root`` > 平台默认用户数据目录。
+    * 各目录：环境变量 ``PC__PATHS__<NAME>_ROOT`` > ``.env`` 里的同名项 >
+      ``config/app.yaml`` 的 ``paths.<name>_root`` > ``<data_root>/<默认子目录>``。
+
+    **媒体目录刻意跟着数据根目录走，而不是跟着数据库文件走**：``PC__DB__PATH`` /
+    ``db.path`` 只改数据库文件本身的位置（放进 SSD、放到挂载盘），如果它顺带把媒体
+    也挪走，一次「把库放到别处」的操作就会静默改变对象存储的位置——对象键虽然不变，
+    落盘位置变了同样意味着老内容找不到。
+
+    容器与多盘部署用 ``paths.*`` / ``PC__PATHS__*`` 显式指定每一项。
+    """
+    environ = os.environ if env is None else env
+    from_file = read_env_file(env_file)
+    configured = _paths_from_app_config(app_config)
+    label = (
+        Path(app_config).as_posix() if app_config is not None else DEFAULT_APP_CONFIG.as_posix()
+    )
+
+    def lookup(env_key: str, yaml_key: str) -> tuple[str, str] | None:
+        """依次查进程环境 → .env → app.yaml，返回 (值, 来源说明)。"""
+        value = environ.get(env_key)
+        if value:
+            return value, f"env:{env_key}"
+        value = from_file.get(env_key)
+        if value:
+            return value, f"env-file:{env_key}"
+        value = configured.get(yaml_key)
+        if value:
+            return value, f"{label}:{yaml_key}"
+        return None
+
+    root_hit = lookup("PC_DATA_ROOT", "data_root")
+    if root_hit is None:
+        data_root = default_data_root(env=environ)
+        root_source = "default"
+    else:
+        data_root = Path(root_hit[0]).expanduser()
+        root_source = root_hit[1]
+
+    paths: dict[str, Path] = {}
+    sources: dict[str, str] = {}
+    for name, yaml_key, default_dir in RUNTIME_DIR_SPECS:
+        hit = lookup(f"PC__PATHS__{name.upper()}_ROOT", yaml_key)
+        if hit is None:
+            paths[name] = data_root / default_dir
+            sources[name] = f"{root_source} + /{default_dir}"
+        else:
+            paths[name] = Path(hit[0]).expanduser()
+            sources[name] = hit[1]
+
+    return ResolvedPaths(
+        data_root=data_root,
+        root_source=root_source,
+        paths=MappingProxyType(paths),
+        sources=MappingProxyType(sources),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1367,7 @@ __all__ = [
     "FTS_VIRTUAL_TABLES",
     "MIN_SQLITE_VERSION",
     "PRAGMA_BASELINE",
+    "RUNTIME_DIR_SPECS",
     "SETTING_CHANGE_VIA",
     "SETTING_SOURCES",
     "DatabaseError",
@@ -1234,6 +1376,7 @@ __all__ = [
     "MigrationFile",
     "MigrationState",
     "ResolvedPath",
+    "ResolvedPaths",
     "SchemaMismatchError",
     "SettingRow",
     "applied_versions",
@@ -1262,6 +1405,7 @@ __all__ = [
     "recorded_checksum",
     "reindex_fts",
     "resolve_db_path",
+    "resolve_paths",
     "seed_settings",
     "settings_revision",
     "split_statements",

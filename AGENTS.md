@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；测试套件覆盖数据库适配层、设置层、SQLite 行为契约、迁移器与 schema 红线，**143 条、0.5 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
+当前状态：**骨架阶段，存储引擎已换成 SQLite**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库已经真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`）；**设置层已经真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种 `setting` 表、带审计与回滚的写入路径）；**配置层已经真实可用**（`config/app.yaml` 全部段严格校验、数据根与六个运行时目录可解析且带来源）；测试套件覆盖数据库适配层、设置层、配置段与路径解析、SQLite 行为契约、迁移器与 schema 红线，**176 条、0.6 秒、不依赖任何外部服务**；**但业务功能仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -22,11 +22,11 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 操作 | 命令 | 说明 |
 | --- | --- | --- |
 | 安装依赖 | `uv sync` | 会一并装上 dev 组（pytest / ruff / httpx）；只要运行时用 `uv sync --no-dev`。生成 `uv.lock`，必须提交 |
-| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`）。体检含只读「数据库」段，**数据库不可达不影响退出码** |
+| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`）。体检含只读「数据库」段（**不可达不影响退出码**）与「运行时目录」段（逐项打印落点与**来源**，并报告 `config/app.yaml` 的缺口） |
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **143 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.5 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **176 条，全部在临时 SQLite 文件上跑：不依赖任何外部服务，也不会跳过**（0.6 秒内跑完）。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR]` | **按文件名序号应用 `migrations/sqlite/` 下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。默认库文件是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`** |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -49,7 +49,7 @@ post-collector/
 ├── .env.example                  部署层变量样例（复制为 .env，后者不入库）
 ├── .gitattributes                行尾统一：仓库内一律 LF（覆盖 Windows 的 autocrlf）
 ├── config/
-│   ├── app.yaml                  L2 开发配置 + 首次启动播种用的 defaults 段
+│   ├── app.yaml                  L2 开发配置：defaults 段（待播种）与部署/安全基线各段
 │   └── settings-registry.yaml    设置项声明式注册表
 ├── migrations/
 │   ├── sqlite/0001_init.sql      **权威**：34 张 STRICT 表 + 2 个 FTS5 虚拟表 + 6 个触发器
@@ -57,13 +57,13 @@ post-collector/
 │   └── README.md                 执行语义、方言历史与写迁移的规矩
 ├── data/                         运行时产物：pc.sqlite3（含 -wal/-shm）、媒体、缩略图、冷层、隔离区、备份
 ├── models/                       本地模型权重（不入库）
-├── tests/                        conftest（临时库夹具）+ 适配器/行为单元测试 + schema 与设置层测试
+├── tests/                        conftest（临时库夹具）+ 适配器/行为/迁移器/配置段/路径/设置层测试
 └── src/pc/
     ├── domain.py                 状态枚举与跨层数据结构（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
-    ├── config.py                 设置层：注册表加载与校验、四层解析、变更闸门、不可变快照
+    ├── config.py                 设置层与 L2 配置段：注册表校验、四层解析、变更闸门、快照、限额与安全策略
     ├── cli.py                    doctor / db apply,status,backup,reindex / config show,seed 已接线
-    ├── adapters/                 适配器实现（sqlite.py：路径解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写）
+    ├── adapters/                 适配器实现（sqlite.py：库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写）
     └── api/                      FastAPI 工厂与路由
 ```
 
@@ -71,10 +71,10 @@ post-collector/
 | --- | --- | --- |
 | `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定，无实现 |
 | `src/pc/domain.py` | 状态取值与传输结构；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
-| `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照 | 可用（单元测试覆盖） |
-| `src/pc/adapters/` | SQLite：路径解析、PRAGMA 基线、迁移应用、结构校验、备份与 FTS5 重建、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
-| `src/pc/cli.py` | `doctor`（含只读数据库段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
-| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 143 条，0.5 秒全绿 |
+| `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
+| `src/pc/adapters/` | SQLite：数据库文件与**六个运行时目录**的解析（都带来源）、PRAGMA 基线、迁移应用、结构校验、备份与 FTS5 重建、`setting`/`setting_change` 读写（带审计与回滚） | 首个适配器，可用 |
+| `src/pc/cli.py` | `doctor`（含只读数据库段与运行时目录段）、`db apply/status/backup/reindex`、`config show/seed` | 可用 |
+| `tests/` | 适配器单测 + SQLite 行为契约 + 迁移器契约 + 配置段与路径解析 + schema 红线 + 设置层（全部在临时库上跑，无外部依赖） | 176 条，0.6 秒全绿 |
 
 ## 边界约束
 
@@ -113,6 +113,12 @@ post-collector/
 - 播种（`pc config seed`）只插不改、不写 `setting_change`：它不是谁做的一次改动。环境变量覆盖**永不播种**，否则会留下「环境变量撤掉后值还在」的幽灵配置。
 - 命令行**没有**设置写入路径，这是刻意的：`setting_change.changed_via` 的 CHECK 只允许 `ui|yaml|env|migration`，从 CLI 写入就得先把审计字段编出来。写入路径 `pc.adapters.sqlite.write_setting_change` 已就绪（带审计、回滚、危险项二次确认断言），等设置页来接。
 - `pc config show` 只读数据库层，且**数据库不可达不影响退出码**：它会把生效值降级成文件与环境层并打印说明，避免让人误以为看到的就是在跑实例的值。
+
+**配置层（L2，`config/app.yaml` 的其余段）**
+
+- `defaults` 段是要播种进数据库的设置项（走注册表校验）；`db` / `paths` / `jobs` / `ingest` / `security` / `models` 六段是**留在文件里**的部署与安全基线，刻意不进设置页。它们的已知键清单写死在 `pc.config.APP_CONFIG_SECTIONS`，**未知段名与未知键一律报错**（拼错的键被静默忽略正是「改了文件没生效」最难查的一类故障），并给出最接近的键名建议；测试断言这张清单与仓库里那份真实文件逐段一致，防止清单过期。
+- 取值一律**类型严格**：整数字段里写 `true` 会报错（`bool` 是 `int` 的子类，静默变成 1 最难查）；布尔字段里写 `"false"` 同样报错。安全相关项的默认值一律在保守那一侧（`fail_closed_on_scan_error=True`、`allow_svg=False`），把它们做成配置项不等于可以随手关掉。
+- 运行时目录的解析在 `pc.adapters.sqlite.resolve_paths()`，与 `resolve_db_path()` 放在**同一个模块**：两者必须对"数据根目录在哪"给出一致答案。优先级：数据根目录取 `PC_DATA_ROOT` > `.env` > `app.yaml:db.data_root` > 平台默认；每个子目录再按 `PC__PATHS__<NAME>_ROOT` > `.env` > `app.yaml:paths.<name>_root` > `<data_root>/<默认名>` 逐项覆盖。**媒体目录跟着数据根目录走，不跟着数据库文件走**——`PC__DB__PATH` 只挪库文件本身（放进 SSD、放到挂载盘），顺带挪走媒体会让老内容静默失联，这条有回归测试钉着。
 
 **性能预算（回归红线）**
 
@@ -174,4 +180,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、worker / sync / retention 进程、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、设置层与 schema 红线，但**没有业务逻辑测试**（因为还没有业务逻辑）。

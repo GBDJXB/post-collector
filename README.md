@@ -125,13 +125,18 @@ description: "post-collector 使用手册：这个工具能做什么、需要准
 ├── cold/            冷层：较早或低频的媒体，可指向 NAS
 ├── quarantine/      提报隔离区，与 media 物理分离，按期限自动清理
 ├── backup/          `pc db backup` 的默认落点
-└── config/          首次启动生成的配置副本
+└── config/          首次启动生成的配置副本（**尚未实现**，见 DESIGN §10.2）
 ```
 
 怎么改位置：
 
 - `PC_DATA_ROOT`：改**数据根目录**，媒体、缩略图、备份都跟着它走。
-- `PC__DB__PATH`：只改**库文件本身**，媒体仍留在数据根目录。
+- `PC__DB__PATH`：只改**库文件本身**，媒体仍留在数据根目录（把库放到 SSD 上不该顺带
+  把媒体本体挪走——落点变了，老内容一样找不到）。
+- `PC__PATHS__MEDIA_ROOT` / `PC__PATHS__COLD_ROOT` / `PC__PATHS__QUARANTINE_ROOT` 等：
+  只改**某一个子目录**，把冷层或备份单独放到 NAS 上时用。
+- 子目录也可以在 `config/app.yaml` 的 `paths` 段里写死（优先级：进程环境 > `.env` >
+  `config/app.yaml` > 从数据根目录派生）。
 
 两个变量都可以写进 `.env`（由 `.env.example` 复制而来，已被 `.gitignore` 忽略，不要提交），
 也可以直接设在进程环境里。改完跑一次 `uv run pc doctor`，它会打印实际生效的库文件路径，
@@ -243,6 +248,7 @@ PC__SEARCH__DEFAULT_PAGE_SIZE=50
 | 环境变量设了却没生效 | 名字拼错了，或它不属于设置项 | `pc config show` 会点名报出可疑的 `PC__` 变量并提示可能想写哪个；`PC__DB__PATH` 这类部署层变量不在检查范围内 |
 | `pc config seed` 说「保留既有 N 项」 | 播种只插不改 | 正常：重复运行不会覆盖任何已有值 |
 | `pc config seed` 说库里没有 `setting` 表 | 还没建库 | 先跑 `uv run pc db apply` |
+| 媒体/备份/隔离区落在了意料之外的位置 | 某个 `PC__PATHS__*` 或 `config/app.yaml` 的 `paths` 段指到了别处（`.env` 里也可能有旧值） | `uv run pc doctor` 的「运行时目录」段会逐项打印落点与**来源**（`env:` / `.env` / `app.yaml` / 从数据根派生）。注意 `env:` 前缀表示它来自**当前 shell 的环境变量**，优先级最高，`.env` 改它没用 |
 | `pc db status` 结论「结构未就绪」、退出码 2 | 缺表、FTS5 索引不全、`journal_mode` 不是 WAL、外键没开、完整性检查没过，或结构指纹漂移 | 按它逐条打印的 `✗` 项处理：索引不完整跑 `uv run pc db reindex` 重建；其余先看下面两行 |
 | `pc db status` 提示结构指纹漂移 | 迁移文件在**应用之后**被改过，库里记的指纹与文件对不上 | 本工具不会自动改库，也不会覆盖指纹。若改动确有必要，请以新迁移追加，而不是改已应用的版本；否则把文件改回原样即可 |
 | 库确实建坏了（半成品状态） | 有表但记账不完整，或记账与表不一致 | 工具不会自动修补。先 `uv run pc db backup --to <别处>` 留档，再删掉这个库文件重建：`uv run pc db apply` |

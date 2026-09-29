@@ -472,6 +472,306 @@ def app_default_warnings(
     return tuple(messages)
 
 
+# ---------------------------------------------------------------------------
+# L2：config/app.yaml 的其余段（db / paths / jobs / ingest / security / models）
+#
+# defaults 段走注册表（那是要播种进数据库的设置项）；这里管的是**留在文件里的**
+# 部署与安全基线：限额、安全开关、队列节拍。它们刻意不进设置页（DESIGN §6.2 末段）：
+# 「改错无法用一句大白话说明后果」的东西不该出现在面向非技术 root 的界面上。
+# ---------------------------------------------------------------------------
+
+
+#: ``config/app.yaml`` 各段允许出现的键。
+#: **这张表刻意写死**：拼错的键会被静默忽略，正是「改了文件没生效」最难查的一类
+#: 故障，所以未知键直接报错。测试会断言它与仓库里那份真实文件一致，防止清单过期。
+APP_CONFIG_SECTIONS: dict[str, frozenset[str]] = {
+    "db": frozenset({"path", "data_root"}),
+    "paths": frozenset(
+        {
+            "media_root",
+            "thumb_root",
+            "cold_root",
+            "quarantine_root",
+            "backup_root",
+            "models_root",
+        }
+    ),
+    "jobs": frozenset(
+        {"worker_concurrency", "batch_size", "max_attempts_default", "backoff_seconds"}
+    ),
+    "ingest": frozenset(
+        {"max_media_bytes", "max_image_pixels", "max_text_chars", "link_autofetch"}
+    ),
+    "security": frozenset(
+        {
+            "sniff_mime_by_magic",
+            "fail_closed_on_scan_error",
+            "exif_strip_gps",
+            "exif_strip_serial",
+            "exif_strip_author",
+            "allow_svg",
+            "allow_pdf_inline_render",
+        }
+    ),
+    "models": frozenset({"profile", "registry_path"}),
+}
+
+#: 顶层允许的键：``schema_version``、``defaults``（键集合由注册表校验）与上面各段。
+APP_CONFIG_TOP_LEVEL: frozenset[str] = frozenset(
+    {"schema_version", "defaults", *APP_CONFIG_SECTIONS}
+)
+
+
+def _suggest(name: str, known: Iterable[str]) -> str:
+    matches = difflib.get_close_matches(name, list(known), n=1)
+    return f"（是不是想写 {matches[0]}？）" if matches else ""
+
+
+def load_app_config(path: Path | str = DEFAULT_APP_CONFIG_PATH) -> dict[str, Any]:
+    """读取整个 ``config/app.yaml``，并严格校验段名与段内键名。
+
+    与 :func:`load_app_defaults` 的分工：后者只关心要播种进数据库的 ``defaults``
+    段，这里关心**留在文件里**的部署与安全基线（限额、安全开关、队列节拍），
+    也就是 :func:`ingest_limits` / :func:`security_policy` / :func:`job_settings`
+    的输入。
+
+    Raises:
+        AppConfigError: 文件缺失、不是合法 YAML、``schema_version`` 不符、
+            顶层出现未知段、已知段不是映射、段内出现未知键。
+    """
+    data = _load_yaml(path, error_cls=AppConfigError, what="开发配置 config/app.yaml")
+
+    version = data.get("schema_version")
+    if version != REGISTRY_SCHEMA_VERSION:
+        raise AppConfigError(
+            f"config/app.yaml 的 schema_version 是 {version!r}，本程序支持 {REGISTRY_SCHEMA_VERSION}。"
+        )
+
+    unknown_sections = [key for key in data if key not in APP_CONFIG_TOP_LEVEL]
+    if unknown_sections:
+        detail = "；".join(f"{key}{_suggest(key, APP_CONFIG_TOP_LEVEL)}" for key in unknown_sections)
+        raise AppConfigError(
+            f"config/app.yaml 出现未知的顶层键：{detail}。"
+            f"已知段：{', '.join(sorted(APP_CONFIG_SECTIONS))}（另有 schema_version / defaults）。"
+        )
+
+    for name, known_keys in APP_CONFIG_SECTIONS.items():
+        if name not in data:
+            continue
+        section = data[name]
+        if section is None:
+            continue
+        if not isinstance(section, Mapping):
+            raise AppConfigError(f"config/app.yaml 的 {name} 段必须是「键: 值」映射。")
+        unknown = [key for key in section if key not in known_keys]
+        if unknown:
+            detail = "；".join(f"{key}{_suggest(key, known_keys)}" for key in unknown)
+            raise AppConfigError(
+                f"config/app.yaml 的 {name} 段出现未知键：{detail}。"
+                f"该段允许的键：{', '.join(sorted(known_keys))}。"
+            )
+
+    return dict(data)
+
+
+def _section(config: Mapping[str, Any] | None, name: str) -> Mapping[str, Any]:
+    """取一个段；缺段或 ``None`` 时返回空映射（由调用方回落到内置默认值）。"""
+    if config is None:
+        return {}
+    section = config.get(name)
+    if section is None:
+        return {}
+    if not isinstance(section, Mapping):
+        raise AppConfigError(f"config/app.yaml 的 {name} 段必须是「键: 值」映射。")
+    return section
+
+
+def _int_field(
+    section: Mapping[str, Any], key: str, default: int, *, where: str, minimum: int = 1
+) -> int:
+    if key not in section or section[key] is None:
+        return default
+    value = section[key]
+    # 注意 bool 是 int 的子类：`true` 写进整数字段必须报错，而不是变成 1
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AppConfigError(
+            f"config/app.yaml 的 {where}.{key} 必须是整数，实际是 {value!r}。"
+        )
+    if value < minimum:
+        raise AppConfigError(
+            f"config/app.yaml 的 {where}.{key} 必须 ≥ {minimum}，实际是 {value}。"
+        )
+    return value
+
+
+def _bool_field(section: Mapping[str, Any], key: str, default: bool, *, where: str) -> bool:
+    if key not in section or section[key] is None:
+        return default
+    value = section[key]
+    if not isinstance(value, bool):
+        raise AppConfigError(
+            f"config/app.yaml 的 {where}.{key} 必须是 true / false，实际是 {value!r}。"
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class IngestLimits:
+    """摄入层限额（DESIGN §6.5 的硬上限，属安全基线而不是可调偏好）。"""
+
+    max_media_bytes: int = 52_428_800  # 单文件 50 MB
+    max_image_pixels: int = 100_000_000  # 1 亿像素（解码隔离的上限）
+    max_text_chars: int = 100_000
+    link_autofetch: bool = False  # 链接默认只记录不抓取（DESIGN §4.3）
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityPolicy:
+    """安全网关基线（DESIGN §6.4、§6.5）。
+
+    ``fail_closed_on_scan_error`` 是这里最重要的一项：扫描失败必须按「未通过」处理。
+    把它做成配置项而不是写死在代码里，是为了让「关掉它」成为一个显式的、能被审计的
+    决定，而不是某天有人在 except 里顺手 return True。
+    """
+
+    sniff_mime_by_magic: bool = True
+    fail_closed_on_scan_error: bool = True
+    exif_strip_gps: bool = True
+    exif_strip_serial: bool = True
+    exif_strip_author: bool = True
+    allow_svg: bool = False
+    allow_pdf_inline_render: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class JobSettings:
+    """队列节拍（DESIGN §2.3、§10.3）。"""
+
+    worker_concurrency: int = 2
+    batch_size: int = 20
+    max_attempts_default: int = 5
+    backoff_seconds: tuple[int, ...] = (30, 120, 480, 1800, 7200)
+
+    def backoff_for(self, attempts: int) -> int:
+        """第 ``attempts`` 次失败之后该等多久（秒）；超出表长时取最后一项。"""
+        if not self.backoff_seconds:
+            return 0
+        index = max(0, min(attempts - 1, len(self.backoff_seconds) - 1))
+        return self.backoff_seconds[index]
+
+
+def ingest_limits(config: Mapping[str, Any] | None = None) -> IngestLimits:
+    """从已加载的 ``config/app.yaml`` 取摄入限额；缺项用内置默认值。"""
+    section = _section(config, "ingest")
+    defaults = IngestLimits()
+    return IngestLimits(
+        max_media_bytes=_int_field(
+            section, "max_media_bytes", defaults.max_media_bytes, where="ingest"
+        ),
+        max_image_pixels=_int_field(
+            section, "max_image_pixels", defaults.max_image_pixels, where="ingest"
+        ),
+        max_text_chars=_int_field(
+            section, "max_text_chars", defaults.max_text_chars, where="ingest"
+        ),
+        link_autofetch=_bool_field(
+            section, "link_autofetch", defaults.link_autofetch, where="ingest"
+        ),
+    )
+
+
+def security_policy(config: Mapping[str, Any] | None = None) -> SecurityPolicy:
+    """从已加载的 ``config/app.yaml`` 取安全基线；缺项用内置默认值。"""
+    section = _section(config, "security")
+    defaults = SecurityPolicy()
+    return SecurityPolicy(
+        sniff_mime_by_magic=_bool_field(
+            section, "sniff_mime_by_magic", defaults.sniff_mime_by_magic, where="security"
+        ),
+        fail_closed_on_scan_error=_bool_field(
+            section,
+            "fail_closed_on_scan_error",
+            defaults.fail_closed_on_scan_error,
+            where="security",
+        ),
+        exif_strip_gps=_bool_field(
+            section, "exif_strip_gps", defaults.exif_strip_gps, where="security"
+        ),
+        exif_strip_serial=_bool_field(
+            section, "exif_strip_serial", defaults.exif_strip_serial, where="security"
+        ),
+        exif_strip_author=_bool_field(
+            section, "exif_strip_author", defaults.exif_strip_author, where="security"
+        ),
+        allow_svg=_bool_field(section, "allow_svg", defaults.allow_svg, where="security"),
+        allow_pdf_inline_render=_bool_field(
+            section,
+            "allow_pdf_inline_render",
+            defaults.allow_pdf_inline_render,
+            where="security",
+        ),
+    )
+
+
+def job_settings(config: Mapping[str, Any] | None = None) -> JobSettings:
+    """从已加载的 ``config/app.yaml`` 取队列节拍；缺项用内置默认值。"""
+    section = _section(config, "jobs")
+    defaults = JobSettings()
+    raw_backoff = section.get("backoff_seconds")
+    if raw_backoff is None:
+        backoff = defaults.backoff_seconds
+    elif not isinstance(raw_backoff, Sequence) or isinstance(raw_backoff, str):
+        raise AppConfigError(
+            f"config/app.yaml 的 jobs.backoff_seconds 必须是整数列表，实际是 {raw_backoff!r}。"
+        )
+    else:
+        values: list[int] = []
+        for item in raw_backoff:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+                raise AppConfigError(
+                    "config/app.yaml 的 jobs.backoff_seconds 必须都是 ≥ 1 的整数，"
+                    f"实际含 {item!r}。"
+                )
+            values.append(item)
+        if not values:
+            raise AppConfigError("config/app.yaml 的 jobs.backoff_seconds 不能是空列表。")
+        backoff = tuple(values)
+    return JobSettings(
+        worker_concurrency=_int_field(
+            section, "worker_concurrency", defaults.worker_concurrency, where="jobs"
+        ),
+        batch_size=_int_field(section, "batch_size", defaults.batch_size, where="jobs"),
+        max_attempts_default=_int_field(
+            section, "max_attempts_default", defaults.max_attempts_default, where="jobs"
+        ),
+        backoff_seconds=backoff,
+    )
+
+
+def config_warnings(config: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+    """报告 ``config/app.yaml`` 里缺失的段与键。
+
+    刻意只是提示：缺段会回落到内置默认值（这是**安全**的，默认值一律是保守的那一侧），
+    但「文件里少了东西」不该静默——那通常意味着有人删了段却没意识到它在生效。
+    """
+    if config is None:
+        return ()
+    messages: list[str] = []
+    for name, known_keys in APP_CONFIG_SECTIONS.items():
+        if name not in config or config[name] is None:
+            messages.append(f"config/app.yaml 缺少 {name} 段，将使用内置默认值。")
+            continue
+        section = config[name]
+        if not isinstance(section, Mapping):
+            continue
+        missing = sorted(key for key in known_keys if key not in section)
+        if missing:
+            messages.append(
+                f"config/app.yaml 的 {name} 段缺少这些键，将使用内置默认值：{', '.join(missing)}。"
+            )
+    return tuple(messages)
+
+
 def setting_seeds(
     registry: Mapping[str, SettingSpec], yaml_defaults: Mapping[str, Any] | None = None
 ) -> list[tuple[str, Any, str, str]]:
@@ -1171,6 +1471,8 @@ def _pyyaml_available() -> bool:
 
 
 __all__ = [
+    "APP_CONFIG_SECTIONS",
+    "APP_CONFIG_TOP_LEVEL",
     "COST_KINDS",
     "DEFAULT_APP_CONFIG_PATH",
     "DEFAULT_REGISTRY_PATH",
@@ -1183,7 +1485,10 @@ __all__ = [
     "SUPPORTED_TYPES",
     "AppConfigError",
     "ConfigError",
+    "IngestLimits",
+    "JobSettings",
     "ResolvedSetting",
+    "SecurityPolicy",
     "SettingChangePlan",
     "SettingSpec",
     "SettingsRegistryError",
@@ -1191,18 +1496,23 @@ __all__ = [
     "SettingsValueError",
     "app_default_warnings",
     "coerce_value",
+    "config_warnings",
     "describe_source",
     "dump_json",
     "env_override_key",
     "env_overrides",
     "env_overrides_by_key",
     "humanize_value",
+    "ingest_limits",
+    "job_settings",
     "key_from_env",
+    "load_app_config",
     "load_app_defaults",
     "load_registry",
     "plan_setting_change",
     "registry_index",
     "resolve",
+    "security_policy",
     "setting_seeds",
     "snapshot",
     "validate_value",

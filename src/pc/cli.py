@@ -52,9 +52,6 @@ _REQUIRED_DEPS: dict[str, str] = {
     "pydantic": "数据校验（实现阶段）",
 }
 
-#: 数据根目录下应当存在的子目录（实际位置由 resolve_db_path 决定，见 DESIGN §10.2）
-_RUNTIME_SUBDIRS: tuple[str, ...] = ("media", "thumbs", "cold", "quarantine", "backup", "models")
-
 
 def _force_utf8_stdio() -> None:
     """把标准输出/错误切到 UTF-8。
@@ -317,26 +314,47 @@ def cmd_config_seed(args: argparse.Namespace) -> int:
 
 
 def _doctor_runtime_dirs(root: Path) -> None:
-    """报告数据根目录及其子目录。
+    """报告数据根目录及其六个运行时目录，以及 L2 配置段的缺口。
 
-    刻意**不再**写死仓库相对的 ``data/``：从 PostgreSQL 换到 SQLite 之后，运行时
-    产物默认落在平台用户数据目录（DESIGN §10.2），仓库里的 ``data/`` 只有在你把
-    ``PC_DATA_ROOT`` 指过去时才会用到。写死路径会让人以为"数据在仓库里"。
+    用 ``db.resolve_paths()`` 作为唯一来源：运行时目录**跟着数据根目录**走，而不是
+    跟着数据库文件走——``PC__DB__PATH`` 只挪数据库文件本身（放进 SSD、放到挂载盘），
+    不该顺带把媒体本体也挪到别处（对象键不变、落盘位置变了，同样意味着老内容找不到）。
     """
-    try:
-        from pc.adapters import sqlite as db
+    from pc import config as cfg
+    from pc.adapters import sqlite as db
 
-        data_root = db.resolve_db_path(None).path.parent
-        source = db.resolve_db_path(None).source
+    try:
+        resolved = db.resolve_paths()
     except Exception as exc:  # pragma: no cover - 适配器不可导入时的兜底
         print(f"  · 无法解析数据根目录：{exc}")
         return
-    print(f"  数据根目录：{data_root}（来源 {source}）")
-    for name in _RUNTIME_SUBDIRS:
-        path = data_root / name
-        print(f"    {'✓' if path.is_dir() else '·'} {name}/")
-    if data_root != (root / "data"):
+
+    print(f"  数据根目录：{resolved.data_root}（来源 {resolved.root_source}）")
+    for name, path in resolved.paths.items():
+        source = resolved.sources[name]
+        # 默认派生路径不值得逐行重复打印；只有被显式指定过的才把落点写出来
+        explicit = not source.endswith(f"/{path.name}")
+        mark = "✓" if path.is_dir() else "·"
+        detail = f"/ → {path}（来源 {source}）" if explicit else "/"
+        print(f"    {mark} {name}{detail}")
+        # 容器里写 /data/media 是对的；在本机（Windows）却会落到当前盘符下的 \data\media，
+        # 这是个静默的落点错误，值得点名——路径本身没错，错的是它出现的环境。
+        if os.name == "nt" and explicit and not path.drive:
+            print(
+                "      ! 这个值看起来是容器/Unix 风格的路径，在 Windows 上会落到当前盘符；"
+                "本机运行请写成绝对路径（如 D:\\pc\\media）或留空让它从数据根目录派生"
+            )
+    if resolved.data_root != (root / "data"):
         print("  提示：仓库内的 data/ 只有把 PC_DATA_ROOT 指过去时才会用到。")
+
+    app_config = Path(root) / cfg.DEFAULT_APP_CONFIG_PATH
+    try:
+        warnings = cfg.config_warnings(cfg.load_app_config(app_config))
+    except cfg.ConfigError as exc:
+        print(f"  · 无法校验 {cfg.DEFAULT_APP_CONFIG_PATH}：{str(exc).splitlines()[0]}")
+        return
+    for message in warnings:
+        print(f"  · {message}")
 
 
 def _doctor_database_section() -> None:
