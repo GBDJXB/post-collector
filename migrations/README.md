@@ -6,7 +6,9 @@
 migrations/
 ├── sqlite/
 │   ├── 0001_init.sql                      ← 基线：34 张表 + 2 个 FTS5 虚拟表 + 6 个触发器
-│   └── 0002_content_hash_not_unique.sql   ← 文本的精确重复改为"归组"语义（见下）
+│   ├── 0002_content_hash_not_unique.sql   ← 文本的精确重复改为"归组"语义（见下）
+│   ├── 0003_message_media_refs.sql        ← 媒体引用落进信封，消息才可重放
+│   └── 0004_manual_source_and_origin_note.sql  ← 重建两张表放宽 kind/mode 枚举 + 备注列
 └── README.md                              本文件
 ```
 
@@ -87,6 +89,39 @@ uv run pc db apply --path <文件>   # 指定数据库文件（默认 <data_root
    FTS5 同步触发器。
 6. 改了索引/唯一性时，**同步改 `tests/test_schema_integration.py` 的结构断言**：
    那里是红线看守，它必须跟着事实走，而不是跟着旧文件走。
+7. 放宽 `CHECK` 枚举（例如给某个取值集合加一项）在 SQLite 里**做不到就地修改**，
+   只能重建表，做法见下一节。
+
+## 重建表（放宽 CHECK 枚举的唯一办法）
+
+SQLite 没有 `ALTER TABLE DROP CONSTRAINT`。要改一个 `CHECK`，只能：建临时表 →
+`INSERT ... SELECT *` → `DROP TABLE` 原表 → `ALTER TABLE ... RENAME TO` 原表名 →
+**重建索引与触发器**（它们跟着旧表一起没了）。
+
+`DROP TABLE` 在 `foreign_keys=ON` 时会做隐式 DELETE 并被子表的外键挡下，而
+`PRAGMA foreign_keys` 在事务内是空操作——所以这种迁移必须在文件里声明一条指令：
+
+```sql
+-- pc:foreign_keys=off
+```
+
+迁移器看到它就会：在 `BEGIN` **之前**关掉外键 → 照常在一个事务里执行 → **提交前**跑
+`PRAGMA foreign_key_check`（有违例就整体回滚并报出来）→ 结束后恢复 `foreign_keys=ON`。
+指令是注释，不参与结构指纹。**未知指令一律报错**：打错一个字母却静默失效，会让重建
+在开着外键的情况下跑，报出来的错与真正的原因差着十万八千里。
+
+约定与注意：
+
+- 临时表名一律以 **`_rebuild`** 结尾（`source_rebuild`）。表清单校验会忽略这个后缀，
+  另一条断言保证库里不会留下没改名的临时表。
+- `INSERT ... SELECT *` 依赖**列顺序完全一致**：临时表的 DDL 必须逐字复制原表，
+  只改那一处要改的 `CHECK`。`test_schema_integration` 里有一条断言把重建后的定义与
+  0001 的定义做逐字比对（只允许枚举那一处不同），手抄抄漏一列会被它抓住。
+- **不需要 `legacy_alter_table`**（本项目在 SQLite 3.50.4 上实测：开关两种设置都成功，
+  子表外键照样指向重建后的表）。外键子句只在运行时解析，指向一张暂时不存在的表不会让
+  `ALTER TABLE RENAME` 的 schema 重解析失败。真正需要它的是**视图与触发器**里引用旧
+  表名——本项目的这两张表上没有。万一将来某个重建牵扯到视图/触发器而报
+  `error in table ... after rename`，再来给指令加一个取值。
 
 ## 0002 为什么把 `content_hash` 的唯一性去掉
 

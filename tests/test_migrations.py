@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -206,5 +207,208 @@ def test_unknown_version_in_database_is_visible(tmp_path: Path) -> None:
         status = db.database_status(conn, tmp_path)
         assert status["migrations_unknown"] == (9,)
         assert status["ok"] is False, "库里出现未知版本时不能声称结构就绪"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 指令注释与表重建
+#
+# SQLite 改不了 CHECK 约束，只能重建表；而重建必须在关闭外键的情况下进行。这组测试
+# 钉住那套机制：指令被正确识别（打错字必须报错）、重建后数据与外键都还在、真出现
+# 外键违例时整体回滚、以及"没有指令就真的会失败"——最后一条证明指令不是装饰。
+# ---------------------------------------------------------------------------
+
+_PARENT_DDL = """
+CREATE TABLE parent (
+    parent_id INTEGER PRIMARY KEY,
+    name      TEXT    NOT NULL,
+    kind      TEXT    NOT NULL,
+    CONSTRAINT parent_kind_chk CHECK (kind IN ('one', 'two'))
+) STRICT;
+"""
+
+_CHILD_DDL = """
+CREATE TABLE child (
+    child_id  INTEGER PRIMARY KEY,
+    parent_id INTEGER NOT NULL REFERENCES parent (parent_id)
+) STRICT;
+"""
+
+_PARENT_INDEX = "CREATE INDEX parent_name_idx ON parent (name);"
+
+
+def _rebuild_sql(*, copy_where: str = "", directive: bool = True) -> str:
+    """一段"放宽 parent.kind 枚举"的重建迁移。"""
+    header = "-- pc:foreign_keys=off\n" if directive else ""
+    return (
+        header
+        + """
+CREATE TABLE parent_rebuild (
+    parent_id INTEGER PRIMARY KEY,
+    name      TEXT    NOT NULL,
+    kind      TEXT    NOT NULL,
+    CONSTRAINT parent_kind_chk CHECK (kind IN ('one', 'two', 'three'))
+) STRICT;
+INSERT INTO parent_rebuild SELECT * FROM parent COPY_WHERE;
+DROP TABLE parent;
+ALTER TABLE parent_rebuild RENAME TO parent;
+"""
+        + _PARENT_INDEX
+        + "\n"
+    ).replace("COPY_WHERE", copy_where)
+
+
+def _seed(tmp_path: Path) -> Any:
+    """建一个"老 schema + 一行父 + 一行子"的库，返回连接。"""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir(exist_ok=True)
+    _write(migrations, 1, "init", f"{_PARENT_DDL}{_CHILD_DDL}{_PARENT_INDEX}")
+    conn = _connect(tmp_path)
+    db.apply_migration(conn, migrations)
+    conn.execute("INSERT INTO parent (name, kind) VALUES ('a', 'one')")
+    conn.execute("INSERT INTO child (parent_id) VALUES (1)")
+    return conn
+
+
+class TestDirectiveParsing:
+    def test_off_is_recognized(self) -> None:
+        assert db.migration_directives("-- pc:foreign_keys=off\nSELECT 1;") == {
+            "foreign_keys": "off"
+        }
+
+    def test_spaces_around_equals_are_tolerated(self) -> None:
+        assert db.migration_directives("--   pc:foreign_keys = off  \nSELECT 1;") == {
+            "foreign_keys": "off"
+        }
+
+    def test_typo_in_the_name_is_rejected(self) -> None:
+        """打错一个字母必须报错：静默失效会让重建在开着外键时跑，报的错与原因无关。"""
+        with pytest.raises(db.MigrationError, match="无法识别的指令注释"):
+            db.migration_directives("-- pc:foreign_key=off\nSELECT 1;")
+
+    def test_unknown_value_is_rejected(self) -> None:
+        with pytest.raises(db.MigrationError, match="取值不认识"):
+            db.migration_directives("-- pc:foreign_keys=on\nSELECT 1;")
+
+    def test_directive_does_not_affect_the_checksum(self) -> None:
+        """指令是注释：往文件里加它不该让结构指纹漂移。"""
+        body = "CREATE TABLE probe (a INTEGER);"
+        assert db.migration_checksum(f"-- pc:foreign_keys=off\n{body}") == db.migration_checksum(body)
+
+    def test_no_directive_means_no_directive(self) -> None:
+        assert db.migration_directives("-- 普通注释\nSELECT 1;") == {}
+
+
+class TestTableRebuild:
+    def test_rebuild_keeps_rows_and_widens_the_check(self, tmp_path: Path) -> None:
+        conn = _seed(tmp_path)
+        try:
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql())
+            result = db.apply_migration(conn, tmp_path / "migrations")
+            assert result["applied"] == [2]
+
+            assert conn.execute("SELECT count(*) FROM parent").fetchone()[0] == 1
+            assert tuple(conn.execute("SELECT name, kind FROM parent").fetchone()) == ("a", "one")
+            # 新取值现在被接受，旧取值当然还接受
+            conn.execute("INSERT INTO parent (name, kind) VALUES ('b', 'three')")
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO parent (name, kind) VALUES ('c', 'four')")
+        finally:
+            conn.close()
+
+    def test_rebuild_keeps_the_child_foreign_key_working(self, tmp_path: Path) -> None:
+        """重建父表之后，子表的外键必须仍然指向它——否则约束就静默失效了。"""
+        conn = _seed(tmp_path)
+        try:
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql())
+            db.apply_migration(conn, tmp_path / "migrations")
+            assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO child (parent_id) VALUES (999)")
+        finally:
+            conn.close()
+
+    def test_rebuild_restores_the_indexes(self, tmp_path: Path) -> None:
+        conn = _seed(tmp_path)
+        try:
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql())
+            db.apply_migration(conn, tmp_path / "migrations")
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'parent'"
+                )
+            }
+            assert "parent_name_idx" in names, "重建时漏了索引——它跟着旧表一起被删掉了"
+        finally:
+            conn.close()
+
+    def test_foreign_keys_is_restored_afterwards(self, tmp_path: Path) -> None:
+        conn = _seed(tmp_path)
+        try:
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql())
+            db.apply_migration(conn, tmp_path / "migrations")
+            assert db.pragma_value(conn, "foreign_keys") == "1", "迁移结束后外键必须恢复为 ON"
+        finally:
+            conn.close()
+
+    def test_rebuild_without_the_directive_fails(self, tmp_path: Path) -> None:
+        """没有指令就真的会失败——这条证明指令不是装饰，也解释了它为什么存在。"""
+        conn = _seed(tmp_path)
+        try:
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql(directive=False))
+            with pytest.raises(db.MigrationError):
+                db.apply_migration(conn, tmp_path / "migrations")
+            # 失败要干净：旧表原样、版本没记账、外键仍是开的
+            assert conn.execute("SELECT count(*) FROM parent").fetchone()[0] == 1
+            assert db.applied_versions(conn) == {1}
+            assert db.pragma_value(conn, "foreign_keys") == "1"
+        finally:
+            conn.close()
+
+    def test_foreign_key_violation_rolls_the_whole_migration_back(self, tmp_path: Path) -> None:
+        """重建把父行丢了 → 子行变成孤儿 → 提交前的 foreign_key_check 必须拦下并回滚。"""
+        conn = _seed(tmp_path)
+        try:
+            # 只拷 parent_id > 1 的行，于是 child 里那一行成了孤儿
+            _write(tmp_path / "migrations", 2, "rebuild", _rebuild_sql(copy_where="WHERE parent_id > 1"))
+            with pytest.raises(db.MigrationError, match="外键违例"):
+                db.apply_migration(conn, tmp_path / "migrations")
+            assert conn.execute("SELECT count(*) FROM parent").fetchone()[0] == 1, (
+                "整体回滚之后旧表必须原样还在"
+            )
+            assert conn.execute("SELECT count(*) FROM child").fetchone()[0] == 1
+            assert db.applied_versions(conn) == {1}
+            assert db.pragma_value(conn, "foreign_keys") == "1"
+        finally:
+            conn.close()
+
+    def test_rebuild_failure_does_not_hide_behind_the_restore(self, tmp_path: Path) -> None:
+        """重建失败时，报出来的必须是**重建的错误**，而不是恢复 PRAGMA 时顺带发现的错。
+
+        这条防的是：`finally` 里的恢复动作把原始异常顶掉，排查方向被带偏。
+        """
+        conn = _seed(tmp_path)
+        try:
+            broken = _rebuild_sql() + "THIS IS NOT SQL;\n"
+            _write(tmp_path / "migrations", 2, "rebuild", broken)
+            with pytest.raises(db.MigrationError) as excinfo:
+                db.apply_migration(conn, tmp_path / "migrations")
+            assert "THIS IS NOT SQL" in str(excinfo.value) or "near" in str(excinfo.value)
+            assert "无法把 foreign_keys" not in str(excinfo.value)
+        finally:
+            conn.close()
+
+
+def test_set_foreign_keys_refuses_inside_a_transaction(tmp_path: Path) -> None:
+    """``PRAGMA foreign_keys`` 在事务里是空操作——必须被检出，而不是假装成功。"""
+    conn = _connect(tmp_path)
+    try:
+        with (
+            pytest.raises(db.MigrationError, match="无法把 foreign_keys 切到 OFF"),
+            db.transaction(conn),
+        ):
+            db.set_foreign_keys(conn, False)
     finally:
         conn.close()

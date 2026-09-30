@@ -713,6 +713,89 @@ def _append_statement(statements: list[str], raw: str) -> None:
     statements.append(statement)
 
 
+# ---------------------------------------------------------------------------
+# 迁移文件的指令注释
+#
+# 有些 schema 改动在 SQLite 里**做不到**就地修改，最典型的是放宽 CHECK 约束：
+# 没有 ALTER TABLE DROP CONSTRAINT，只能重建表（建新表 → 拷数据 → 删旧表 → 改名）。
+# 而重建必须在**外键关闭**时进行，否则 DROP 旧表会做隐式 DELETE 并被子表的外键挡下。
+#
+# `PRAGMA foreign_keys` 在事务内是空操作，而迁移器保证"一个文件一个事务"——所以这条
+# 指令必须是**声明式的**：迁移器在 BEGIN 之前关掉外键，提交前用 foreign_key_check
+# 兜底，结束后恢复（恢复失败不掩盖真正的迁移错误）。迁移文件里仍然不允许任何
+# PRAGMA 语句。
+#
+# 顺带记一条实测结论，省得后来者再照抄文档：**本项目不需要 `legacy_alter_table`**。
+# SQLite 3.50.4 上开关两种设置下重建都成功，子表外键照样指向重建后的表——外键子句
+# 只在运行时解析，指向一张暂时不存在的表不会让 `ALTER TABLE RENAME` 的 schema
+# 重解析失败。真正需要它的是**视图与触发器**里引用旧表名，而这两张表上没有。
+# ---------------------------------------------------------------------------
+
+#: 指令注释：``-- pc:<名字> = <取值>``（整行）
+_DIRECTIVE_PATTERN = re.compile(r"^--\s*pc:([a-z_]+)\s*=\s*(\S+)\s*$", re.MULTILINE)
+
+#: 已知指令及其允许取值。**未知指令一律报错**——打错一个字母就静默失效，
+#: 会让"重建表"在开着外键的情况下执行，报出来的错与真正的原因差着十万八千里。
+KNOWN_DIRECTIVES: dict[str, frozenset[str]] = {"foreign_keys": frozenset({"off"})}
+
+
+def migration_directives(sql: str) -> dict[str, str]:
+    """解析迁移文件里的指令注释。
+
+    Raises:
+        MigrationError: 出现未知指令或未知取值。
+    """
+    directives: dict[str, str] = {}
+    for match in _DIRECTIVE_PATTERN.finditer(sql):
+        name, value = match.group(1), match.group(2)
+        allowed = KNOWN_DIRECTIVES.get(name)
+        if allowed is None:
+            raise MigrationError(
+                f"迁移文件里有无法识别的指令注释：-- pc:{name}={value}\n"
+                f"  已知指令：{', '.join(sorted(KNOWN_DIRECTIVES))}。"
+            )
+        if value not in allowed:
+            raise MigrationError(
+                f"指令 -- pc:{name}={value} 的取值不认识；"
+                f"允许：{', '.join(sorted(allowed))}。"
+            )
+        directives[name] = value
+    return directives
+
+
+def set_foreign_keys(conn: sqlite3.Connection, enabled: bool) -> None:
+    """切换 ``foreign_keys`` 并**确认它真的生效**。
+
+    `PRAGMA foreign_keys` 在事务里是空操作；如果这里不校验，重建迁移会在开着外键的
+    情况下继续跑，然后在 `DROP TABLE` 处报一个与真实原因无关的错。
+    """
+    conn.execute(f"PRAGMA foreign_keys = {'ON' if enabled else 'OFF'}")
+    is_on = _pragma_is_on(conn, "foreign_keys")
+    if is_on != enabled:
+        raise MigrationError(
+            f"无法把 foreign_keys 切到 {'ON' if enabled else 'OFF'}"
+            f"（当前 {'ON' if is_on else 'OFF'}）。\n"
+            "  `pc:foreign_keys=off` 指令必须在事务之外生效——迁移器会在 BEGIN 之前调用它。"
+        )
+
+
+def _pragma_is_on(conn: sqlite3.Connection, name: str) -> bool:
+    """读一个布尔型 PRAGMA。它返回的是 0/1，不是 ``ON``/``OFF``。"""
+    raw = (pragma_value(conn, name) or "0").strip().upper()
+    return raw in {"1", "ON", "TRUE", "YES"}
+
+
+def check_foreign_keys(conn: sqlite3.Connection, name: str) -> None:
+    """提交前的安全网：重建表之后必须没有外键违例（SQLite 官方 12 步流程的最后一步）。"""
+    rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if rows:
+        detail = "；".join(f"{row[0]} 第 {row[1]} 行 → {row[2]}" for row in rows[:5])
+        raise MigrationError(
+            f"{name} 执行后存在外键违例，已整体回滚：{detail}"
+            + ("（还有更多）" if len(rows) > 5 else "")
+        )
+
+
 def public_tables(conn: sqlite3.Connection) -> set[str]:
     """当前库里的**基础表**名。
 
@@ -948,10 +1031,17 @@ def apply_migration(
             continue
 
         statements = split_statements(migration.path.read_text(encoding="utf-8"))
+        directives = migration_directives(migration.path.read_text(encoding="utf-8"))
+        rebuild = directives.get("foreign_keys") == "off"
         try:
+            if rebuild:
+                # 必须在 BEGIN 之前：PRAGMA foreign_keys 在事务内是空操作
+                set_foreign_keys(conn, False)
             with transaction(conn):
                 for statement in statements:
                     conn.execute(statement)
+                if rebuild:
+                    check_foreign_keys(conn, migration.name)
                 _record_migration(conn, migration.version, migration.name, checksum)
         except MigrationError:
             raise
@@ -960,6 +1050,16 @@ def apply_migration(
                 f"应用 {migration.name} 失败，已在单事务内整体回滚，该版本未被记账。\n"
                 f"  之前成功的版本仍然有效（每个文件一个事务）。\n原始错误：{exc}"
             ) from exc
+        finally:
+            if rebuild:
+                # 恢复失败**不能掩盖**真正的迁移错误（否则排查会被带偏到错误的方向）；
+                # 只有本来没有异常在途时，才把恢复失败抛出去。
+                in_flight = sys.exc_info()[0] is not None
+                try:
+                    set_foreign_keys(conn, True)
+                except MigrationError:
+                    if not in_flight:  # pragma: no cover - 罕见路径
+                        raise
         applied.append(migration.version)
         statements_total += len(statements)
 
@@ -1382,6 +1482,7 @@ __all__ = [
     "DEFERRED_TABLES",
     "EXPECTED_TABLES",
     "FTS_VIRTUAL_TABLES",
+    "KNOWN_DIRECTIVES",
     "MIN_SQLITE_VERSION",
     "PRAGMA_BASELINE",
     "RUNTIME_DIR_SPECS",
@@ -1400,6 +1501,7 @@ __all__ = [
     "apply_migration",
     "backup_filename",
     "backup_to",
+    "check_foreign_keys",
     "connect",
     "database_file_of",
     "database_status",
@@ -1412,6 +1514,7 @@ __all__ = [
     "is_fts_shadow_table",
     "latest_migration_version",
     "migration_checksum",
+    "migration_directives",
     "migration_state",
     "now_iso",
     "open_db",
@@ -1424,6 +1527,7 @@ __all__ = [
     "resolve_db_path",
     "resolve_paths",
     "seed_settings",
+    "set_foreign_keys",
     "settings_revision",
     "split_statements",
     "sqlite_version_ok",

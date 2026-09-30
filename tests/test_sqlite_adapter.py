@@ -304,12 +304,20 @@ class TestNames:
 
 class TestTableInventory:
     def test_matches_tables_declared_in_migration(self) -> None:
-        """清单与迁移文件必须同步；只改一边时这条测试会红。"""
-        declared = set(
-            re.findall(
+        """清单与迁移文件必须同步；只改一边时这条测试会红。
+
+        **重建用的临时表**（以 ``_rebuild`` 结尾）不算 —— SQLite 改不了 CHECK，只能
+        建临时表、拷数据、删旧表、改名。约定写在 ``migrations/README.md``：临时表一律
+        以 ``_rebuild`` 结尾，且必须在同一个文件里改名成正式表。改名漏了的话，
+        ``test_schema_integration`` 里"库里不该有 _rebuild 表"那条会红。
+        """
+        declared = {
+            name
+            for name in re.findall(
                 r"(?m)^CREATE TABLE (?:IF NOT EXISTS )?([a-z_][a-z0-9_]*)", _read_migration()
             )
-        )
+            if not name.endswith("_rebuild")
+        }
         assert declared == set(db.EXPECTED_TABLES)
 
     def test_expected_shape(self) -> None:

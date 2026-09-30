@@ -26,6 +26,7 @@ EXPECTED_MIGRATION_NAMES = {
     1: "0001_init.sql",
     2: "0002_content_hash_not_unique.sql",
     3: "0003_message_media_refs.sql",
+    4: "0004_manual_source_and_origin_note.sql",
 }
 
 
@@ -127,6 +128,94 @@ def test_red_line_constraints_present(applied_schema: Any) -> None:
     assert "nsfw_level BETWEEN 0 AND 4" in content_sql
     assert "status IN ('active', 'quarantined', 'archived', 'deleted')" in content_sql
     assert "submission_tier IN (0, 1, 2)" in content_sql
+
+
+def test_source_kind_set_includes_manual(applied_schema: Any) -> None:
+    """``kind`` 的取值集合在 0004 里被放宽过一次，放宽这件事必须有人确认。
+
+    这条断言同时钉住"放宽了什么"：六个值一个不多、一个不少。少了 ``manual``
+    就等于 root 手工上传这条路又断了。
+    """
+    sql = _object_sql(applied_schema, "source", "table")
+    assert "CONSTRAINT source_kind_chk" in sql
+    values = "kind IN ('bot_api', 'webhook', 'rss', 'export', 'user_api', 'manual')"
+    assert values in sql, f"source.kind 的取值集合不符：{sql}"
+
+
+def test_authorization_modes_include_root_self(applied_schema: Any) -> None:
+    """``root_self``：授权来自 root 本人在场操作，与"我导出了平台数据"是两件事。"""
+    sql = _object_sql(applied_schema, "source_authorization", "table")
+    assert "CONSTRAINT source_authorization_mode_chk" in sql
+    values = "mode IN ('owner_token', 'admin_consent', 'public_feed', 'manual_export', 'root_self')"
+    assert values in sql, f"source_authorization.mode 的取值集合不符：{sql}"
+
+
+def test_rebuilt_tables_differ_from_0001_only_in_the_enum(applied_schema: Any) -> None:
+    """重建本质上是**手抄 0001 的 DDL**，这条断言防的就是抄漏一列或抄错一个默认值。
+
+    做法：把 0001 里那两处枚举 CHECK 替换成 0004 的版本，然后与库里的实际定义比对
+    （去注释、去引号、折叠空白后逐字比较）。除了那一处枚举，任何差异都会让它红。
+    """
+    import re
+
+    text = (db.DEFAULT_MIGRATIONS_DIR / "0001_init.sql").read_text(encoding="utf-8")
+
+    def normalize(sql: str) -> str:
+        # 去掉行注释、引号与空白差异；SQLite 存进 sqlite_master 时不带结尾分号
+        sql = re.sub(r"--[^\n]*", "", sql)
+        collapsed = " ".join(sql.replace('"', "").split())
+        return collapsed[:-1] if collapsed.endswith(";") else collapsed
+
+    def ddl_of(source_text: str, table: str) -> str:
+        match = re.search(rf"CREATE TABLE {table} \(.*?\) STRICT;", source_text, flags=re.S)
+        assert match is not None, f"0001 里找不到 {table} 的建表语句"
+        return match.group(0)
+
+    expected_source = ddl_of(text, "source").replace(
+        "CHECK (kind IN ('bot_api', 'webhook', 'rss', 'export', 'user_api'))",
+        "CHECK (kind IN ('bot_api', 'webhook', 'rss', 'export', 'user_api', 'manual'))",
+    )
+    actual_source = applied_schema.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source'"
+    ).fetchone()[0]
+    assert normalize(actual_source) == normalize(expected_source), (
+        "重建后的 source 与 0001 的差异不止 kind 枚举——手抄时改坏了别的东西"
+    )
+
+    expected_authz = ddl_of(text, "source_authorization").replace(
+        "CHECK (mode IN ('owner_token', 'admin_consent', 'public_feed', 'manual_export'))",
+        "CHECK (mode IN ('owner_token', 'admin_consent', 'public_feed', 'manual_export', 'root_self'))",
+    )
+    actual_authz = applied_schema.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_authorization'"
+    ).fetchone()[0]
+    assert normalize(actual_authz) == normalize(expected_authz), (
+        "重建后的 source_authorization 与 0001 的差异不止 mode 枚举"
+    )
+
+
+def test_message_origin_note_is_nullable(applied_schema: Any) -> None:
+    """备注是"我后来想起来了"的钩子：可空、不参与任何唯一约束。"""
+    columns = {row[1]: row for row in applied_schema.execute("PRAGMA table_info(message)")}
+    assert "origin_note" in columns, "message.origin_note 列不存在（0004 没生效？）"
+    assert columns["origin_note"][3] == 0, "origin_note 必须是可空列（notnull=0）"
+
+    index_names = {
+        row[0] for row in applied_schema.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
+    assert not any("origin_note" in str(name) for name in index_names), (
+        "备注不该进索引：它是人写的自由文本，不是检索维度"
+    )
+
+
+def test_no_rebuild_scratch_table_survives(applied_schema: Any) -> None:
+    """重建用的临时表（``*_rebuild``）必须在同一个迁移里改名成正式表。
+
+    这条是"重建漏了改名"的兜底：表清单校验会忽略 ``*_rebuild``（否则任何重建都会
+    让清单对不上），所以必须有另一条断言保证它没有留在库里。
+    """
+    leftovers = sorted(name for name in db.public_tables(applied_schema) if name.endswith("_rebuild"))
+    assert leftovers == [], f"重建临时表没改名就留下了：{leftovers}"
 
 
 def test_content_hash_index_is_partial_but_not_unique(applied_schema: Any) -> None:
