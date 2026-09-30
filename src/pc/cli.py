@@ -758,6 +758,8 @@ def cmd_source_add(args: argparse.Namespace) -> int:
     if info["kind"] in PLANNED_KINDS:
         print(f"  · 注意：kind={info['kind']} 的实现还没落地（{PLANNED_KINDS[info['kind']]}）")
         print(f"    现在能用的只有：{'、'.join(sorted(SUPPORTED_KINDS))}")
+    elif info["authorization_mode"] == "root_self":
+        print("  · 这个来源不需要凭证：授权来自操作者本人在场（`pc upload` 会直接用它）")
     return 0
 
 
@@ -803,6 +805,60 @@ def cmd_source_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_local_connector(connector: Any, source: Any, *, command: str) -> bool:
+    """授权校验 + 拉取型校验；不过关就打印人话并返回 False。
+
+    ``pc import`` 与 ``pc upload`` 共用：这两条命令的差别只在"来源怎么来"，授权与
+    "能不能拉取"的判据必须完全一致。
+    """
+    if not connector.authorize():
+        print(
+            f"  ✗ 来源「{source['name']}」未通过授权校验："
+            "凭证 / 授权范围 / 授权证明三者不齐备（DESIGN §1.3）",
+            file=sys.stderr,
+        )
+        return False
+    if not connector.capabilities().get("supports_pull", False):
+        print(f"  ✗ 该来源是推送型，不能用 {command} 拉取", file=sys.stderr)
+        return False
+    return True
+
+
+def _ingest_loop(
+    conn: Any,
+    source: Any,
+    connector: Any,
+    *,
+    dry_run: bool,
+    limit: int | None,
+    origin_note: str | None = None,
+) -> tuple[Any, int]:
+    """按批 ``list_new`` → 落库（或 dry-run 计数），返回 ``(报告, 扫描到的消息数)``。
+
+    ``pc import`` 与 ``pc upload`` 共用这一段：取字节之后的流程必须一模一样，否则
+    两条路会各自漂移。差别只在调用前怎么构造连接器、传不传 ``origin_note``。
+    """
+    from pc.services import ingest as ingest_service
+
+    report = ingest_service.IngestReport()
+    cursor: str | None = None
+    scanned = 0
+    while True:
+        messages, cursor = connector.list_new(cursor)
+        if not messages:
+            break
+        scanned += len(messages)
+        if dry_run:
+            report = report.merge(ingest_service.IngestReport(seen=len(messages)))
+        else:
+            report = report.merge(
+                ingest_service.ingest_messages(conn, source, messages, origin_note=origin_note)
+            )
+        if limit and scanned >= limit:
+            break
+    return report, scanned
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     """把本地文件导入库：落信封并入队（L2），``--process`` 时接着跑 worker（L3）。"""
     from pc import config as cfg
@@ -813,7 +869,6 @@ def cmd_import(args: argparse.Namespace) -> int:
         connector_for,
         source_config,
     )
-    from pc.services import ingest as ingest_service
     from pc.services import sources as sources_service
 
     resolved, paths = _db_and_paths(args)
@@ -849,39 +904,15 @@ def cmd_import(args: argparse.Namespace) -> int:
                 max_media_bytes=limits.max_media_bytes,
                 max_text_chars=limits.max_text_chars,
             )
-            if not connector.authorize():
-                print(
-                    f"  ✗ 来源「{source['name']}」未通过授权校验："
-                    "凭证 / 授权范围 / 授权证明三者不齐备（DESIGN §1.3）",
-                    file=sys.stderr,
-                )
+            if not _prepare_local_connector(connector, source, command="pc import"):
                 return 2
 
             capabilities = connector.capabilities()
             print(f"[导入] 来源「{source['name']}」（{capabilities['kind']}）")
             print(f"  目录：{'、'.join(capabilities['roots'])}")
-            if not capabilities.get("supports_pull", False):
-                print("  ✗ 该来源是推送型，不能用 pc import 拉取", file=sys.stderr)
-                return 2
-
-            report = ingest_service.IngestReport()
-            cursor: str | None = None
-            scanned = 0
-            while True:
-                messages, cursor = connector.list_new(cursor)
-                if not messages:
-                    break
-                scanned += len(messages)
-                if args.dry_run:
-                    report = report.merge(
-                        ingest_service.IngestReport(seen=len(messages))
-                    )
-                else:
-                    report = report.merge(
-                        ingest_service.ingest_messages(conn, source, messages)
-                    )
-                if args.limit and scanned >= args.limit:
-                    break
+            report, _scanned = _ingest_loop(
+                conn, source, connector, dry_run=args.dry_run, limit=args.limit
+            )
     except (
         db.DatabaseError,
         sources_service.SourceError,
@@ -901,6 +932,138 @@ def cmd_import(args: argparse.Namespace) -> int:
     )
     if not args.process:
         print("    接着处理：uv run pc work（或下次直接加 --process）")
+        return 0
+
+    print()
+    with db.open_db(resolved.path, expect_exists=True) as conn:
+        worker = _build_worker(conn, paths, root, worker_id=args.worker_id)
+        work = worker.run_once()
+    _print_work_report(work, prefix="  ")
+    return 0
+
+
+def _print_skipped(skipped: Any) -> None:
+    """报告"跳过了哪些文件、为什么"——跳过不能是静默的。"""
+    if not skipped:
+        return
+    print(f"  · 跳过 {len(skipped)} 个文件（内容身份不成立）：")
+    for name, reason in list(skipped)[:5]:
+        print(f"      {name} —— {reason}")
+    if len(skipped) > 5:
+        print(f"      …还有 {len(skipped) - 5} 个")
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    """root 手工上传：一条命令把文件丢进库。
+
+    与 ``pc import`` 的差别是刻意的（都写在 DESIGN §1.3 的那张表里）：
+
+    * **来源可以省略**：默认用（必要时新建）「manual」这个"来源待补"的归档桶；
+    * **身份按内容哈希**：重传同一份内容不会变成两条，改名换目录也算同一条；
+    * ``--note`` 记下"这是从哪儿弄来的"（可选，写在 ``message.origin_note``）；
+    * **默认接着处理**：媒体引用存的是文件路径，你手一快把原文件删了，任务就只能死信。
+    """
+    from pc import config as cfg
+    from pc.adapters import sqlite as db
+    from pc.adapters.registry import (
+        SourceConfigError,
+        UnsupportedSourceKindError,
+        connector_for,
+    )
+    from pc.services import sources as sources_service
+
+    resolved, paths = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+
+    requested = [Path(item).expanduser() for item in args.paths]
+    missing = [str(item) for item in requested if not item.exists()]
+    if missing:
+        print(f"  ✗ 找不到这些路径：{'、'.join(missing)}", file=sys.stderr)
+        return 2
+
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_repo_root()
+    app_config = _load_app_config(root)
+    limits = cfg.ingest_limits(app_config)
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            if args.source:
+                source = sources_service.require_source(conn, args.source)
+                if source.get("kind") != "manual":
+                    print(
+                        f"  ✗ 来源「{source['name']}」的 kind 是 {source.get('kind')}，不是 manual。\n"
+                        "    手工上传按**内容**定身份（重传同一份内容不会变成两条）；别的 kind 按路径\n"
+                        "    定身份，同一张图换个名字重传就会多出一条。\n"
+                        "    要么别加 --source（用默认的「manual」来源），"
+                        "要么 `pc source add <名字> --kind manual` 建一个。",
+                        file=sys.stderr,
+                    )
+                    return 2
+                created = False
+            else:
+                ensured = sources_service.ensure_manual_source(conn)
+                source = ensured["source"]
+                created = bool(ensured["created"])
+
+            authorizations = sources_service.load_authorizations(conn, int(source["source_id"]))
+            # **扫描范围就是这次给的路径**（`pc upload a.jpg` 只处理 a.jpg）。合并进
+            # source.config 的 roots 是给 worker 用的（它在另一个时刻按来源构造连接器），
+            # 但**不能**拿来当本次的扫描范围：那样第二次上传一个文件会把以前传过的路径
+            # 全部重扫一遍，报告里冒出"重复 N 条"，N 还不是你这次给的数量。
+            requested_roots = [str(item) for item in requested]
+            if not args.dry_run:
+                sources_service.merge_roots(conn, source, requested_roots)
+
+            connector = connector_for(
+                source,
+                authorizations,
+                roots=requested_roots,
+                max_media_bytes=limits.max_media_bytes,
+                max_text_chars=limits.max_text_chars,
+            )
+            if not _prepare_local_connector(connector, source, command="pc upload"):
+                return 2
+
+            capabilities = connector.capabilities()
+            print(
+                f"[上传] 来源「{source['name']}」"
+                f"（{capabilities['kind']}，身份={capabilities['identity']}）"
+                + ("，本次新建" if created else "")
+            )
+            print(f"  需要凭证：{'是' if capabilities.get('requires_credential') else '否'}")
+            if args.note:
+                print(f"  备注：{args.note}")
+            report, _scanned = _ingest_loop(
+                conn,
+                source,
+                connector,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                origin_note=args.note,
+            )
+            # 跳过清单是连接器的报告属性（不是端口契约的一部分），取不到就当没有
+            skipped = getattr(connector, "skipped", ())
+    except (
+        db.DatabaseError,
+        sources_service.SourceError,
+        UnsupportedSourceKindError,
+        SourceConfigError,
+    ) as exc:
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return 2
+
+    _print_skipped(skipped)
+    if args.dry_run:
+        print(f"  · dry-run：发现 {report.seen} 个文件，未写任何行。去掉 --dry-run 才会真正上传。")
+        return 0
+
+    print(
+        f"  ✓ 新消息 {report.inserted} 条，重复（已存在）{report.duplicates} 条，"
+        f"入队 {report.enqueued} 个任务"
+    )
+    if not args.process:
+        print("    接着处理：uv run pc work（或下次直接去掉 --no-process）")
         return 0
 
     print()
@@ -974,7 +1137,7 @@ def cmd_item_list(args: argparse.Namespace) -> int:
 
     sql = [
         "SELECT c.content_id, c.item_type, c.status, s.name AS source, c.ordinal,",
-        "       c.byte_size, c.char_count, c.text_content,",
+        "       c.byte_size, c.char_count, c.text_content, m.origin_note,",
         "       (SELECT count(*) FROM content_media cm WHERE cm.content_id = c.content_id) AS media_count,",
         "       (SELECT m.sha256 FROM content_media cm JOIN media m ON m.media_id = cm.media_id",
         "         WHERE cm.content_id = c.content_id LIMIT 1) AS sha256,",
@@ -1019,6 +1182,9 @@ def cmd_item_list(args: argparse.Namespace) -> int:
             summary = f"媒体 {row['sha256'][:12]}…（{_human_size(row['byte_size'])}）"
         else:
             summary = "（空）"
+        note = str(row["origin_note"] or "").replace("\n", " ")
+        if len(note) > 24:
+            note = note[:24] + "…"
         table.append(
             [
                 row["content_id"],
@@ -1028,10 +1194,13 @@ def cmd_item_list(args: argparse.Namespace) -> int:
                 summary,
                 row["scan_status"] or "-",
                 row["media_count"],
+                note or "-",
                 row["created_at"],
             ]
         )
-    _print_table(["id", "类型", "状态", "来源", "内容", "扫描", "媒体", "建库时间"], table)
+    _print_table(
+        ["id", "类型", "状态", "来源", "内容", "扫描", "媒体", "备注", "建库时间"], table
+    )
     print(f"  共 {total} 个内容项（上面显示最近 {len(rows)} 条）")
     return 0
 
@@ -1136,8 +1305,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_source_add.add_argument(
         "--kind",
         default="export",
-        choices=["export", "bot_api", "webhook", "rss", "user_api"],
-        help="来源类型（默认 export：本地文件/官方导出目录）",
+        choices=["export", "manual", "bot_api", "webhook", "rss", "user_api"],
+        help="来源类型（export=本地文件/官方导出目录；manual=root 手工上传）",
     )
     p_source_add.add_argument(
         "--trust", type=int, default=1, choices=[1, 2, 3], help="信任级别：1=自有 2=已授权群 3=外部"
@@ -1148,9 +1317,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_source_add.add_argument(
         "--authorize",
-        default="manual_export",
-        choices=["manual_export", "owner_token", "admin_consent", "public_feed"],
-        help="授权取得方式（默认 manual_export：自己的导出与文件）",
+        default=None,
+        choices=["manual_export", "root_self", "owner_token", "admin_consent", "public_feed"],
+        help="授权取得方式（留空按 kind 取默认：manual→root_self，其余→manual_export）",
     )
     p_source_add.add_argument("--evidence", help="授权证明留档：文件路径 / 链接 / 截图哈希")
     p_source_add.add_argument("--expires-at", help="授权到期时间（ISO-8601，留空表示不过期）")
@@ -1172,6 +1341,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--root", help="仓库根目录（默认自动查找，用于读 config/app.yaml）")
     p_import.add_argument("--path", help=db_path_help)
     p_import.set_defaults(func=cmd_import)
+
+    p_upload = sub.add_parser(
+        "upload", help="root 手工上传：身份按内容，时间留空（重传不会变成两条）"
+    )
+    p_upload.add_argument("paths", nargs="+", help="文件或目录（目录会递归扫描）")
+    p_upload.add_argument(
+        "--source", help="来源名称或 source_id（留空用默认的「manual」来源，必要时自动建）"
+    )
+    p_upload.add_argument(
+        "--note", help="来源备注（可选）：这条内容是从哪儿弄来的，写在 message.origin_note"
+    )
+    p_upload.add_argument(
+        "--process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="上传后立刻跑 worker 处理（默认开；用 --no-process 分开跑）",
+    )
+    p_upload.add_argument("--limit", type=int, help="最多扫描这么多条（调试用）")
+    p_upload.add_argument("--dry-run", action="store_true", help="只报告会发现什么，不写任何行")
+    p_upload.add_argument("--worker-id", help="处理阶段的 worker 标识")
+    p_upload.add_argument("--root", help="仓库根目录（默认自动查找，用于读 config/app.yaml）")
+    p_upload.add_argument("--path", help=db_path_help)
+    p_upload.set_defaults(func=cmd_upload)
 
     p_work = sub.add_parser("work", help="跑 worker：取字节、扫描、去重、落库")
     p_work.add_argument("--once", action="store_true", help="只处理一条")

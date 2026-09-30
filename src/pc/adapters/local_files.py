@@ -152,17 +152,28 @@ class LocalFilesConnector:
     # -- 发现的文件 ---------------------------------------------------------
 
     def discover(self) -> list[DiscoveredFile]:
-        """扫描全部根目录，返回**稳定排序**的文件列表。
+        """扫描全部根，返回**稳定排序**的文件列表。
+
+        一个根**可以是一个文件**（``pc upload a.jpg`` / ``pc import a.jpg``）：那就只产出
+        它自己，``relative`` 取文件名。这不是特例而是必要——把文件当根、再去 ``rglob``，
+        一个文件都发现不了（``Path("a.jpg").rglob("*")`` 是空的），于是"导入单个文件"会
+        静默地什么都不做。命令行因此可以原样把用户给的路径当根，而不必偷偷换成它们的
+        父目录（换成父目录会把整个目录都导进来，那是另一种误伤）。
 
         跳过：隐藏文件与隐藏目录（``.`` 开头）、符号链接（防环，也防"导出包里指向
         ``/etc`` 的链接"）、非普通文件。跳过不是静默的：``capabilities()`` 里写明了规则。
         """
         found: list[DiscoveredFile] = []
         for label, root in zip(self._root_labels, self._roots, strict=True):
-            if not root.exists():
+            if not root.exists() or root.is_symlink():
                 continue
-            for path in root.rglob("*"):
-                relative = path.relative_to(root)
+            if root.is_file():
+                candidates = [(root, Path(root.name))]
+            else:
+                candidates = [
+                    (path, path.relative_to(root)) for path in root.rglob("*")
+                ]
+            for path, relative in candidates:
                 if any(part.startswith(".") for part in relative.parts):
                     continue
                 if path.is_symlink() or not path.is_file():
@@ -209,7 +220,7 @@ class LocalFilesConnector:
 
     @property
     def skipped(self) -> tuple[tuple[str, str], ...]:
-        """``list_new`` 跳过的文件与原因（去重、按路径排序）。**只为报告，不是状态机。**"""
+        """``list_new`` 跳过的文件（路径）与原因，去重、按路径排序。**只为报告。**"""
         seen: dict[str, str] = {}
         for relative, reason in self._skipped:
             seen.setdefault(relative, reason)
@@ -310,7 +321,9 @@ class LocalFilesConnector:
                     if item.size_bytes == 0
                     else "只剩空白的文本：规范化后没有内容，无法构成内容身份"
                 )
-                self._skipped.append((item.msg_id, reason))
+                # 报**路径**而不是 msg_id：内容身份模式下 msg_id 是一串哈希，对人没用；
+                # 而且文件根时 msg_id 会长成 "a.jpg/a.jpg"（根标签与文件名相同）。
+                self._skipped.append((str(item.path), reason))
                 return None
             platform_msg_id = identity
             sent_at = None

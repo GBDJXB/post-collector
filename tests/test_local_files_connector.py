@@ -103,6 +103,36 @@ class TestDiscovery:
         found = {item.relative for item in _connector(samples).discover()}
         assert "link.jpg" not in found, "符号链接可能指到来源目录之外，一律跳过"
 
+    def test_a_file_root_yields_exactly_that_file(self, samples: Path) -> None:
+        """根可以是一个**文件**：``pc upload a.jpg`` 就该只处理 a.jpg。
+
+        这条曾经是缺陷：``Path("a.jpg").rglob("*")`` 是空的，所以"导入单个文件"会静默地
+        什么都不做。修法是把文件根当成"就这一个文件"，而**不是**把根换成它的父目录——
+        换父目录会把整个目录都导进来，那是另一种误伤。
+        """
+        connector = _connector(samples / "cat.jpg")
+        found = connector.discover()
+        assert [item.relative for item in found] == ["cat.jpg"]
+        assert found[0].path == samples / "cat.jpg"
+
+    def test_a_file_root_does_not_pull_in_its_directory(self, samples: Path) -> None:
+        found = {item.relative for item in _connector(samples / "cat.jpg").discover()}
+        assert found == {"cat.jpg"}, "整个目录不该跟着进来"
+
+    def test_both_root_kinds_can_be_mixed(self, samples: Path) -> None:
+        connector = _connector(samples / "dog.png")
+        connector_dirs = _connector(samples)
+        assert {item.relative for item in connector_dirs.discover()} >= {"dog.png", "cat.jpg"}
+        assert [item.relative for item in connector.discover()] == ["dog.png"]
+
+    def test_a_symlinked_file_root_is_skipped(self, samples: Path) -> None:
+        link = samples / "link-root.jpg"
+        try:
+            os.symlink(samples / "cat.jpg", link)
+        except (OSError, NotImplementedError):
+            pytest.skip("本机不允许创建符号链接（Windows 需要开发者模式）")
+        assert _connector(link).discover() == []
+
 
 class TestListNew:
     def test_batches_follow_the_cursor(self, samples: Path) -> None:
@@ -448,7 +478,7 @@ class TestContentIdentitySkips:
             _messages, cursor = connector.list_new(cursor)
             if cursor in (None, "3"):
                 break
-        assert [item[0].split("/")[-1] for item in connector.skipped] == [
+        assert [item[0].split(os.sep)[-1] for item in connector.skipped] == [
             "empty-a.txt",
             "empty-b.txt",
         ]
