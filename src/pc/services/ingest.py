@@ -80,16 +80,23 @@ def ingest_messages(
     messages: Sequence[SourceMessage],
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    origin_note: str | None = None,
 ) -> IngestReport:
     """把一批信封落库并入队。
 
     ``source`` 必须是 ``source`` 表的一行：``source_id`` 与 ``trust_level`` 都会写进
     ``message``（``source_trust`` 是**摄入当时**的门控副本，来源后来的信任级别变化
     不该改写历史判定）。
+
+    ``origin_note`` 是**调用方注解**，不是平台信封的一部分：它回答"这批内容是我从哪儿弄来的"
+    （``pc upload --note "某个群里的"``），整批套用同一个值，写进 ``message.origin_note``。
+    平台的"转自哪里"走 ``forward_chain``，两者不是一回事；备注**不进 ``raw_payload``**
+    （那是原始载荷的自证，掺进人写的东西就不可信了）。
     """
     source_id = int(source["source_id"])
     trust = source.get("trust_level")
     trust_value = int(trust) if trust is not None else None
+    note = (origin_note or "").strip() or None
     report = IngestReport()
     size = max(1, int(batch_size))
 
@@ -98,7 +105,7 @@ def ingest_messages(
         with transaction(conn):
             for message in chunk:
                 report = report.merge(
-                    _ingest_one(conn, source_id, trust_value, message)
+                    _ingest_one(conn, source_id, trust_value, message, note)
                 )
     return report
 
@@ -108,14 +115,15 @@ def _ingest_one(
     source_id: int,
     trust_value: int | None,
     message: SourceMessage,
+    origin_note: str | None = None,
 ) -> IngestReport:
     payload_hash = raw_payload_hash(message.raw_payload)
     row = conn.execute(
         "INSERT INTO message ("
         "  uuid, source_id, platform_msg_id, platform_thread_id, sender_display_name,"
         "  sender_is_bot, sent_at, message_type, text_raw, reply_to_platform_id, permalink,"
-        "  forward_chain, media_refs, raw_payload_hash, source_trust"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "  forward_chain, media_refs, raw_payload_hash, source_trust, origin_note"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (source_id, platform_msg_id) DO NOTHING "
         "RETURNING message_id",
         (
@@ -134,6 +142,7 @@ def _ingest_one(
             json.dumps(list(message.media_refs), ensure_ascii=False),
             payload_hash,
             trust_value,
+            origin_note,
         ),
     ).fetchone()
 

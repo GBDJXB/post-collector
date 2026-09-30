@@ -8,11 +8,18 @@
   本模块，不会散落到业务代码里；
 * 授权行（``source_authorization``）在这里交给连接器，连接器本身**不碰数据库**。
 
+**凭证是"按需"的，不是所有来源都要**：连接器在 ``capabilities()`` 里用
+``requires_credential`` 如实声明。本地的两类来源（``export`` / ``manual``）声明 ``False``
+——它们的授权来自手工导出或操作者本人在场，没有平台凭证这回事，因此**不需要占位凭证**；
+平台型来源必须声明 ``True``，并且在 ``credential_secret`` 表与系统密钥库落地之前无法实现
+（DESIGN §6.1，附录 A 第 15 项）。给不需要凭证的来源塞一张空凭证，会让审计表里出现
+"看着验证过、其实什么都没有"的记录，将来无法区分。
+
 新增一个平台的步骤（写成清单是为了让"留够接口"这件事可核对）：
 
 1. 在 ``pc/adapters/`` 下写一个类，实现 :class:`pc.ports.Connector` 的方法子集，
    并在 ``capabilities()`` 里如实声明 ``supports_pull`` / ``supports_push`` /
-   ``supports_media_fetch``；
+   ``supports_media_fetch`` / ``requires_credential``；
 2. 在下面的 ``SUPPORTED_KINDS`` 里登记它的 ``kind``，并在 ``_build`` 里接上；
 3. 不支持的接入方式（浏览器会话劫持、私有接口逆向、付费墙绕过）**不要实现**，
    这条写在 DESIGN §1.3 里，是设计决定而不是待办。
@@ -25,12 +32,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from pc.adapters.local_files import LocalFilesConnector
+from pc.adapters.local_files import IDENTITY_CONTENT, LocalFilesConnector
 from pc.ports.ingest import Connector
 
 #: 已实现的来源类型 → 说明。``kind`` 的取值集合由 ``source.source_kind_chk`` 约束。
 SUPPORTED_KINDS: dict[str, str] = {
-    "export": "本地文件 / 官方导出目录（手工上传与导包导入共用同一实现）",
+    "export": "本地文件 / 官方导出目录：身份按相对路径，时间取文件 mtime",
+    "manual": "root 手工上传：身份按内容哈希，时间留空（来源待补的正式归档桶）",
 }
 
 #: 尚未实现但设计上支持的来源类型 → 说明（报错时列出来，避免"这个 kind 到底支不支持"的猜测）
@@ -135,7 +143,7 @@ def _build(
     if not resolved_roots:
         raise SourceConfigError(
             f"来源「{source.get('name')}」没有可用的目录：在 source.config 里写 "
-            '{"roots": ["D:/导出/2024"]}，或在命令行把路径传给 pc import。'
+            '{"roots": ["D:/导出/2024"]}，或在命令行把路径传给 pc import / pc upload。'
         )
 
     options: dict[str, Any] = {}
@@ -146,10 +154,18 @@ def _build(
     if max_text_chars is not None:
         options["max_text_chars"] = max_text_chars
 
-    # kind 目前只有 'export'；分支写成显式映射，新增类型时必须在这里接上（漏接会报错，
-    # 而不是静默退化成别的实现）。
+    # kind 的分派写成显式映射：新增类型时必须在这里接上，漏接会报错，而不是静默退化成
+    # 别的实现。两种本地来源是同一个类、两种身份策略（见 local_files 的模块文档）。
     if kind == "export":
         return LocalFilesConnector(source, authorizations, roots=resolved_roots, **options)
+    if kind == "manual":
+        return LocalFilesConnector(
+            source,
+            authorizations,
+            roots=resolved_roots,
+            identity=IDENTITY_CONTENT,
+            **options,
+        )
     raise UnsupportedSourceKindError(  # pragma: no cover - SUPPORTED_KINDS 与 _build 必须同步
         f"{kind} 登记为已支持，但 _build 里没有对应分支（这是缺陷，不是配置问题）"
     )

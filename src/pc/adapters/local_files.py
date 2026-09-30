@@ -1,13 +1,41 @@
 """本地文件连接器（DESIGN §1.3、§9.1：``Connector`` 的第一个实现）。
 
-服务的是阶段 1 的入口：**官方导出导入 + 手工上传**。语义刻意简单到没有歧义：
+服务的是阶段 1 的两个入口：**官方导出导入**（``pc import``）与 **root 手工上传**
+（``pc upload``）。两者的取字节逻辑完全一样，差别只有**身份怎么定**——所以这里是
+同一个实现、两种身份策略，而不是两个类：
 
-* 一个文件一条消息；同名侧车文本（``cat.jpg`` + ``cat.txt``）合成一条 ``mixed`` 消息，
-  这正是"图 + 配文"在平台上的样子，也让导入层能验证一条消息含多个内容项；
-* ``platform_msg_id`` 用**相对路径**，所以同一个文件重复导入是幂等的（唯一约束挡在
-  摄入层），换个路径再导一次则被视为另一条消息——去重交给内容哈希，不靠路径；
+``identity="path"``（导出/目录导入）
+  一个文件一条消息；``platform_msg_id`` 用**相对路径**（``根标签/相对路径``），所以同一个
+  文件重复导入是幂等的，换个路径再导一次算另一条消息。``sent_at`` 取文件 mtime——导出包
+  里的文件时间是有意义的线索。适合"把一个目录整体导进来"。
+
+``identity="content"``（root 手工上传）
+  一个文件一条消息；``platform_msg_id`` 由**内容**决定（见下），所以同一份内容重传是幂等的，
+  改名、换目录都不影响。``sent_at`` **留空**：手工上传的文件 mtime 是下载/复制/解压的时间，
+  拿它冒充"发布时间"是假数据。适合"我随手把几个文件放进来"。
+
+两种策略共同的规则：
+
+* 同名侧车文本（``cat.jpg`` + ``cat.txt``）合成一条 ``mixed`` 消息，这正是"图 + 配文"在
+  平台上的样子，也让导入层能验证一条消息含多个内容项；
 * 文本文件（``.txt`` / ``.md``）作为纯文本消息入库，媒体文件作为媒体消息；
 * 其余一切都当作**待扫描的媒体**：类型对不对由扫描器按魔数判定，不由扩展名判定。
+
+内容身份的构造规则（``upload:`` 前缀 + 冒号连接的组件）：
+
+===================  ==========================================
+单张图                ``upload:<字节的 sha256>``
+纯文本                ``upload:<规范化文本的 sha256>``
+图 + 配文             ``upload:<媒体 sha256>:<文本 sha256>``
+===================  ==========================================
+
+组件用的就是内容层已经在用的那两个哈希：媒体是 ``media.sha256``，文本是
+``content_item.content_hash``（``sha256(normalize_text(原文))``）的口径。**两处用同一套
+判据**，只差空白的文本文件因此会被认成同一条，而不是先分裂成两条再靠 dup_group 归组。
+
+**内容为空的文件不产生消息**（空文件、只剩空白的文本文件）：它们没有可用的身份组件，而
+"所有空文件的哈希都相同"会让它们互相顶掉——那是最难查的一类静默丢数据。跳过的文件记在
+``skipped`` 里供命令行报告，不是静默丢弃。
 
 刻意不做的事：解析 Telegram / QQ / 微信的导出格式。那是**同一端口上的另一个实现**
 （``list_new`` 的游标语义换成"读到 JSON 数组的第几条"即可），不是本类的分支——把它塞进
@@ -16,6 +44,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from pc.adapters.sqlite import now_iso
-from pc.domain import MediaTooLargeError, SourceMessage
+from pc.domain import MediaTooLargeError, SourceMessage, normalize_text
 
 #: 视为"纯文本内容"的扩展名
 TEXT_SUFFIXES: frozenset[str] = frozenset({".txt", ".md", ".markdown"})
@@ -33,6 +62,17 @@ SIDECAR_SUFFIXES: tuple[str, ...] = (".txt", ".md", ".markdown")
 
 #: 一次 ``list_new`` 最多返回多少条
 DEFAULT_BATCH_SIZE = 200
+
+#: 身份策略：``platform_msg_id`` 由路径还是由内容决定
+IDENTITY_PATH = "path"
+IDENTITY_CONTENT = "content"
+IDENTITIES: frozenset[str] = frozenset({IDENTITY_PATH, IDENTITY_CONTENT})
+
+#: 内容身份的前缀，让两种身份在库里一眼可辨（``upload:...`` vs ``根标签/相对路径``）
+CONTENT_ID_PREFIX = "upload:"
+
+#: 流式哈希的分块大小（内容身份要读一遍字节，但不该把整个文件读进内存）
+HASH_CHUNK_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +113,17 @@ class LocalFilesConnector:
         batch_size: int = DEFAULT_BATCH_SIZE,
         max_media_bytes: int = 52_428_800,
         max_text_chars: int = 100_000,
+        identity: str = IDENTITY_PATH,
     ) -> None:
         if not roots:
             raise ValueError(
                 "本地文件来源至少要有一个目录；请在 source.config 的 roots 里写，"
                 "或在命令行把路径传给 pc import。"
+            )
+        if identity not in IDENTITIES:
+            raise ValueError(
+                f"未知的身份策略 identity={identity!r}；"
+                f"可用：{'、'.join(sorted(IDENTITIES))}"
             )
         self._source = source
         self._authorizations = tuple(authorizations)
@@ -85,6 +131,12 @@ class LocalFilesConnector:
         self._batch_size = max(1, int(batch_size))
         self._max_media_bytes = int(max_media_bytes)
         self._max_text_chars = int(max_text_chars)
+        self._identity = identity
+        # 内容身份需要读一遍字节。``list_new`` 是按批调用的，而 ``discover()`` 每批都重扫
+        # 整个目录——没有缓存的话，一个大目录会被反复哈希成 O(n²)。缓存键带 mtime_ns，
+        # 文件被改动时自然失效。
+        self._hash_cache: dict[tuple[str, int, int], str] = {}
+        self._skipped: list[tuple[str, str]] = []
         self._root_labels = self._make_root_labels()
 
     def _make_root_labels(self) -> tuple[str, ...]:
@@ -140,6 +192,9 @@ class LocalFilesConnector:
         游标就是序号：它不承诺文件集合不变（新文件插到中间会让序号位移），所以**发现
         新消息的兜底始终是内容哈希去重**，而不是游标本身。这一点写在这里，免得后来者
         以为游标是可靠的增量水位。
+
+        内容身份下，**内容为空的文件不会出现在返回值里**——它们没有可用的身份组件。
+        跳过了哪些、为什么，看 :attr:`skipped`。
         """
         files = self.discover()
         try:
@@ -149,22 +204,38 @@ class LocalFilesConnector:
         if start >= len(files):
             return (), str(len(files))
         batch = files[start : start + self._batch_size]
-        return tuple(self._to_message(item) for item in batch), str(start + len(batch))
+        messages = [message for item in batch if (message := self._to_message(item)) is not None]
+        return tuple(messages), str(start + len(batch))
+
+    @property
+    def skipped(self) -> tuple[tuple[str, str], ...]:
+        """``list_new`` 跳过的文件与原因（去重、按路径排序）。**只为报告，不是状态机。**"""
+        seen: dict[str, str] = {}
+        for relative, reason in self._skipped:
+            seen.setdefault(relative, reason)
+        return tuple(sorted(seen.items()))
 
     def capabilities(self) -> dict[str, Any]:
+        skip_rules = ["隐藏文件与隐藏目录（. 开头）", "符号链接", "非普通文件"]
+        if self._identity == IDENTITY_CONTENT:
+            skip_rules.append("内容为空的文件（空文件、只剩空白的文本）")
         return {
             "platform": self._source.get("platform"),
             "kind": self._source.get("kind"),
             "supports_pull": True,
             "supports_push": False,
             "supports_media_fetch": True,
+            # 凭证需求由实现自己声明：本地文件的授权来自"操作者在场"或"手工导出"，
+            # 没有平台凭证这回事。平台型连接器必须声明 True（见 registry 的模块文档）。
+            "requires_credential": False,
+            "identity": self._identity,
             "history": "all-local",
             "message_types": ["text", "media", "mixed"],
             "max_attachment_bytes": self._max_media_bytes,
             "supports_edit_events": False,
             "supports_delete_events": False,
             "cursor": "文件在稳定排序（根目录标签 + 相对路径）后的序号",
-            "skip_rules": ["隐藏文件与隐藏目录（. 开头）", "符号链接", "非普通文件"],
+            "skip_rules": skip_rules,
             "roots": [str(root) for root in self._roots],
         }
 
@@ -219,15 +290,37 @@ class LocalFilesConnector:
 
     def parse_event(self, payload: dict[str, Any]) -> Sequence[SourceMessage]:
         raise NotImplementedError(
-            "本地文件来源是拉取型：请用 list_new（命令行是 `pc import`），不支持事件推送。"
+            "本地文件来源是拉取型：请用 list_new（命令行是 `pc import` 或 `pc upload`），"
+            "不支持事件推送。"
         )
 
     # -- 内部 ---------------------------------------------------------------
 
-    def _to_message(self, item: DiscoveredFile) -> SourceMessage:
+    def _to_message(self, item: DiscoveredFile) -> SourceMessage | None:
+        """把一个发现的文件变成信封；内容身份下无法成立身份时返回 ``None``（并记账跳过）。"""
         text = self._read_text(item)
         is_text_file = item.path.suffix.lower() in TEXT_SUFFIXES
         media_refs: tuple[str, ...] = () if is_text_file else (str(item.path),)
+
+        if self._identity == IDENTITY_CONTENT:
+            identity = self._content_identity(item, text=text, has_media=bool(media_refs))
+            if identity is None:
+                reason = (
+                    "0 字节的文件：空字节无法构成内容身份"
+                    if item.size_bytes == 0
+                    else "只剩空白的文本：规范化后没有内容，无法构成内容身份"
+                )
+                self._skipped.append((item.msg_id, reason))
+                return None
+            platform_msg_id = identity
+            sent_at = None
+            time_note = "内容身份模式下 sent_at 留空：mtime 只是文件系统线索，不是发布时间"
+        else:
+            platform_msg_id = item.msg_id
+            # 本地文件的 mtime 是**唯一可用的时间线索**，但它不是"这条内容发布的时间"：
+            # 复制、下载、解压都会改 mtime。写进 raw_payload 让来源可追溯。
+            sent_at = _iso_from_timestamp(item.mtime)
+            time_note = "sent_at 取自文件 mtime，不是真实发布时间"
 
         if media_refs and text:
             message_type = "mixed"
@@ -238,22 +331,61 @@ class LocalFilesConnector:
 
         return SourceMessage(
             source_id=int(self._source["source_id"]),
-            platform_msg_id=item.msg_id,
+            platform_msg_id=platform_msg_id,
             message_type=message_type,
-            # 本地文件的 mtime 是**唯一可用的时间线索**，但它不是"这条内容发布的时间"：
-            # 复制、下载、解压都会改 mtime。写进 raw_payload 让来源可追溯。
-            sent_at=_iso_from_timestamp(item.mtime),
+            sent_at=sent_at,
             text_raw=text,
             media_refs=media_refs,
             raw_payload={
                 "kind": "local_file",
+                "identity": self._identity,
                 "path": item.msg_id,
                 "absolute_path": str(item.path),
                 "size_bytes": item.size_bytes,
                 "mtime": _iso_from_timestamp(item.mtime),
-                "note": "sent_at 取自文件 mtime，不是真实发布时间",
+                "note": time_note,
             },
         )
+
+    def _content_identity(
+        self, item: DiscoveredFile, *, text: str | None, has_media: bool
+    ) -> str | None:
+        """按内容算出 ``platform_msg_id``；没有可用的身份组件时返回 ``None``。
+
+        组件的取法与内容层一致：媒体用字节的 sha256（等于 ``media.sha256``），文本用
+        ``sha256(normalize_text(原文))``（等于 ``content_item.content_hash``）。
+
+        **0 字节的文件一律不产生消息**（文本或媒体都一样）：所有空文件的哈希都是同一个值，
+        拿它当身份会让它们互相顶掉。这不会丢内容——媒体的同名侧车文本本身就是
+        ``TEXT_SUFFIXES`` 里的文件，会被 ``discover()`` 单独发现、作为纯文本消息入库。
+        """
+        if item.size_bytes == 0:
+            return None
+        components: list[str] = []
+        if has_media:
+            components.append(self._hash_file(item.path))
+        if text is not None:
+            normalized = normalize_text(text)
+            if normalized:
+                components.append(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+        if not components:
+            return None
+        return CONTENT_ID_PREFIX + ":".join(components)
+
+    def _hash_file(self, path: Path) -> str:
+        """流式算文件字节的 sha256（带缓存，见 ``__init__`` 里的说明）。"""
+        stat = path.stat()
+        key = (str(path), stat.st_size, int(stat.st_mtime_ns))
+        cached = self._hash_cache.get(key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(HASH_CHUNK_BYTES):
+                digest.update(chunk)
+        value = digest.hexdigest()
+        self._hash_cache[key] = value
+        return value
 
     def _read_text(self, item: DiscoveredFile) -> str | None:
         """文本文件读自己；媒体文件找同名侧车（``cat.jpg`` + ``cat.txt``）。"""
@@ -279,4 +411,14 @@ class LocalFilesConnector:
         return text
 
 
-__all__ = ["DEFAULT_BATCH_SIZE", "SIDECAR_SUFFIXES", "TEXT_SUFFIXES", "DiscoveredFile", "LocalFilesConnector"]
+__all__ = [
+    "CONTENT_ID_PREFIX",
+    "DEFAULT_BATCH_SIZE",
+    "IDENTITIES",
+    "IDENTITY_CONTENT",
+    "IDENTITY_PATH",
+    "SIDECAR_SUFFIXES",
+    "TEXT_SUFFIXES",
+    "DiscoveredFile",
+    "LocalFilesConnector",
+]

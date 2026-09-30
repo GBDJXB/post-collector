@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 本地文件连接器 → L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**451 条 + 1 条环境跳过、4.6 秒、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 本地文件连接器 → L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**487 条 + 1 条环境跳过、5 秒、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **451 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（4.6 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **487 条 + 1 条跳过，全部在临时目录上跑：不依赖任何外部服务**（5 秒内跑完）。唯一那条 skip 是"符号链接被跳过"——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -85,10 +85,10 @@ post-collector/
 | `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定；`Connector` 的取字节与推送两条路已补齐，其余无实现 |
 | `src/pc/domain.py` | 状态取值、传输结构与跨层错误（`MediaTooLargeError` / `SourceNotAuthorizedError`）；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
-| `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器、连接器工厂 | 可用（单元测试覆盖） |
-| `src/pc/services/` | 来源登记（source + authorization 同生共死）、L2 摄入（幂等落信封 + 入队）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
+| `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
+| `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端与项目根解析 + 迁移器 + 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 451 条 + 1 条跳过（Windows 无符号链接权限），4.6 秒全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端与项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 487 条 + 1 条跳过（Windows 无符号链接权限），5 秒全绿 |
 
 ## 边界约束
 
@@ -106,6 +106,8 @@ post-collector/
 - `ModelProvider` 必须支持「仅本地」模式：缺模型是正常状态，不是故障，管线跳过而非产生失败任务。
 - 外部内容永远是数据、永不进入指令位置；模型输出不能直接触发写操作。
 - **连接器只有两条路，且必须自己声明走哪条**：拉取型实现 `list_new`，推送型实现 `parse_event`，另一条抛 `NotImplementedError`；`capabilities()` 里的 `supports_pull` / `supports_push` / `supports_media_fetch` 是调用方唯一的判据（微信/QQ 这类回调型来源与 Telegram 这类拉取型来源因此产出同一个信封）。
+- **凭证按需，不造占位凭证**：`capabilities()` 里的 `requires_credential` 声明本来源要不要平台凭证。本地两类（`export` / `manual`）声明 `False`——它们的授权来自手工导出或操作者本人在场；平台型必须声明 `True`，并且在 `credential_secret` 表与系统密钥库落地前**无法实现**（`pc db status` 之外没有任何地方需要它们）。给不需要凭证的来源塞一张空凭证，会让审计里出现"看着验证过、其实什么都没有"的记录，将来无法区分真验证与占位。真正拦截调用的是 `authorize()`，统一语义是"**本来源所需的授权条件是否满足**"。
+- **同一端口可以有多套身份策略**：`kind='export'` 按相对路径定身份（`platform_msg_id = 根标签/相对路径`，时间取 mtime），`kind='manual'` 按内容定身份（`upload:<媒体 sha256>[:<文本 sha256>]`，`sent_at` 留空）。两者共用同一个连接器实现，靠构造参数区分——**不要**为"又一种上传入口"写第二个类，那会把取字节/扫描/限流的逻辑复制一遍。
 - **适配器不自己开数据库连接**：连接器由 `pc.adapters.registry.connector_for()` 构造，来源行与它的授权行由服务层读好后注入，`authorize()` 只对注入的记录做判断。凭证解密将来也只加在 `registry.py` 这一处（DESIGN §6.1）。
 - **扫描是 fail closed 的**：`MagicNumberScanner` 对未知类型、压缩包、可执行文件、PDF、脚本一律 `passed=False`，把 SVG 与"扩展名与魔数不符"标成 `gray=True`；`passed=False` 的含义是"不许直接落盘"，调用方应当隔离并开复核任务，**不是丢弃**。
 
@@ -149,6 +151,9 @@ post-collector/
 - **隔离区是独立的存储后端行**：扫描不通过的字节写进 `quarantine_root` 并记 `storage_backend_id = local-quarantine`、`quarantine_key` 非空。`media.object_key` 因此**是相对所属后端根目录的键**——判断"这份字节在主存储还是隔离区"要看 `quarantine_key`，不能只看 `object_key`。
 - **`text_content` 存原文、`text_search` 刻意留空**：`text_search` 的契约是"应用层分词结果，空格连接"（DESIGN §5.1）；本切片没有分词器，塞进未分词原文只会让 `content_word` 里出现一个巨大的单 token。词级检索随检索切片一起接，届时**要覆盖这一列**（不是只在插入时写）。trigram 索引已经在 `text_content` 上工作，所以 ≥3 字符的子串检索今天是可用的；<3 字符命中 0 行（§5.1 已实测）。
 - **`pc import` 必须把目录持久化进 `source.config["roots"]`**：worker 在另一个时刻取字节，它只读那里；目录只活在命令行参数里的话，导入能成功而处理阶段拿不到引用（无法续跑）。`--dry-run` 除外——它什么都不写。
+- **内容身份用的就是内容层那两个哈希**：媒体取字节的 `sha256`（等于 `media.sha256`），文本取 `sha256(normalize_text(原文))`（等于 `content_item.content_hash`）。两处同一套判据，只差空白的文本文件因此算同一条，而不是先分裂成两条再靠 `dup_group_id` 归组。**0 字节的文件一律不产生消息**——所有空文件的哈希是同一个值，拿它当身份会让它们互相顶掉；这不会丢内容，媒体的同名侧车文本本身就是文本文件、会被单独发现（有测试钉着这个坑）。
+- **`pc upload` 的媒体引用是绝对路径，所以默认立刻处理**：`media_refs` 存的是文件路径，用户上传完把原文件删掉/移走，任务就只能死信。`pc upload` 因此默认接着跑 worker（`--no-process` 才是分开跑），与 `pc import` 的默认值刻意相反。
+- **`message.origin_note` 是调用方注解，不是平台信封的一部分**：它回答"这批内容我从哪儿弄来的"，整批套用同一个值；平台的"转自哪里"走 `forward_chain`。备注**不进 `raw_payload`**（那是原始载荷的自证哈希），也不用去动 `SourceMessage`。
 - 规范化（`pc.domain.normalize_text`）只做**无损**变换（NFKC + 空白折叠），且必须幂等：它的结果进 `content_hash`，是文本精确去重的分组键，不确定就会让同一份内容分裂成两份。
 
 **性能预算（回归红线）**

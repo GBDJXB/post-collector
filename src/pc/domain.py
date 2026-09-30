@@ -134,12 +134,18 @@ class StorageClass(StrEnum):
 
 
 class AuthzMode(StrEnum):
-    """授权的取得方式；每个来源必须三者齐备才可入库（DESIGN §1.3）。"""
+    """授权的取得方式；每个来源必须三者齐备才可入库（DESIGN §1.3）。
+
+    ``ROOT_SELF`` 与 ``MANUAL_EXPORT`` 的区别是刻意的：前者是"授权来自 root **本人**
+    在操作"（手工上传自己的文件），后者是"我导出了平台数据"。审计要能分清这两件事，
+    所以不用一张占位凭证把前者糊过去。
+    """
 
     OWNER_TOKEN = "owner_token"
     ADMIN_CONSENT = "admin_consent"
     PUBLIC_FEED = "public_feed"
     MANUAL_EXPORT = "manual_export"
+    ROOT_SELF = "root_self"
 
 
 class SettingsSource(StrEnum):

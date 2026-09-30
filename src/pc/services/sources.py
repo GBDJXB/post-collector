@@ -21,7 +21,7 @@ from pc.adapters.registry import SourceConfigError, source_config
 from pc.adapters.sqlite import now_iso, transaction
 
 #: ``source.kind`` 的合法取值（与 ``source_kind_chk`` 一致）
-SOURCE_KINDS: tuple[str, ...] = ("bot_api", "webhook", "rss", "export", "user_api")
+SOURCE_KINDS: tuple[str, ...] = ("bot_api", "webhook", "rss", "export", "user_api", "manual")
 
 #: ``source_authorization.mode`` 的合法取值（与 CHECK 一致）
 AUTHORIZATION_MODES: tuple[str, ...] = (
@@ -29,7 +29,27 @@ AUTHORIZATION_MODES: tuple[str, ...] = (
     "admin_consent",
     "public_feed",
     "manual_export",
+    "root_self",
 )
+
+#: 每个 kind 的默认授权方式。``manual`` 的授权来自 **root 本人在场操作**，不是平台凭证，
+#: 所以它跟"我导出了平台数据"（``manual_export``）是两个不同的说法（DESIGN §1.3、§6.1）。
+KIND_DEFAULT_AUTHZ: dict[str, str] = {
+    "manual": "root_self",
+    "export": "manual_export",
+}
+
+#: 认不出 kind 时用的兜底默认值
+DEFAULT_AUTHORIZATION_MODE = "manual_export"
+
+#: root 手工上传的默认来源名（ASCII、稳定、可脚本化）；``pc upload`` 第一次运行会自动建它
+MANUAL_SOURCE_NAME = "manual"
+
+#: 手工来源的 platform 标签：它不是任何平台
+MANUAL_SOURCE_PLATFORM = "local"
+
+#: 手工来源的授权证明：授权就是"root 本人把文件放进来"这个动作本身
+MANUAL_SOURCE_EVIDENCE = "root 本地上传：授权来自操作者本人在场，无外部凭证"
 
 
 class SourceError(RuntimeError):
@@ -50,6 +70,11 @@ def _require_mode(mode: str) -> str:
     return mode
 
 
+def default_authorization_mode(kind: str) -> str:
+    """没显式指定授权方式时用哪个。只按 ``kind`` 决定，别处不再重复这套规则。"""
+    return KIND_DEFAULT_AUTHZ.get(kind, DEFAULT_AUTHORIZATION_MODE)
+
+
 def create_source(
     conn: sqlite3.Connection,
     *,
@@ -59,7 +84,7 @@ def create_source(
     trust_level: int = 1,
     external_ref: str | None = None,
     config: Mapping[str, Any] | None = None,
-    authorization_mode: str = "manual_export",
+    authorization_mode: str | None = None,
     scope: Mapping[str, Any] | None = None,
     evidence_ref: str | None = None,
     granted_by: int | None = None,
@@ -68,9 +93,12 @@ def create_source(
     """建来源并同时写下它的授权记录，返回 ``{source_id, authz_id, ...}``。
 
     ``trust_level``：1=可信自有、2=已授权群、3=外部不确定。手工上传自己的文件属于 1。
+
+    ``authorization_mode`` 省略时按 ``kind`` 取默认值（见 :func:`default_authorization_mode`）：
+    ``manual`` → ``root_self``，其余 → ``manual_export``。
     """
     _require_kind(kind)
-    _require_mode(authorization_mode)
+    mode = _require_mode(authorization_mode or default_authorization_mode(kind))
     if trust_level not in (1, 2, 3):
         raise SourceError(f"trust_level={trust_level!r} 不合法；只能是 1 / 2 / 3。")
 
@@ -96,7 +124,7 @@ def create_source(
             "INSERT INTO source_authorization "
             "(source_id, mode, scope, evidence_ref, granted_by, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?) RETURNING authz_id",
-            (source_id, authorization_mode, scope_payload, evidence_ref, granted_by, expires_at),
+            (source_id, mode, scope_payload, evidence_ref, granted_by, expires_at),
         ).fetchone()[0]
     return {
         "source_id": int(source_id),
@@ -104,7 +132,51 @@ def create_source(
         "name": name,
         "kind": kind,
         "trust_level": trust_level,
-        "authorization_mode": authorization_mode,
+        "authorization_mode": mode,
+    }
+
+
+def ensure_manual_source(conn: sqlite3.Connection, *, name: str = MANUAL_SOURCE_NAME) -> dict[str, Any]:
+    """确保存在"root 手工上传"的来源，返回 ``{"source", "created", "authorization"}``。
+
+    幂等：已存在就直接返回。**不覆盖已有的配置，也不恢复已撤销的授权**——撤销是有意为之，
+    自动复原等于绕过它（那种情况下 ``authorize()`` 会拒绝，并如实说明原因）。
+
+    Raises:
+        SourceError: 同名来源已经存在，但 ``kind`` 不是 ``manual``。这时**不能**默默拿它来用：
+            身份策略会从"按内容哈希"变成"按相对路径"，重传同一张图就变成两条。
+    """
+    existing = get_source(conn, name)
+    if existing is not None:
+        if existing.get("kind") != "manual":
+            raise SourceError(
+                f"已经有一个叫「{name}」的来源，但它的 kind 是 {existing.get('kind')}，不是 manual。\n"
+                "  手工上传要的是 kind=manual（身份按内容哈希、时间留空）；拿别的来源来上传，"
+                "重传同一份内容会变成两条。\n"
+                "  要么给这次上传换个来源名（`pc upload --source <名字>`），要么改掉那个来源。"
+            )
+        return {
+            "source": existing,
+            "created": False,
+            "authorization": authorization_state(
+                load_authorizations(conn, int(existing["source_id"]))
+            ),
+        }
+
+    info = create_source(
+        conn,
+        name=name,
+        platform=MANUAL_SOURCE_PLATFORM,
+        kind="manual",
+        trust_level=1,
+        config={"note": "root 手工上传：来源待补时的正式归档桶，不是垃圾堆"},
+        evidence_ref=MANUAL_SOURCE_EVIDENCE,
+    )
+    source_id = int(info["source_id"])
+    return {
+        "source": require_source(conn, source_id),
+        "created": True,
+        "authorization": authorization_state(load_authorizations(conn, source_id)),
     }
 
 
@@ -239,11 +311,18 @@ def ensure_default_backend(
 
 __all__ = [
     "AUTHORIZATION_MODES",
+    "DEFAULT_AUTHORIZATION_MODE",
+    "KIND_DEFAULT_AUTHZ",
+    "MANUAL_SOURCE_EVIDENCE",
+    "MANUAL_SOURCE_NAME",
+    "MANUAL_SOURCE_PLATFORM",
     "SOURCE_KINDS",
     "SourceError",
     "authorization_state",
     "create_source",
+    "default_authorization_mode",
     "ensure_default_backend",
+    "ensure_manual_source",
     "get_source",
     "list_sources",
     "load_authorizations",

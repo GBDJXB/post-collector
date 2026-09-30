@@ -7,14 +7,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from pc.adapters.local_files import LocalFilesConnector
-from pc.domain import MediaTooLargeError
+from pc.adapters.local_files import (
+    CONTENT_ID_PREFIX,
+    IDENTITY_CONTENT,
+    IDENTITY_PATH,
+    LocalFilesConnector,
+)
+from pc.domain import MediaTooLargeError, normalize_text
 
 JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"j" * 64
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"p" * 64
@@ -280,3 +286,207 @@ class TestTextLimits:
 def test_requires_at_least_one_root() -> None:
     with pytest.raises(ValueError, match="至少要有一个目录"):
         LocalFilesConnector(_source(), [_authz()], roots=[])
+
+
+# ---------------------------------------------------------------------------
+# 内容身份（pc upload 用的策略）
+#
+# 手工上传没有平台给的 ID，身份只能由内容决定。这里要钉住的恰恰是"安静出错"的几种：
+# 重传同一张图变成两条、同一张图换个配文被当成同一条、空文件互相顶掉。
+# ---------------------------------------------------------------------------
+
+
+def _upload_dir(tmp_path: Path, name: str = "upload") -> Path:
+    root = tmp_path / name
+    root.mkdir()
+    return root
+
+
+def _content_connector(root: Path, **kwargs: Any) -> LocalFilesConnector:
+    return LocalFilesConnector(
+        _source(kind="manual"),
+        [_authz(mode="root_self")],
+        roots=[root],
+        identity=IDENTITY_CONTENT,
+        **kwargs,
+    )
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class TestContentIdentity:
+    def test_media_identity_is_the_byte_hash(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "whatever-name.jpg").write_bytes(JPEG)
+        messages, _ = _content_connector(root).list_new(None)
+        assert messages[0].platform_msg_id == f"{CONTENT_ID_PREFIX}{_sha(JPEG)}"
+
+    def test_text_identity_uses_the_same_rule_as_content_hash(self, tmp_path: Path) -> None:
+        """文本用 ``sha256(normalize_text(原文))``——与 ``content_item.content_hash`` 同一口径。"""
+        root = _upload_dir(tmp_path)
+        (root / "note.txt").write_bytes("一只猫".encode())
+        messages, _ = _content_connector(root).list_new(None)
+        expected = _sha(normalize_text("一只猫").encode("utf-8"))
+        assert messages[0].platform_msg_id == f"{CONTENT_ID_PREFIX}{expected}"
+
+    def test_media_with_sidecar_uses_both_components(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "cat.jpg").write_bytes(JPEG)
+        (root / "cat.txt").write_bytes("一只猫".encode())
+        messages, _ = _content_connector(root).list_new(None)
+        text_part = _sha(normalize_text("一只猫").encode("utf-8"))
+        assert messages[0].message_type == "mixed"
+        assert messages[0].platform_msg_id == f"{CONTENT_ID_PREFIX}{_sha(JPEG)}:{text_part}"
+
+    def test_reuploading_the_same_bytes_is_idempotent(self, tmp_path: Path) -> None:
+        """换个文件名、换个目录都还是同一条：身份只认内容。"""
+        first = _upload_dir(tmp_path, "a")
+        second = _upload_dir(tmp_path, "b")
+        (first / "cat.jpg").write_bytes(JPEG)
+        (second / "renamed-copy.jpg").write_bytes(JPEG)
+        id_one = _content_connector(first).list_new(None)[0][0].platform_msg_id
+        id_two = _content_connector(second).list_new(None)[0][0].platform_msg_id
+        assert id_one == id_two
+
+    def test_same_media_with_a_different_caption_is_a_different_message(self, tmp_path: Path) -> None:
+        """同一张图配不同文字是**两个条目**——那是两次不同的上传，不该互相顶掉。"""
+        first = _upload_dir(tmp_path, "a")
+        second = _upload_dir(tmp_path, "b")
+        for root, caption in ((first, "一只猫"), (second, "其实是两只")):
+            (root / "cat.jpg").write_bytes(JPEG)
+            (root / "cat.txt").write_bytes(caption.encode())
+        id_one = _content_connector(first).list_new(None)[0][0].platform_msg_id
+        id_two = _content_connector(second).list_new(None)[0][0].platform_msg_id
+        assert id_one != id_two
+
+    def test_whitespace_only_text_files_share_one_identity(self, tmp_path: Path) -> None:
+        """只差空白的文本文件算同一条：规范化之后它们本来就是同一份内容。"""
+        first = _upload_dir(tmp_path, "a")
+        second = _upload_dir(tmp_path, "b")
+        (first / "one.txt").write_bytes("一只猫".encode())
+        (second / "two.txt").write_bytes("  一只猫  \n".encode())
+        id_one = _content_connector(first).list_new(None)[0][0].platform_msg_id
+        id_two = _content_connector(second).list_new(None)[0][0].platform_msg_id
+        assert id_one == id_two
+
+    def test_sent_at_is_empty(self, tmp_path: Path) -> None:
+        """文件 mtime 是下载/复制/解压的时间，拿它当发布时间是假数据。"""
+        root = _upload_dir(tmp_path)
+        (root / "cat.jpg").write_bytes(JPEG)
+        messages, _ = _content_connector(root).list_new(None)
+        assert messages[0].sent_at is None
+        assert messages[0].raw_payload is not None
+        assert "mtime" in messages[0].raw_payload, "时间线索仍要留档，只是不冒充发布时间"
+
+    def test_path_identity_still_uses_mtime(self, samples: Path) -> None:
+        messages, _ = _connector(samples).list_new(None)
+        assert all(message.sent_at for message in messages)
+
+    def test_images_with_the_same_bytes_keep_one_identity_across_names(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "one.jpg").write_bytes(JPEG)
+        (root / "two.jpg").write_bytes(JPEG)
+        messages, _ = _content_connector(root).list_new(None)
+        assert len({message.platform_msg_id for message in messages}) == 1, (
+            "两份字节相同的文件必须得到同一个身份，否则重传就会变成两条"
+        )
+
+
+class TestContentIdentitySkips:
+    def test_empty_file_is_skipped_and_reported(self, tmp_path: Path) -> None:
+        """空文件没有可用的身份组件；所有空文件的哈希相同，用它当身份会互相顶掉。"""
+        root = _upload_dir(tmp_path)
+        (root / "empty.txt").write_bytes(b"")
+        connector = _content_connector(root)
+        messages, _ = connector.list_new(None)
+        assert messages == ()
+        assert connector.skipped and connector.skipped[0][0].endswith("empty.txt")
+        assert "0 字节" in connector.skipped[0][1]
+
+    def test_whitespace_only_text_is_skipped(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "blank.txt").write_bytes(b"   \n\t ")
+        connector = _content_connector(root)
+        assert connector.list_new(None)[0] == ()
+
+    def test_empty_media_is_skipped_and_its_sidecar_survives(self, tmp_path: Path) -> None:
+        """0 字节的图不产生消息；同名侧车文本会被单独发现，所以内容没有丢。
+
+        这条同时钉住一个不显眼的坑：如果让空媒体"退化成纯文本身份"，那张图的身份就会与
+        侧车文本文件**撞成同一个**，于是其中一条被唯一约束静默吞掉（顺序还不确定）。
+        """
+        root = _upload_dir(tmp_path)
+        (root / "broken.jpg").write_bytes(b"")
+        (root / "broken.txt").write_bytes("正文还在".encode())
+        connector = _content_connector(root)
+        messages, _ = connector.list_new(None)
+        assert len(messages) == 1
+        assert messages[0].message_type == "text"
+        assert messages[0].text_raw == "正文还在"
+        expected = _sha(normalize_text("正文还在").encode("utf-8"))
+        assert messages[0].platform_msg_id == f"{CONTENT_ID_PREFIX}{expected}"
+        assert connector.skipped and "0 字节" in connector.skipped[0][1]
+
+    def test_path_identity_does_not_skip_empty_files(self, tmp_path: Path) -> None:
+        """导出目录通道的行为不变：空文件照样入库，由扫描器按魔数判定。"""
+        root = _upload_dir(tmp_path)
+        (root / "empty.jpg").write_bytes(b"")
+        messages, _ = _connector(root).list_new(None)
+        assert len(messages) == 1
+
+    def test_skips_are_deduplicated_across_batches(self, tmp_path: Path) -> None:
+        """``list_new`` 是按批调用的，每批都会重扫目录——报告不能随批次数翻倍。"""
+        root = _upload_dir(tmp_path)
+        (root / "empty-a.txt").write_bytes(b"")
+        (root / "empty-b.txt").write_bytes(b"")
+        (root / "cat.jpg").write_bytes(JPEG)
+        connector = _content_connector(root, batch_size=1)
+        cursor = None
+        while True:
+            _messages, cursor = connector.list_new(cursor)
+            if cursor in (None, "3"):
+                break
+        assert [item[0].split("/")[-1] for item in connector.skipped] == [
+            "empty-a.txt",
+            "empty-b.txt",
+        ]
+
+
+class TestContentIdentityMechanics:
+    def test_unknown_identity_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="未知的身份策略"):
+            LocalFilesConnector(_source(), [_authz()], roots=[tmp_path], identity="vibes")
+
+    def test_hashes_are_cached_across_list_new_calls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``list_new`` 每批都重扫目录：没有缓存的话一个大目录会被哈希成 O(n²)。"""
+        root = _upload_dir(tmp_path)
+        (root / "cat.jpg").write_bytes(JPEG)
+        calls = {"n": 0}
+        real = hashlib.sha256
+
+        def counting(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(hashlib, "sha256", counting)
+        connector = _content_connector(root)
+        connector.list_new(None)
+        first = calls["n"]
+        connector.list_new(None)
+        assert calls["n"] == first, "第二次 list_new 又读了一遍字节——缓存没生效"
+
+    def test_capabilities_declare_content_identity_without_credentials(self, tmp_path: Path) -> None:
+        caps = _content_connector(tmp_path).capabilities()
+        assert caps["identity"] == IDENTITY_CONTENT
+        assert caps["requires_credential"] is False
+        assert any("内容为空" in rule for rule in caps["skip_rules"])
+
+    def test_path_identity_is_the_default(self, samples: Path) -> None:
+        caps = _connector(samples).capabilities()
+        assert caps["identity"] == IDENTITY_PATH
+        assert caps["requires_credential"] is False
+        assert not any("内容为空" in rule for rule in caps["skip_rules"])

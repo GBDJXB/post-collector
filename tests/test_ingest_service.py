@@ -150,3 +150,43 @@ class TestJobIdemKeyHelper:
     def test_format_is_stable(self) -> None:
         assert svc.job_idem_key(7) == "ingest.process:message:7:"
         assert svc.job_idem_key(7, "other.job") == "other.job:message:7:"
+
+
+class TestOriginNote:
+    """来源备注：root 手工上传时"我记不清这东西从哪来的"的那个钩子。
+
+    它是**调用方注解**，不是平台信封的一部分（平台的"转自哪里"走 ``forward_chain``），
+    所以整批套用同一个值，且**绝不能混进 raw_payload**——那是原始载荷的自证哈希。
+    """
+
+    def test_note_is_written_to_every_message(self, fresh_db: Any, source: dict[str, Any]) -> None:
+        svc.ingest_messages(
+            fresh_db, source, [_message("a"), _message("b")], origin_note="好像是某个群里的"
+        )
+        rows = fresh_db.execute("SELECT origin_note FROM message ORDER BY message_id").fetchall()
+        assert [row[0] for row in rows] == ["好像是某个群里的", "好像是某个群里的"]
+
+    def test_note_is_optional(self, fresh_db: Any, source: dict[str, Any]) -> None:
+        svc.ingest_messages(fresh_db, source, [_message()])
+        assert fresh_db.execute("SELECT origin_note FROM message").fetchone()[0] is None
+
+    def test_blank_note_becomes_null(self, fresh_db: Any, source: dict[str, Any]) -> None:
+        svc.ingest_messages(fresh_db, source, [_message()], origin_note="   ")
+        assert fresh_db.execute("SELECT origin_note FROM message").fetchone()[0] is None, (
+            "空备注要存成 NULL，不要让'什么都没写'和'写了空格'在库里长得不一样"
+        )
+
+    def test_note_does_not_leak_into_the_payload_hash(
+        self, fresh_db: Any, source: dict[str, Any]
+    ) -> None:
+        """备注是人写的，原始载荷哈希必须只反映平台给的东西。"""
+        payload = {"kind": "local_file", "path": "x.jpg"}
+        svc.ingest_messages(
+            fresh_db, source, [_message("a", raw_payload=payload)], origin_note="有备注"
+        )
+        svc.ingest_messages(fresh_db, source, [_message("b", raw_payload=payload)])
+        hashes = {
+            row[0]
+            for row in fresh_db.execute("SELECT raw_payload_hash FROM message ORDER BY message_id")
+        }
+        assert len(hashes) == 1, "同一份原始载荷，备注不同不该算出两个哈希"

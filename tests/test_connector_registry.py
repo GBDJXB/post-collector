@@ -115,3 +115,45 @@ class TestUnsupportedKinds:
         with pytest.raises(UnsupportedSourceKindError) as excinfo:
             connector_for(_source(kind="bot_api"), roots=["."])
         assert "已实现" in str(excinfo.value)
+
+
+class TestKindTablesStayInSync:
+    def test_every_kind_is_either_implemented_or_planned(self) -> None:
+        """三张 kind 清单（数据库 CHECK / 服务层 / 连接器工厂）必须说的是同一件事。
+
+        漏一边的具体后果：往 CHECK 里加了取值却忘了登记，用户会遇到"数据库接受、
+        程序说不合法"这种最难解释的错误；反过来则会出现一条永远建不出来的 kind。
+        """
+        from pc.services import sources as sources_service
+
+        assert set(SUPPORTED_KINDS) | set(PLANNED_KINDS) == set(sources_service.SOURCE_KINDS)
+
+    def test_authorization_modes_match_the_domain_enum(self) -> None:
+        from pc.domain import AuthzMode
+        from pc.services import sources as sources_service
+
+        assert set(sources_service.AUTHORIZATION_MODES) == {mode.value for mode in AuthzMode}
+
+
+class TestManualKind:
+    def test_manual_builds_a_content_identity_connector(self, tmp_path: Path) -> None:
+        connector = connector_for(_source(kind="manual"), roots=[tmp_path])
+        assert isinstance(connector, LocalFilesConnector)
+        assert connector.capabilities()["identity"] == "content"
+
+    def test_export_keeps_path_identity(self, tmp_path: Path) -> None:
+        connector = connector_for(_source(kind="export"), roots=[tmp_path])
+        assert connector.capabilities()["identity"] == "path"
+
+    def test_local_kinds_need_no_credential(self, tmp_path: Path) -> None:
+        """凭证是"按需"的：本地来源声明不需要，所以永远不必给它们造占位凭证。"""
+        for kind in ("export", "manual"):
+            caps = connector_for(_source(kind=kind), roots=[tmp_path]).capabilities()
+            assert caps["requires_credential"] is False, kind
+
+    def test_planned_platform_kinds_will_need_one(self) -> None:
+        """平台型来源必须声明需要凭证——这是它们在 credential_secret 落地前的阻塞项。"""
+        assert "bot_api" in PLANNED_KINDS
+        assert SUPPORTED_KINDS.keys() == {"export", "manual"}, (
+            "已实现的 kind 只有这两个；多出来的必须是本文件里显式接过的"
+        )

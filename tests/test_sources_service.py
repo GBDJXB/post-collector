@@ -181,3 +181,83 @@ class TestDefaultBackend:
             fresh_db, tmp_path / "quarantine", name="local-quarantine"
         )
         assert media["backend_id"] != quarantine["backend_id"]
+
+
+# ---------------------------------------------------------------------------
+# root 手工上传的来源
+#
+# "root 本人就是来源"这件事要在数据里说得清：kind=manual + mode=root_self，而且**不要
+# 占位凭证**。授权依然是一条真实记录，只是它的含义是"操作者本人在场"。
+# ---------------------------------------------------------------------------
+
+
+class TestManualKind:
+    def test_manual_kind_defaults_to_root_self(self, fresh_db: Any) -> None:
+        info = svc.create_source(fresh_db, name="manual", platform="local", kind="manual")
+        assert info["authorization_mode"] == "root_self"
+        rows = svc.load_authorizations(fresh_db, info["source_id"])
+        assert [row["mode"] for row in rows] == ["root_self"]
+
+    def test_export_kind_still_defaults_to_manual_export(self, fresh_db: Any) -> None:
+        info = svc.create_source(fresh_db, name="dump", platform="local", kind="export")
+        assert info["authorization_mode"] == "manual_export", "既有行为不能因为新增 kind 而改变"
+
+    def test_default_mode_table(self) -> None:
+        assert svc.default_authorization_mode("manual") == "root_self"
+        assert svc.default_authorization_mode("export") == "manual_export"
+        assert svc.default_authorization_mode("bot_api") == svc.DEFAULT_AUTHORIZATION_MODE, (
+            "认不出的 kind 要有兜底值，而不是抛错——真正的校验在 _require_kind 那里"
+        )
+
+    def test_manual_kind_is_accepted_by_the_service(self) -> None:
+        assert "manual" in svc.SOURCE_KINDS
+        assert "root_self" in svc.AUTHORIZATION_MODES
+
+
+class TestEnsureManualSource:
+    def test_creates_then_reuses(self, fresh_db: Any) -> None:
+        first = svc.ensure_manual_source(fresh_db)
+        assert first["created"] is True
+        assert first["source"]["kind"] == "manual"
+        assert first["source"]["trust_level"] == 1
+        assert first["authorization"]["ok"] is True
+        assert first["authorization"]["modes"] == ("root_self",)
+
+        second = svc.ensure_manual_source(fresh_db)
+        assert second["created"] is False
+        assert second["source"]["source_id"] == first["source"]["source_id"]
+        assert fresh_db.execute("SELECT count(*) FROM source").fetchone()[0] == 1
+        assert fresh_db.execute("SELECT count(*) FROM source_authorization").fetchone()[0] == 1
+
+    def test_no_credential_fields_are_needed(self, fresh_db: Any) -> None:
+        """手工上传不需要任何凭证字段——这正是"凭证可选"的落点。"""
+        result = svc.ensure_manual_source(fresh_db)
+        evidence = fresh_db.execute(
+            "SELECT evidence_ref FROM source_authorization WHERE source_id = ?",
+            (result["source"]["source_id"],),
+        ).fetchone()[0]
+        assert "无外部凭证" in str(evidence)
+        assert svc.authorization_state(
+            svc.load_authorizations(fresh_db, result["source"]["source_id"])
+        )["ok"] is True
+
+    def test_name_clash_with_another_kind_is_refused(self, fresh_db: Any) -> None:
+        """同名来源的 kind 不对时必须报错，不能默默拿来用。
+
+        默默用它的后果很具体：身份策略会从"按内容哈希"变成"按相对路径"，重传同一张图
+        就变成两条——而这正是手工上传最不能接受的行为。
+        """
+        svc.create_source(fresh_db, name=svc.MANUAL_SOURCE_NAME, platform="local", kind="export")
+        with pytest.raises(svc.SourceError, match="kind 是 export"):
+            svc.ensure_manual_source(fresh_db)
+
+    def test_revoked_authorization_is_not_resurrected(self, fresh_db: Any) -> None:
+        """撤销是有意为之：再跑一次 upload 不该把授权悄悄恢复。"""
+        first = svc.ensure_manual_source(fresh_db)
+        fresh_db.execute(
+            "UPDATE source_authorization SET revoked_at = ? WHERE source_id = ?",
+            ("2026-01-01T00:00:00.000Z", first["source"]["source_id"]),
+        )
+        again = svc.ensure_manual_source(fresh_db)
+        assert again["created"] is False
+        assert again["authorization"]["ok"] is False, "撤销必须继续生效，authorize() 才有意义"

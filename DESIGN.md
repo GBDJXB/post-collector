@@ -79,6 +79,7 @@
 | 官方用户态 API / 官方客户端授权 | Reddit API、Mastodon/ActivityPub、Bluesky AT Protocol | 高 | 中~高 | 需遵守 API 条款与速率限制；商业用途可能收费（需核实） | **首选**。速率限制需按来源配额化 |
 | RSS / Atom / JSON Feed | 博客、论坛、部分频道桥接 | 高 | 中 | 低风险 | **推荐**作为补充 |
 | 官方数据导出 | Telegram Desktop 导出、Twitter/X 归档、Discord 数据包 | 高 | 高（离线） | 明确授权，合规性最好 | **强烈推荐**作为冷启动与历史回填路径 |
+| **root 本人手工上传** | 自己保存/收藏的文件，**来源已记不清**（"忘了从哪个群存的"） | 高 | 高（离线） | 内容是自己手上的文件；本人即授权 | **阶段 1 一等来源**（`kind='manual'`、`mode='root_self'`）。身份按**内容哈希**，`sent_at` **留空**（文件 mtime 是下载/复制时间，不能冒充发布时间），来源备注写在 `message.origin_note`。**不需要凭证，也不造占位凭证**——授权就是"操作者本人在场"这个事实 |
 | 平台内官方"保存/转发到私有位置" | 用户手动转发到自建私有频道，再由 Bot 采集 | 高 | 高 | 完全由用户行为驱动，风险最低 | **推荐**作为不支持 API 的平台的通用兜底（"人肉 webhook"） |
 | Webhook（自建中转） | 平台推送 → 本地接收 | 高 | 中（需公网或隧道） | 低 | 推荐用 Cloudflare Tunnel / Tailscale Funnel，避免暴露家庭网络 |
 | 浏览器自动化（登录态） | 用 Playwright 带 cookie 抓取 | 低~中 | 低（前端改版即失效） | **高**：多数平台 ToS 禁止，账号封禁与法律风险 | **仅在自有站点或明确允许的场景**；否则不建议 |
@@ -86,6 +87,8 @@
 | 第三方聚合/爬虫服务 | 购买他人抓取的数据流 | 低 | 中 | **高**：来源合法性不可控，法律与投毒风险 | 不建议 |
 
 结论：**连接器必须做成可插拔适配器，并且每个来源都必须携带"授权凭证 + 授权范围 + 授权证明记录"三者**，缺一不可入库。这样即使某平台政策变化，只需替换一个适配器。
+
+**凭证是"按需"的，不是所有来源都要**（v3.1 实现时明确）：连接器在 `capabilities()` 里用 `requires_credential` 如实声明。本地两类来源（`export` / `manual`）声明 `False`——它们的授权来自手工导出或操作者本人在场，没有平台凭证这回事；平台型来源必须声明 `True`，并且在 `credential_secret` 与系统密钥库（§6.1）落地之前**无法实现**。给不需要凭证的来源塞一张空凭证，会让审计表里出现"看着验证过、其实什么都没有"的记录，将来无法区分真验证与占位，所以**不做占位凭证**。真正拦截调用的是 `authorize()`，它的统一语义是"本来源所需的授权条件是否满足"。
 
 ### 1.4 合规风险清单
 
@@ -373,25 +376,27 @@ api_credential(cred_id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES app_user(
 
 密钥策略：**不存明文**。主密钥放在**系统密钥库**里（Windows DPAPI / macOS Keychain / Linux Secret Service，经 `keyring`），**不进 YAML、不进 `setting` 表**；密钥库不可用时拒绝启用第三方凭证，而不是退化成明文或口令派生。入库的第三方密钥用信封加密（AES-GCM），密文落 `credential_secret(cred_id FK, ciphertext, nonce, key_version)`；系统自身的 API Key 只存哈希。首次初始化、恢复码、会话与轮换见 6.1。
 
+**凭证按需，不造占位**（v3.1 实现时明确）：只有 `requires_credential=True` 的来源才需要 `credential_secret` 与密钥库。`root_self` 授权的来源（root 手工上传）**没有凭证这个概念**——它的"凭证"就是操作者本人在场，这一点由 `source_authorization` 的 `mode='root_self'` 与审计记录表达，而不是靠一张空凭证凑齐"三者齐备"。因此 `credential_secret` 表与密钥库可以推迟到接入第一个平台型连接器时再落地，**不阻塞阶段 1**；反过来说，那张表落地之前平台型连接器也无法实现（附录 A 第 15 项）。
+
 **source / 授权 / 同步游标**
 
 ```sql
-source(source_id INTEGER PRIMARY KEY, uuid TEXT, name TEXT, platform TEXT, kind TEXT,   -- kind: bot_api|webhook|rss|export|user_api
+source(source_id INTEGER PRIMARY KEY, uuid TEXT, name TEXT, platform TEXT, kind TEXT,   -- kind: bot_api|webhook|rss|export|user_api|manual
      external_ref TEXT,                                     -- 频道 ID / 群 ID / RSS URL
      config TEXT,                                           -- 平台特有配置 JSON（凭证引用，不存明文）
      trust_level INTEGER,                                   -- 1=可信自有 2=已授权群 3=外部不确定
      enabled INTEGER, created_by INTEGER REFERENCES app_user(user_id), created_at TEXT,
      updated_at TEXT, deleted_at TEXT,
-     CHECK (kind IN ('bot_api','webhook','rss','export','user_api')),
+     CHECK (kind IN ('bot_api','webhook','rss','export','user_api','manual')),
      CHECK (trust_level IN (1,2,3)))
 
 source_authorization(authz_id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES source(source_id),
-     mode TEXT,                                             -- mode: owner_token|admin_consent|public_feed|manual_export
+     mode TEXT,                                             -- mode: owner_token|admin_consent|public_feed|manual_export|root_self
      scope TEXT,                                            -- 允许读取的消息类型、时间范围（JSON）
      evidence_ref TEXT,                                     -- 授权证明文件路径/链接/截图 hash
      granted_by INTEGER REFERENCES app_user(user_id), granted_at TEXT, expires_at TEXT, revoked_at TEXT,
      created_at TEXT, updated_at TEXT,
-     CHECK (mode IN ('owner_token','admin_consent','public_feed','manual_export')))
+     CHECK (mode IN ('owner_token','admin_consent','public_feed','manual_export','root_self')))
 
 sync_cursor(source_id INTEGER PRIMARY KEY REFERENCES source(source_id), cursor_value TEXT,
      last_seen_at TEXT, last_success_at TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -420,6 +425,7 @@ message(message_id INTEGER PRIMARY KEY, uuid TEXT, source_id INTEGER REFERENCES 
      media_refs TEXT,                                       -- JSON: 平台侧媒体引用（file_id/URL/路径），顺序即内容项顺序
      permalink TEXT, raw_payload TEXT,                      -- 原始载荷 JSON（保留策略见下）
      raw_payload_hash TEXT,
+     origin_note TEXT,                                      -- 调用方注解：这条内容是从哪儿弄来的（人写的，可空）
      source_trust INTEGER, nsfw_gate INTEGER,               -- 摄入时的门控判定副本
      created_at TEXT, updated_at TEXT, deleted_at TEXT,
      UNIQUE(source_id, platform_msg_id),
@@ -1933,7 +1939,7 @@ MVP 明确的**不做**：**L2 匿名入口**、第二个与第三个连接器�
 
 | 接口 | 为什么现在就要定 | 契约要点 |
 |---|---|---|
-| `Connector`（平台接入） | 平台政策会变，连接器必然要换 | `list_new(cursor) -> [SourceMessage]`、`capabilities()`、`authorize()`、`rate_limit_hint()`、`fetch_media(ref) -> bytes`、`parse_event(payload) -> [SourceMessage]`；连接器不得直接写库。**拉取与推送是同一端口的两条路**，由 `capabilities()` 的 `supports_pull` / `supports_push` / `supports_media_fetch` 声明，不适用的那条抛 `NotImplementedError`（于是微信/QQ 这类回调型来源与 Telegram 这类拉取型来源产出同一个信封）；取字节、平台鉴权与限流都由适配器自己承担 |
+| `Connector`（平台接入） | 平台政策会变，连接器必然要换 | `list_new(cursor) -> [SourceMessage]`、`capabilities()`、`authorize()`、`rate_limit_hint()`、`fetch_media(ref) -> bytes`、`parse_event(payload) -> [SourceMessage]`；连接器不得直接写库。**拉取与推送是同一端口的两条路**，由 `capabilities()` 的 `supports_pull` / `supports_push` / `supports_media_fetch` 声明，不适用的那条抛 `NotImplementedError`（于是微信/QQ 这类回调型来源与 Telegram 这类拉取型来源产出同一个信封）；取字节、平台鉴权与限流都由适配器自己承担。`capabilities()` 另需声明 `requires_credential`（见 §1.3 的"凭证按需"），以及本实现的消息**身份策略**（本地文件两种：`path` = 相对路径 / `content` = 内容哈希）——同一端口下的多个实现靠这些自述把差异摊开，而不是让调用方去猜 |
 | `StorageBackend`（媒体存储） | 本地→NAS→对象存储→云盘是必然路径 | `put(bytes) -> key`、`get(key)`、`exists`、`delete`、`presign`；键必须内容寻址 |
 | `SearchIndex`（检索） | FTS5 → Meilisearch → 混合检索 | `index(doc)`、`delete(id)`、`query(q, filters, sort, page)`、`rebuild()`；索引必须可全量重建 |
 | `VectorStore` | 阶段 3 再定：内存暴力 / sqlite-vec → Qdrant（见 5.3） | `upsert(id, vec, payload)`、`search(vec, filter, k)`、`delete` |
@@ -2129,6 +2135,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
 | **连接器端口补齐取字节与推送两条路**（阶段 1 首发适配器） | §9.1 的 `Connector` 只有 `list_new` / `capabilities` / `authorize` / `rate_limit_hint`：**取媒体这件事在契约里没有归口**（§2.1 把 fetch 放在 L3，但只有平台适配器知道怎么取），推送型平台（Discord 网关、微信/QQ 回调）也没有入口。照这个契约写，第一个真实平台适配器就得绕过端口 | `Connector` 增加 `fetch_media(ref) -> bytes`（自己带鉴权与限流，超上限抛 `MediaTooLargeError`）与 `parse_event(payload) -> [SourceMessage]`（推送型入口），`capabilities()` 增加 `supports_pull` / `supports_push` / `supports_media_fetch` 三个开关，不适用的那条路抛 `NotImplementedError`；**只加方法不加协议，接口数量仍是 13**。同时落地三个本地适配器（`local_files` / `local_storage` / `magic_scan`）与工厂 `registry.connector_for()`（`source.kind` 分派，也是唯一解密凭证的位置），`source.config` 约定 `{"roots": [...]}` |
 | **第一条端到端链路：本地文件 → 库**（阶段 1 首个可用切片） | 设计里 L2/L3 的职责边界（落信封 / 取字节）、任务的幂等与重试策略、隔离区的物理分离都只有文字描述，没有可运行的判据；`media_refs` 也没有落脚点 | 新增 `src/pc/services/`：`sources`（source + authorization 同生共死、默认存储后端、目录持久化）、`ingest`（L2 幂等落信封 + 入队，`raw_payload` 默认只留哈希）、`pipeline`（L3 单进程 worker：`BEGIN IMMEDIATE` 原子抢占、`attempts` 抢占即 +1、崩溃恢复、确定性失败进死信 / 偶发退避重试、幂等护栏、扫描不通过写进独立后端行 `local-quarantine`）。新增 `0003_message_media_refs.sql`（§3.2 的 `media_refs`，三档保留策略的第一档）。CLI 新增 `source add/list`、`import`、`work`、`item list`。新增测试 6 个文件（服务层、worker 管线、CLI 端到端、文本规范化、出网守卫），并把「全库不存在外发代码路径」（§9 验收⑦）从口号变成每次提交都在跑的断言 |
 | **仓库文件改按「项目根」解析**（可用性修复） | §10.2 说运行时目录由 `PC_DATA_ROOT` 决定，但没说**仓库文件**（迁移目录、`config/app.yaml`、`.env`）该相对谁。实现里 `doctor` / `config` 会自动向上查找项目根，`db` 子命令却用「当前工作目录 + 相对路径」——从仓库外运行会报「找不到迁移目录」，更糟的是 `config/app.yaml` 与 `.env` 被**静默跳过**：命令成功、库却建在平台默认目录，§6.2 的配置分层白设 | 新增 `cli._project_root()`（`--root` > 按 `pyproject.toml` + `DESIGN.md` 向上查找，含 `__file__` 方向），`db apply/status/backup/reindex`、`config show/seed`、`doctor` 的数据库段与运行时目录段全部改走它，`env_file`/`app_config` 一律传绝对路径；`db apply` 打印它实际用的迁移目录；`--root` 加到四个 db 子命令上；「找不到迁移目录」的报错列出三条出路并点明 `uv tool install` 的分发缺口（迁移文件尚未打包进 wheel）。新增 `tests/test_cli_project_root.py`（8 条，含"从仓库外运行仍读到 `app.yaml:db.data_root`"这条回归） |
+| **root 手工上传成为一等来源，凭证改为"按需"**（阶段 1） | §1.5 的 MVP 一直写着"官方导出导入 **+ 手工上传**"，但实现里只有 `export` 一种来源，手工上传只能借 `kind='export'` + `mode='manual_export'` 凑合——那套说法的含义是"我导出了平台数据"，与"我本人就是来源"是两件事。另外"凭证 + 范围 + 证明三者齐备"被默认成"所有来源都要凭证"，而 root 自己丢进来的文件根本没有凭证可谈 | `source.kind` 增加 `manual`、`source_authorization.mode` 增加 `root_self`（§3.2 两处 CHECK 放宽，由 `0004` **重建表**完成）；`message` 增加 `origin_note`（"我后来想起来了"的钩子，可选、不进索引、不进 `raw_payload`）；同一端口上增加第二种**身份策略**：`export` 按相对路径（时间取 mtime），`manual` 按内容哈希（`upload:<媒体 sha256>[:<文本 sha256>]`，时间留空），两者共用一个实现；`Connector.capabilities()` 增加 `requires_credential`，本地来源声明 `False` 并**不造占位凭证**（§1.3、§6.1 补写这条规则），平台型来源声明 `True` 且被 `credential_secret` 阻塞。迁移器为此新增受控的 `-- pc:foreign_keys=off` 指令通道（提交前 `PRAGMA foreign_key_check` 兜底） |
 | **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 
 ## 附录 B：参考组件
