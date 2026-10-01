@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from pc import __version__, domain
+from pc.adapters.fts_search import TIME_FIELD_INGEST, TIME_FIELDS
 
 #: 关键文件清单：doctor 逐项检查存在性
 _EXPECTED_FILES: tuple[str, ...] = (
@@ -823,6 +824,7 @@ SEARCH_HEADERS: tuple[str, ...] = (
     "id",
     "类型",
     "来源",
+    "文件名",
     "命中",
     "内容",
     "标签",
@@ -833,6 +835,7 @@ SEARCH_MAX_WIDTHS: dict[str, int] = {
     "id": 8,
     "类型": 8,  # item_type ∈ text/image/video/audio/link/sticker/file
     "来源": 16,
+    "文件名": 32,  # basename；媒体项才有（文本项这一刀留空）
     "命中": 24,  # 命中的词，多个用空格隔开
     "内容": 40,  # 命中片段（带 [] 标记）或正文摘要
     "标签": 20,  # 标签名列表（置信度与来源在 --json 里）
@@ -1489,6 +1492,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         tags=tuple(args.tag or ()),
         since=args.since,
         until=args.until,
+        time_field=args.time_field,
         nsfw_max_level=args.nsfw_level,
         include_duplicates=args.include_duplicates,
         sort=args.sort,
@@ -1531,11 +1535,13 @@ def cmd_search(args: argparse.Namespace) -> int:
             hit["content_id"],
             hit["item_type"],
             hit["source"],
+            hit["original_name"] or "-",
             " ".join(hit["matched_terms"]) or "-",
             hit["snippet"] or _short_text(hit["text"]) or _media_summary(hit["media"]),
             " ".join(tag["name"] for tag in hit["tags"]) or "-",
             hit["origin_note"] or "-",
-            hit["first_seen_at"],
+            # 「时间」列显示**当前所选字段**的值：按消息时间搜时，显示入库时间会让人对不上
+            (hit["sent_at"] if result.get("time_field") == "sent" else hit["first_seen_at"]) or "-",
         ]
         for hit in result["hits"]
     ]
@@ -1565,6 +1571,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"  下一页：pc search … --cursor {result['next_cursor']}")
     elif result["has_more"] and result["total"] is None:
         print(f"  下一页：pc search … --page {int(result.get('page', 1)) + 1}")
+    if result.get("time_field") == "sent":
+        print(
+            "  时间用的是「收到消息时间」（sent_at；「时间」列与排序都按它）。"
+            "手工上传的内容 sent_at 为空，会被时间范围排除、排在最后。"
+        )
     _print_search_timings(result["timings"], show=args.timings)
     return 0
 
@@ -1803,8 +1814,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="按标签过滤，多个标签是 AND（写法：名字 或 命名空间:名字）",
     )
-    p_search.add_argument("--since", help="只看这个时间之后入库的（2026-09-30 或完整 ISO-8601）")
-    p_search.add_argument("--until", help="只看这个时间之前入库的")
+    p_search.add_argument("--since", help="只看这个时间之后的（按 --time-field 选定的时间字段）")
+    p_search.add_argument("--until", help="只看这个时间之前的（按 --time-field 选定的时间字段）")
+    p_search.add_argument(
+        "--time-field",
+        choices=list(TIME_FIELDS),
+        default=TIME_FIELD_INGEST,
+        help="时间看哪个钟：ingest=入库时间（默认），sent=收到消息的时间",
+    )
     p_search.add_argument(
         "--nsfw-level",
         type=int,

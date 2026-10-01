@@ -226,6 +226,87 @@ class TestStaleHint:
         assert "蓝发精灵站在雨里" in texts, "重算之后老内容应当能搜到"
 
 
+class TestNameTypeAndTime:
+    """文件名、类型与两个钟：都要能从命令行直接问到。"""
+
+    def test_search_by_file_name(
+        self, workspace: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """上传一个带中文名字的图片，按名字搜得到（这正是最常见的找图方式）。"""
+        code, out = _run(["db", "apply", "--path", workspace["db_path"]], capsys)
+        assert code == 0, out
+        photo = workspace["files"] / "电脑壁纸.jpg"
+        photo.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"j" * 64)
+        code, out = _run(["upload", str(photo), "--path", workspace["db_path"]], capsys)
+        assert code == 0, out
+        assert "成功 1" in out, out
+
+        for term in ("电脑", "壁纸", "jpg", "电脑壁纸"):
+            result = _json(workspace, capsys, term)
+            assert result["hits"], f"按 {term} 搜不到刚上传的图片"
+            assert result["hits"][0]["original_name"] == "电脑壁纸.jpg"
+
+    def test_table_shows_the_file_name(
+        self, workspace: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code, out = _run(["db", "apply", "--path", workspace["db_path"]], capsys)
+        assert code == 0, out
+        photo = workspace["files"] / "电脑壁纸.jpg"
+        photo.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"j" * 64)
+        _run(["upload", str(photo), "--path", workspace["db_path"]], capsys)
+        code, out = _search(workspace, capsys, "壁纸")
+        assert code == 0
+        assert "文件名" in out and "电脑壁纸.jpg" in out, out
+
+    def test_search_by_type_word(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """类型值与中文说法都是关键词；精确过滤仍走 --type。"""
+        for term in ("text", "文本"):
+            result = _json(ready, capsys, term)
+            assert len(result["hits"]) == 3, f"{term} 应当命中三条文本内容"
+        assert len(_json(ready, capsys, "--type", "text")["hits"]) == 3
+        assert _json(ready, capsys, "--type", "image")["hits"] == []
+
+    def test_time_field_defaults_to_ingest(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result = _json(ready, capsys, "--limit", "1")
+        assert result["time_field"] == "ingest"
+        assert result["hits"][0]["sent_at"] is None, "手工上传刻意留空 sent_at"
+
+    def test_time_field_sent_is_reported_and_explained(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code, out = _search(ready, capsys, "--time-field", "sent", "--sort", "time")
+        assert code == 0
+        assert "收到消息时间" in out, "要说明用的是哪个钟，否则用户对不上时间列"
+        result = _json(ready, capsys, "--time-field", "sent", "--sort", "time")
+        assert result["time_field"] == "sent"
+        assert result["filters_applied"]["time_field"] == "sent"
+
+    def test_time_field_sent_excludes_rows_without_sent_at(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result = _json(ready, capsys, "--time-field", "sent", "--since", "2000-01-01")
+        assert result["hits"] == [], "手工上传没有消息时间，不该被时间范围包含"
+
+    def test_invalid_time_field_is_rejected_by_the_parser(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit):
+            cli.main(["search", "--time-field", "yesterday", "--path", ready["db_path"]])
+        assert "invalid choice" in capsys.readouterr().err
+
+    def test_json_carries_name_and_search_extra(
+        self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        hit = _json(ready, capsys, "sunset", "--limit", "1")["hits"][0]
+        # 这三条是 .txt（文本项）：文件名那一刀还没做，所以 original_name 为空（见 AGENTS）
+        assert hit["original_name"] is None
+        assert "sunset" in hit["search_extra"] or "sunset" in (hit["text"] or "")
+
+
 class TestOutput:
     def test_json_carries_the_reason_and_cursor(
         self, ready: dict[str, Any], capsys: pytest.CaptureFixture[str]

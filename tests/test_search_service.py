@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from pc.adapters.fts_search import MAX_PAGE_SIZE, SqliteFtsSearch
-from pc.domain import search_extra_value, search_tokens
+from pc.domain import ITEM_TYPE_LABELS, search_extra_value, search_tokens
 from pc.services import search as svc
 from pc.services.search import SearchError, SearchQuery
 
@@ -41,6 +41,8 @@ def _seed_item(
     source_label: str = "mine",
     platform: str = "local",
     first_seen_at: str = "2026-01-01T00:00:00.000Z",
+    sent_at: str | None = None,
+    original_name: str | None = None,
     status: str = "active",
     nsfw_level: int = 0,
     deleted_at: str | None = None,
@@ -54,18 +56,21 @@ def _seed_item(
 
     message_id = int(
         conn.execute(
-            "INSERT INTO message (uuid, source_id, platform_msg_id, text_raw) "
-            "VALUES (?, ?, ?, ?) RETURNING message_id",
-            (str(uuid.uuid4()), source_id, f"m-{uuid.uuid4().hex[:8]}", text),
+            "INSERT INTO message (uuid, source_id, platform_msg_id, text_raw, sent_at) "
+            "VALUES (?, ?, ?, ?, ?) RETURNING message_id",
+            (str(uuid.uuid4()), source_id, f"m-{uuid.uuid4().hex[:8]}", text, sent_at),
         ).fetchone()[0]
     )
-    extra = search_extra_value(source_label, platform)
+    extra = search_extra_value(
+        source_label, platform, item_type, ITEM_TYPE_LABELS.get(item_type), original_name
+    )
     content_id = int(
         conn.execute(
             "INSERT INTO content_item ("
             "  uuid, message_id, item_type, ordinal, text_content, text_search, search_extra,"
-            "  status, nsfw_level, first_seen_at, deleted_at, canonical_id, dup_group_id"
-            ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
+            "  original_name, status, nsfw_level, first_seen_at, deleted_at, canonical_id,"
+            "  dup_group_id"
+            ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
             (
                 str(uuid.uuid4()),
                 message_id,
@@ -73,6 +78,7 @@ def _seed_item(
                 text,
                 search_tokens(text, None, None, extra),
                 extra,
+                original_name,
                 status,
                 nsfw_level,
                 first_seen_at,
@@ -102,8 +108,9 @@ def _seed_media(conn: Any, content_id: int, *, thumb_key: str = "aa/bb/thumb") -
 
     media_id = int(
         conn.execute(
-            "INSERT INTO media (uuid, sha256, size_bytes, object_key, thumb_key, width, height) "
-            "VALUES (?, ?, 100, ?, ?, 800, 600) RETURNING media_id",
+            "INSERT INTO media (uuid, sha256, size_bytes, object_key, thumb_key, width, height,"
+            " mime_detected, extension) "
+            "VALUES (?, ?, 100, ?, ?, 800, 600, 'image/jpeg', 'jpg') RETURNING media_id",
             (str(uuid.uuid4()), uuid.uuid4().hex + uuid.uuid4().hex, thumb_key, thumb_key),
         ).fetchone()[0]
     )
@@ -573,6 +580,111 @@ class TestPaging:
             fresh_db, SearchQuery(), registry=registry, yaml_defaults={}, env=os.environ
         )
         assert result["limit"] == 10, "页大小要读设置项（env > db > yaml > default）"
+
+
+class TestTimeFields:
+    """两个钟：入库时间（默认）与收到消息时间（`message.sent_at`）。"""
+
+    def _seed_pair(self, conn: Any, source_id: int) -> dict[str, int]:
+        """两条内容：一条有消息时间，一条没有（模拟手工上传）。"""
+        return {
+            "with_sent": _seed_item(
+                conn,
+                source_id=source_id,
+                text="有消息时间的内容",
+                first_seen_at="2026-03-01T00:00:00.000Z",
+                sent_at="2026-01-05T00:00:00.000Z",
+            ),
+            "without_sent": _seed_item(
+                conn,
+                source_id=source_id,
+                text="手工上传的内容",
+                first_seen_at="2026-02-01T00:00:00.000Z",
+                sent_at=None,
+            ),
+        }
+
+    def test_default_is_ingest_time(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        result = svc.run_search(fresh_db, SearchQuery(limit=1))
+        assert result["time_field"] == "ingest"
+        assert result["hits"][0]["first_seen_at"] > "2026-01-06"
+
+    def test_sent_time_filters_on_message_time(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        ids = self._seed_pair(fresh_db, corpus["source_a"])
+        result = svc.run_search(
+            fresh_db,
+            SearchQuery(limit=50, time_field="sent", since="2026-01-01", until="2026-01-31"),
+        )
+        assert _ids(result) == [ids["with_sent"]], "按消息时间筛，只有它落在范围里"
+        assert result["time_field"] == "sent"
+        assert result["filters_applied"]["time_field"] == "sent"
+
+    def test_rows_without_sent_time_are_excluded_by_a_range(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        """`sent_at` 为空 = 没有消息时间，不该被任何时间范围"顺带"包含进来。"""
+        ids = self._seed_pair(fresh_db, corpus["source_a"])
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, time_field="sent", since="2000-01-01"))
+        assert ids["without_sent"] not in _ids(result)
+        assert ids["with_sent"] in _ids(result)
+
+    def test_sent_time_sort_puts_empty_values_last(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        ids = self._seed_pair(fresh_db, corpus["source_a"])
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, time_field="sent", sort="time"))
+        order = _ids(result)
+        assert order.index(ids["with_sent"]) < order.index(ids["without_sent"])
+        assert result["hits"][-1]["sent_at"] is None, "没有消息时间的排在最后"
+
+    def test_cursor_is_bound_to_its_time_field(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        """拿入库时间的游标去翻消息时间会翻出错页——必须明确报错。"""
+        self._seed_pair(fresh_db, corpus["source_a"])
+        first = svc.run_search(fresh_db, SearchQuery(limit=1, sort="time"))
+        assert first["next_cursor"]
+        with pytest.raises(SearchError, match="time-field"):
+            svc.run_search(
+                fresh_db,
+                SearchQuery(limit=1, sort="time", time_field="sent", cursor=first["next_cursor"]),
+            )
+
+    def test_invalid_time_field_is_rejected(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        with pytest.raises(SearchError, match="时间字段"):
+            svc.run_search(fresh_db, SearchQuery(limit=5, time_field="yesterday"))
+
+    def test_keyword_with_sent_time_still_filters_by_keyword(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        """换时间字段只改"看哪个钟"，不能把关键词丢掉。"""
+        ids = self._seed_pair(fresh_db, corpus["source_a"])
+        result = svc.run_search(
+            fresh_db, SearchQuery(q="手工上传", limit=50, time_field="sent", sort="time")
+        )
+        assert _ids(result) == [ids["without_sent"]]
+
+
+class TestNameAndMediaFields:
+    def test_hit_carries_the_file_name(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        content_id = _seed_item(
+            fresh_db,
+            source_id=corpus["source_a"],
+            item_type="image",
+            original_name="电脑壁纸.jpg",
+            text=None,
+        )
+        hit = svc.run_search(fresh_db, SearchQuery(q="壁纸", limit=10))["hits"][0]
+        assert hit["content_id"] == content_id
+        assert hit["original_name"] == "电脑壁纸.jpg"
+        assert "电脑壁纸.jpg" in hit["search_extra"]
+
+    def test_hit_carries_mime_and_extension(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        media_hit = svc.run_search(fresh_db, SearchQuery(limit=50, item_types=("image",)))["hits"][0]
+        assert media_hit["media"]["mime_detected"] == "image/jpeg"
+        assert media_hit["media"]["extension"] == "jpg"
 
 
 class TestErrors:

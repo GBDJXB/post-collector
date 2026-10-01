@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」与「按关键词把它搜出来」这两条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 5 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；**检索链路真实可用**（应用层分词写入 `text_search` → FTS5 双索引候选 → 候选内过滤与 canonical 折叠 → 三条 SQL 组装 → `pc search` 输出命中理由；文件名/类型/备注经 `search_extra` 也进索引；预算与达成机制见 DESIGN §5.6）；测试套件覆盖以上全部，**728 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」与「按关键词把它搜出来」这两条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 5 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；**检索链路真实可用**（应用层分词写入 `text_search` → FTS5 双索引候选 → 候选内过滤与 canonical 折叠 → 三条 SQL 组装 → `pc search` 输出命中理由；文件名/类型/备注经 `search_extra` 也进索引；预算与达成机制见 DESIGN §5.6）；测试套件覆盖以上全部，**745 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **728 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 12~30 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **745 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 12~30 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -40,7 +40,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 手工上传 | `uv run pc upload PATH... [--note TEXT] [--source NAME] [--no-process] [--dry-run]` | root 自己丢文件进来的正式入口：**身份按内容哈希**（重传同一份内容不会变成两条）、`sent_at` 留空、`--note` 记来源线索。默认用（必要时新建）`kind=manual` 的「manual」来源，**不需要任何凭证**；**默认接着处理**（媒体引用是文件路径，原文件被删就只能死信） |
 | 跑处理管线 | `uv run pc work [--once] [--max N] [--loop] [--interval S]` | 抢占任务 → 取字节 → 扫描 → 哈希去重 → 落 media/content_item/content_media；确定性失败进死信，偶发失败退避重试 |
 | 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；带「备注」列（来源备注，没有则 `-`）；未建库时只提示不报错。**表格按显示宽度对齐**（中文/全角算 2 格，组合记号与零宽符算 0 格），每列有上限、超出用 `…` 截断——上限就是 `cli.ITEM_LIST_MAX_WIDTHS` / `SOURCE_LIST_MAX_WIDTHS` / `SEARCH_MAX_WIDTHS`，**加一列必须同时加上限**（`tests/test_cli_table.py` 有断言盯着）；上限只作用于表格，`--json` 永远是完整值 |
-| 检索 | `uv run pc search [关键词...] [--source N] [--tag N] [--type T] [--status S] [--since D] [--until D] [--nsfw-level 0..4] [--include-duplicates] [--sort relevance\|time] [--limit N] [--page N] [--cursor C] [--timings] [--json]` | 多个关键词是 AND；**1~2 字中文走词级索引、≥3 字走 trigram**（前者少于 3 字命中 0 且不报错）。默认只看 `active` 且 `nsfw_level <= 0`、折叠重复项——放宽要显式给参数。关键词检索**不给精确总数**（只给候选数，§5.6 M1b），纯过滤列表给。时间序翻页用 `--cursor`（取自 `--json` 的 `next_cursor`），相关度用 `--page`。每条结果都带"为什么命中"（命中词、命中列、带 `[]` 的片段）。0 结果且存在未分词的老行时会提示跑 `--recompute-derived` |
+| 检索 | `uv run pc search [关键词...] [--source N] [--tag N] [--type T] [--status S] [--since D] [--until D] [--time-field ingest\|sent] [--nsfw-level 0..4] [--include-duplicates] [--sort relevance\|time] [--limit N] [--page N] [--cursor C] [--timings] [--json]` | 多个关键词是 AND；**1~2 字中文走词级索引、≥3 字走 trigram**（前者少于 3 字命中 0 且不报错）。默认只看 `active` 且 `nsfw_level <= 0`、折叠重复项——放宽要显式给参数。**文件名、类型（值与中文说法）、你写的备注都是关键词**（经 `search_extra` 进索引）。`--since/--until/--sort time` 看哪个钟由 `--time-field` 决定（默认入库时间 `ingest`；`sent` 是消息时间，手工上传的该字段为空、会被时间范围排除并排在最后，footer 会说明）。关键词检索**不给精确总数**（只给候选数，§5.6 M1b），纯过滤列表给。时间序翻页用 `--cursor`（取自 `--json` 的 `next_cursor`；它与时间字段绑定，混用会明确报错），相关度用 `--page`。表格带「文件名」列；每条结果都带"为什么命中"（命中词、命中列、带 `[]` 的片段）。0 结果且存在未分词/未补名的老行时会提示跑 `--recompute-derived` |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -92,7 +92,7 @@ post-collector/
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5 重建与派生列重算、setting 读写）、FTS5 检索（双索引候选、候选内求交、键集分页）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账）、检索（可见性政策、来源与标签解析、页大小与预算闸门、可解释性） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list`、`search` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端（导入、上传、检索各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + 检索（分词、派生列重算与文件名回填、过滤/分页/可解释性/语句计数、基准脚本自身）+ schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 728 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端（导入、上传、检索各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + 检索（分词、派生列重算与文件名回填、过滤/分页/可解释性/语句计数、基准脚本自身）+ schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 745 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
 
 ## 边界约束
 
@@ -123,7 +123,8 @@ post-collector/
 - **不返回精确总数**（§5.6 M1b）：关键词检索只给候选数（`total=None`）；带标签的查询用 `tag.usage_count` 估（`total_kind="estimate"`，**打标切片必须维护这个计数器**，为 0 时退回真实计数）；其余条件数到 `COUNT_CAP=5000` 就停（`at_least`）。`has_more` 说的是"这一页之外还有没有"，与总数口径无关。
 - **组装固定三条 SQL，不允许 N+1**：主查询 + tag 批量 + 媒体批量；可解释性（命中词、命中列、片段高亮）从**已取回的列**算，不许为了 `snippet()` 逐行再查一次 FTS。`tests/test_search_service.py` 用语句计数盯着（关键词一页 5 条、纯过滤一页 4 条）。
 - **结果集的规模决定查询计划，不是拍脑袋的常数**：标签过滤在"时间索引 + EXISTS"与"物化最小标签集当驱动表（`CROSS JOIN` 强制顺序）"之间按**估算扫描行数**切换（`TAG_SCAN_LIMIT`）。两张表上都实测过，选错差一个数量级（§3.7 记了修改前后的数字）。**参数顺序必须与 SQL 文本一致**——驱动子查询在 FROM 里、EXISTS 在 WHERE 末尾，拼错了不报错、只是静默查不到东西（有回归测试）。
-- **分页有两条路**：时间序用键集游标（`next_cursor`，不透明串，第 20 页与第 1 页同价），相关度用候选集内 `--page`（候选耗尽仍未凑满一页时标 `incomplete`，如实说"结果可能不完整"）。页大小上限 50 与预算绑定，不由设置项放开。
+- **分页有两条路**：时间序用键集游标（`next_cursor`，不透明串，第 20 页与第 1 页同价），相关度用候选集内 `--page`（候选耗尽仍未凑满一页时标 `incomplete`，如实说"结果可能不完整"）。页大小上限 50 与预算绑定，不由设置项放开。**游标与时间字段绑定**：游标里编了 `ingest`/`sent`，拿一个字段的游标去翻另一个字段会明确报错（两者的顺序不同，混用会翻出错页且不报错——这类错必须变成报错）。
+- **时间有两个钟，由一个开关选**：`--time-field ingest`（默认，`content_item.first_seen_at`，即"进了我的库"）与 `sent`（`message.sent_at`，即"消息时间"）。它同时作用于 `--since/--until`、`--sort time` 与游标；按 `sent` 排序时查询**由 message 驱动**（`CROSS JOIN` 强制顺序，靠 `message_sent_idx`），否则十万行一次排序会击穿预算。`sent_at` 为空的行（手工上传刻意留空）在时间范围里被排除、在倒序里排最后——不要把它们"顺带"算进任何时间范围。
 - **引擎可替换**：过滤器是结构化字典，查询构造全在 `adapters/fts_search.py` 里，业务层不认识任何 FTS5 语法（换 Meilisearch 时只改这一个文件）。**基准脚本驱动真实实现**，不许在工具里复制一份 SQL——否则会出现"基准达标而线上很慢"。
 - **`search_extra` 的组成是固定契约**（`domain.search_extra_value` 的 docstring 写死了顺序）：来源名 → 平台 → 发送者名 → `item_type` → `item_type` 中文 → **文件名** → 标签名与同义词 → **来源备注**。落库（`pipeline`）与批量重算（`refresh_search_derived`）是两处调用，**改一处必须改另一处**：漂移的表现是"刚入库的搜得到、重算之后搜不到"（有测试比较两条路径的同值性）。文件名与备注是自由文本，拼接前各有上限（`FILE_NAME_LIMIT` / `SEARCH_EXTRA_TEXT_LIMIT`）。
 - **文件名只存 basename，且不参与路径拼接**：`content_item.original_name` 是展示与回填的落点（检索靠 `search_extra`，不靠它），规则在 `domain.filename_from_ref`（剥目录与 URL 的 query/fragment、去控制字符、截断 255）。老行按**无歧义**情形回填：该消息恰好一个 media 引用时取它的 basename；多附件消息与文本项留空。**文本文件的名字还没有**（纯文本文件没有 media ref，名字在 L2 之后就丢了；补齐要给 `SourceMessage` 加字段并给 `message` 加列，属于单独一刀——见 DESIGN 附录 C）。

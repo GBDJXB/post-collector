@@ -37,7 +37,15 @@ from typing import Any
 from pc.adapters import sqlite as db
 from pc.domain import is_cjk, normalize_text, tokenize_document, tokenize_query
 
-__all__ = ["BM25_WEIGHTS", "MAX_PAGE_SIZE", "SearchQueryError", "SqliteFtsSearch"]
+__all__ = [
+    "BM25_WEIGHTS",
+    "MAX_PAGE_SIZE",
+    "TIME_FIELDS",
+    "TIME_FIELD_INGEST",
+    "TIME_FIELD_SENT",
+    "SearchQueryError",
+    "SqliteFtsSearch",
+]
 
 #: ``content_fts`` 的列权重（列序：text_content, ocr_text, caption, search_extra）。
 #: 没有评估集之前不调参，这组值只是"正文 > 配文 > 标签与来源 > OCR"这个常识排序。
@@ -48,6 +56,13 @@ DEFAULT_CANDIDATE_CAPS: tuple[int, ...] = (500, 2000)
 
 #: 每页条数硬上限：与 §5.6 的预算绑定，设置项也只能到 50
 MAX_PAGE_SIZE = 50
+
+#: 时间字段的两种取值：入库时间（内容项第一次被看到）与消息时间（`message.sent_at`）。
+#: 手工上传的 `sent_at` 是空的（本地文件的 mtime 不是"发布时间"，所以刻意留空），
+#: 因此按消息时间过滤会排除它们——这是有意的，见 `_where` 与 CLI 的 footer 说明。
+TIME_FIELD_INGEST = "ingest"
+TIME_FIELD_SENT = "sent"
+TIME_FIELDS: tuple[str, ...] = (TIME_FIELD_INGEST, TIME_FIELD_SENT)
 
 #: 精确统计的上限（§5.6 M1b）：超过它就不再数下去，改为如实说"至少这么多"。
 #: 十万条库上 `COUNT(*)` 要几百毫秒，而它换来的信息是"还有更多"——不值。
@@ -238,6 +253,7 @@ class SqliteFtsSearch:
         driver, tag_clauses, driver_params, suffix_params = self._tag_driver(
             filters.get("tag_ids") or (), limit=size
         )
+        time_column = self._time_column(filters)
         base_where, base_params = self._where(filters, skip_tags=True)
         if tag_clauses:
             base_where = base_where + " AND " + " AND ".join(tag_clauses)
@@ -246,21 +262,31 @@ class SqliteFtsSearch:
         where, params = base_where, list(base_params)
         offset = 0
         if cursor:
-            first_seen_at, content_id = self._decode_cursor(cursor)
-            where += " AND (c.first_seen_at, c.content_id) < (?, ?)"
-            params += [first_seen_at, content_id]
+            moment, content_id = self._decode_cursor(cursor, field=self._time_field(filters))
+            where += f" AND ({time_column}, c.content_id) < (?, ?)"
+            params += [moment, content_id]
         else:
             offset = max(0, (max(1, int(page)) - 1) * size)
 
         mark = time.perf_counter()
-        rows = self._fetch_page(where, params, size + 1, offset, driver=driver)
+        rows = self._fetch_page(
+            where,
+            params,
+            size + 1,
+            offset,
+            driver=driver,
+            order_column=time_column,
+            filters=filters,
+        )
         timings["main"] = (time.perf_counter() - mark) * 1000
         has_more = len(rows) > size
         page_rows = rows[:size]
         page_ids = [int(row["content_id"]) for row in page_rows]
 
         mark = time.perf_counter()
-        total, total_kind = self._total_for(base_where, base_params, filters, driver=driver)
+        total, total_kind = self._total_for(
+            base_where, base_params, filters, driver=driver
+        )
         timings["count"] = (time.perf_counter() - mark) * 1000
 
         hits, tail = self._assemble(page_rows, page_ids, terms, filters)
@@ -268,7 +294,10 @@ class SqliteFtsSearch:
         next_cursor = None
         if has_more and page_rows:
             last = page_rows[-1]
-            next_cursor = self._encode_cursor(str(last["first_seen_at"]), int(last["content_id"]))
+            moment = last["sent_at"] if time_column == "m.sent_at" else last["first_seen_at"]
+            next_cursor = self._encode_cursor(
+                self._time_field(filters), str(moment), int(last["content_id"])
+            )
         timings["total"] = (time.perf_counter() - started) * 1000
         return {
             "hits": hits,
@@ -281,6 +310,7 @@ class SqliteFtsSearch:
             "incomplete": False,
             "terms": list(terms),
             "sort": "time",
+            "time_field": self._time_field(filters),
             "limit": size,
             "timings": timings,
         }
@@ -329,6 +359,7 @@ class SqliteFtsSearch:
                 size=size,
                 offset=offset,
                 cursor=cursor,
+                time_field=self._time_field(filters),
             )
             window_ids = [int(row["content_id"]) for row in page_rows]
             timings["main"] = (time.perf_counter() - mark) * 1000
@@ -346,6 +377,7 @@ class SqliteFtsSearch:
                 "incomplete": incomplete,
                 "terms": list(terms),
                 "sort": "time",
+                "time_field": self._time_field(filters),
                 "limit": size,
                 "timings": timings,
             }
@@ -372,6 +404,7 @@ class SqliteFtsSearch:
             "incomplete": incomplete,
             "terms": list(terms),
             "sort": "relevance",
+            "time_field": self._time_field(filters),
             "limit": size,
             "page": max(1, int(page)),
             "timings": timings,
@@ -384,28 +417,60 @@ class SqliteFtsSearch:
         size: int,
         offset: int,
         cursor: str | None,
+        time_field: str,
     ) -> tuple[list[Any], bool, str | None]:
         """在候选 id 集内按时间倒序取一页（关键词 + `--sort time` 这条组合）。"""
         if not ids:
             return [], False, None
+        column = "m.sent_at" if time_field == TIME_FIELD_SENT else "c.first_seen_at"
         marks = ",".join("?" * len(ids))
         where = f"c.content_id IN ({marks})"
         params: list[Any] = list(ids)
         real_offset = 0
         if cursor:
-            first_seen_at, content_id = self._decode_cursor(cursor)
-            where += " AND (c.first_seen_at, c.content_id) < (?, ?)"
-            params += [first_seen_at, content_id]
+            moment, content_id = self._decode_cursor(cursor, field=time_field)
+            where += f" AND ({column}, c.content_id) < (?, ?)"
+            params += [moment, content_id]
         else:
             real_offset = offset
-        rows = self._fetch_page(where, params, size + 1, real_offset)
+        rows = self._fetch_page(where, params, size + 1, real_offset, order_column=column)
         has_more = len(rows) > size
         page_rows = rows[:size]
         next_cursor = None
         if has_more and page_rows:
             last = page_rows[-1]
-            next_cursor = self._encode_cursor(str(last["first_seen_at"]), int(last["content_id"]))
+            moment = last["sent_at"] if time_field == TIME_FIELD_SENT else last["first_seen_at"]
+            next_cursor = self._encode_cursor(time_field, str(moment), int(last["content_id"]))
         return page_rows, has_more, next_cursor
+
+    @staticmethod
+    def _time_field(filters: Mapping[str, Any]) -> str:
+        return str(filters.get("time_field") or TIME_FIELD_INGEST)
+
+    def _time_column(self, filters: Mapping[str, Any]) -> str:
+        """当前时间字段对应的列（``sent`` 走消息时间，其余一律入库时间）。"""
+        return "m.sent_at" if self._time_field(filters) == TIME_FIELD_SENT else "c.first_seen_at"
+
+    def _from_clause_for(self, filters: Mapping[str, Any], driver: str | None = None) -> str:
+        """按时间字段选 FROM：按消息时间排序时**由 message 驱动**（否则要整体排序）。
+
+        ``sent`` 路径用 ``CROSS JOIN`` 强制连接顺序，理由与标签驱动集相同（见
+        :meth:`_from_clause`）：不加这一句，SQLite 可能仍从 content_item 出发再按
+        ``m.sent_at`` 排序，十万行一次排序就足以击穿 §5.6 的 P99。
+        """
+        if self._time_field(filters) != TIME_FIELD_SENT:
+            return self._from_clause(driver)
+        if driver is not None:
+            return (
+                f"  FROM message m CROSS JOIN ({driver}) AS t"
+                " CROSS JOIN content_item c ON c.message_id = m.message_id"
+                " AND c.content_id = t.content_id"
+                "  JOIN source s ON s.source_id = m.source_id"
+            )
+        return (
+            "  FROM message m CROSS JOIN content_item c ON c.message_id = m.message_id"
+            "  JOIN source s ON s.source_id = m.source_id"
+        )
 
     # -- 候选与过滤 ---------------------------------------------------------
 
@@ -478,6 +543,7 @@ class SqliteFtsSearch:
         "       substr(c.ocr_text, 1, 200) AS ocr_text,"
         "       substr(c.caption, 1, 200) AS caption,"
         "       substr(c.search_extra, 1, 300) AS search_extra,"
+        "       c.original_name,"
         "       m.source_id, m.sent_at, m.origin_note, m.sender_display_name,"
         "       s.name AS source_name"
     )
@@ -612,11 +678,11 @@ class SqliteFtsSearch:
 
         since = filters.get("since")
         if since:
-            clauses.append("c.first_seen_at >= ?")
+            clauses.append(f"{self._time_column(filters)} >= ?")
             params.append(str(since))
         until = filters.get("until")
         if until:
-            clauses.append("c.first_seen_at <= ?")
+            clauses.append(f"{self._time_column(filters)} <= ?")
             params.append(str(until))
 
         if not skip_tags:
@@ -650,10 +716,13 @@ class SqliteFtsSearch:
         offset: int = 0,
         *,
         driver: str | None = None,
+        order_column: str = "c.first_seen_at",
+        filters: Mapping[str, Any] | None = None,
     ) -> list[Any]:
+        source = self._from_clause_for(filters or {}, driver) if filters is not None else self._from_clause(driver)
         sql = (
-            f"{self._SELECT_HIT}{self._from_clause(driver)} WHERE {where}"
-            " ORDER BY c.first_seen_at DESC, c.content_id DESC LIMIT ?"
+            f"{self._SELECT_HIT}{source} WHERE {where}"
+            f" ORDER BY {order_column} DESC, c.content_id DESC LIMIT ?"
         )
         args = [*params, int(count)]
         if offset:
@@ -703,11 +772,16 @@ class SqliteFtsSearch:
             ]
             if usage and min(usage) > 0:
                 return min(usage), "estimate"
-        total, capped = self._count_capped(where, params, driver=driver)
+        total, capped = self._count_capped(where, params, filters=filters, driver=driver)
         return total, "at_least" if capped else "exact"
 
     def _count_capped(
-        self, where: str, params: Sequence[Any], *, driver: str | None = None
+        self,
+        where: str,
+        params: Sequence[Any],
+        *,
+        filters: Mapping[str, Any] | None = None,
+        driver: str | None = None,
     ) -> tuple[int, bool]:
         """数到 :data:`COUNT_CAP` 就停（§5.6 M1b）。
 
@@ -715,10 +789,8 @@ class SqliteFtsSearch:
             ``(数量, 是否被截断)``。被截断时数量就是上限值，调用方要如实说"至少这么多"，
             而不是把它当成精确总数——那正是 M1b 要避免的误导。
         """
-        sql = (
-            "SELECT count(*) FROM (SELECT 1"
-            f"{self._from_clause(driver)} WHERE {where} LIMIT ?)"
-        )
+        source = self._from_clause_for(filters or {}, driver)
+        sql = f"SELECT count(*) FROM (SELECT 1{source} WHERE {where} LIMIT ?)"
         value = int(self._conn.execute(sql, [*params, COUNT_CAP + 1]).fetchone()[0])
         if value > COUNT_CAP:
             return COUNT_CAP, True
@@ -761,7 +833,8 @@ class SqliteFtsSearch:
         mark = time.perf_counter()
         media: dict[int, dict[str, Any]] = {}
         for row in self._conn.execute(
-            "SELECT cm.content_id, m.object_key, m.thumb_key, m.width, m.height, m.scan_status"
+            "SELECT cm.content_id, m.object_key, m.thumb_key, m.width, m.height, m.scan_status,"
+            "       m.mime_detected, m.extension"
             "  FROM content_media cm JOIN media m ON m.media_id = cm.media_id"
             f" WHERE cm.content_id IN ({marks}) ORDER BY cm.ordinal",
             list(ids),
@@ -776,6 +849,8 @@ class SqliteFtsSearch:
                     "width": row["width"],
                     "height": row["height"],
                     "scan_status": row["scan_status"],
+                    "mime_detected": row["mime_detected"],
+                    "extension": row["extension"],
                 },
             )
             entry["count"] += 1
@@ -804,12 +879,14 @@ class SqliteFtsSearch:
                     "status": row["status"],
                     "nsfw_level": int(row["nsfw_level"]),
                     "first_seen_at": row["first_seen_at"],
+                    "original_name": row["original_name"],
                     "source_id": int(row["source_id"]),
                     "source": row["source_name"],
                     "sent_at": row["sent_at"],
                     "origin_note": row["origin_note"],
                     "sender": row["sender_display_name"],
                     "text": fields["text_content"],
+                    "search_extra": fields["search_extra"],
                     "snippet": self._snippet(fields, terms),
                     "matched_terms": matched,
                     "matched_fields": matched_fields,
@@ -893,19 +970,31 @@ class SqliteFtsSearch:
     # -- 游标（键集分页） ---------------------------------------------------
 
     @staticmethod
-    def _encode_cursor(first_seen_at: str, content_id: int) -> str:
-        raw = f"{first_seen_at}|{content_id}".encode()
+    def _encode_cursor(time_field: str, moment: str, content_id: int) -> str:
+        """游标里带**时间字段**：拿入库时间的游标去翻消息时间会翻出错页，必须能查出来。"""
+        raw = f"{time_field}|{moment}|{content_id}".encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
     @staticmethod
-    def _decode_cursor(cursor: str) -> tuple[str, int]:
+    def _decode_cursor(cursor: str, *, field: str) -> tuple[str, int]:
+        """解码游标并校验它属于当前的时间字段（不一致时明确报错，而不是静默给错页）。"""
         try:
             padded = cursor + "=" * (-len(cursor) % 4)
             raw = base64.urlsafe_b64decode(padded.encode()).decode()
-            first_seen_at, _, content_id = raw.rpartition("|")
-            return first_seen_at, int(content_id)
+            encoded_field, _, rest = raw.partition("|")
+            moment, _, content_id = rest.rpartition("|")
+            if not moment or not content_id:
+                raise ValueError("游标缺少字段")
+            parsed = int(content_id)
         except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
             raise SearchQueryError(
                 "翻页游标坏了（它应当来自上一次结果的 next_cursor）。"
                 "想从头看就重新查询，不要手写游标。"
             ) from exc
+        if encoded_field != field:
+            raise SearchQueryError(
+                f"这个游标是按「{encoded_field}」时间的翻页位置生成的，当前查询用的是"
+                f"「{field}」。两者的顺序不同，混用会翻出错页——请重新查询，或用"
+                f"--time-field {encoded_field} 继续上一次的翻页。"
+            )
+        return moment, parsed

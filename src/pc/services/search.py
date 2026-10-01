@@ -26,7 +26,13 @@ from difflib import get_close_matches
 from typing import Any
 
 from pc import config as cfg
-from pc.adapters.fts_search import MAX_PAGE_SIZE, SearchQueryError, SqliteFtsSearch
+from pc.adapters.fts_search import (
+    MAX_PAGE_SIZE,
+    TIME_FIELD_INGEST,
+    TIME_FIELDS,
+    SearchQueryError,
+    SqliteFtsSearch,
+)
 from pc.adapters.sqlite import read_settings, stale_search_row_count
 from pc.services.sources import get_source, list_sources
 
@@ -63,6 +69,9 @@ class SearchQuery:
     tags: tuple[str, ...] = ()
     since: str | None = None
     until: str | None = None
+    #: 时间字段：``ingest`` 看内容项第一次入库的时间（默认），``sent`` 看消息时间
+    #: （``message.sent_at``）。手工上传的 ``sent_at`` 是空的——按 ``sent`` 过滤会排除它们。
+    time_field: str = TIME_FIELD_INGEST
     nsfw_max_level: int = 0
     include_duplicates: bool = False
     sort: str | None = None
@@ -125,11 +134,21 @@ def run_search(
 ) -> dict[str, Any]:
     """执行一次检索，返回可直接渲染的结果字典（见 ``SearchIndex.query`` 的返回约定）。
 
+    ``time_field="sent"`` 时 ``--since/--until`` 与时间排序都看 ``message.sent_at``；
+    该列为空的行（手工上传刻意留空）会被时间范围排除——"没有消息时间"与"消息时间不在
+    范围内"不是一回事，后者不该把前者混进来。
+
     Raises:
-        SearchError: 来源/标签不存在、页大小或页码越界、时间格式不合法、游标损坏。
+        SearchError: 来源/标签不存在、页大小或页码越界、时间字段非法、时间格式不合法、
+            游标损坏或与当前时间字段不匹配。
     """
     if query.page < 1:
         raise SearchError(f"页码从 1 开始，收到 page={query.page}。")
+    if query.time_field not in TIME_FIELDS:
+        raise SearchError(
+            f"时间字段只能是 {' 或 '.join(TIME_FIELDS)}，收到 {query.time_field!r}"
+            "（ingest=入库时间，sent=收到消息的时间）。"
+        )
     if not 0 <= query.nsfw_max_level <= 4:
         raise SearchError(
             f"nsfw_level 只能是 0~4，收到 {query.nsfw_max_level}（0=safe 默认，4=restricted）。"
@@ -149,6 +168,7 @@ def run_search(
         "statuses": tuple(query.statuses or ("active",)),
         "nsfw_max_level": int(query.nsfw_max_level),
         "item_types": tuple(query.item_types),
+        "time_field": query.time_field,
         "since": _normalize_time(query.since, end=False),
         "until": _normalize_time(query.until, end=True),
         "fold_duplicates": not query.include_duplicates,
