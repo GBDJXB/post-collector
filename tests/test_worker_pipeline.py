@@ -70,17 +70,20 @@ def _seed(
     msg_id: str = "m1",
     attempts: int = 0,
     max_attempts: int = 5,
+    sender: str | None = None,
 ) -> tuple[int, int]:
     """直接写一条消息 + 一个排队任务（绕开连接器，便于构造边界情况）。"""
     message_id = conn.execute(
-        "INSERT INTO message (uuid, source_id, platform_msg_id, message_type, text_raw, media_refs) "
-        "VALUES (?, ?, ?, ?, ?, ?) RETURNING message_id",
+        "INSERT INTO message (uuid, source_id, platform_msg_id, message_type, text_raw,"
+        " sender_display_name, media_refs) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
         (
             str(uuid.uuid4()),
             source_id,
             msg_id,
             "media" if refs else "text",
             text,
+            sender,
             json.dumps(list(refs)),
         ),
     ).fetchone()[0]
@@ -159,9 +162,15 @@ class TestClaimAndRecover:
 
 
 class TestTextItems:
-    def test_text_item_keeps_raw_and_leaves_tokenized_column_empty(
+    def test_text_item_keeps_raw_and_tokenizes_into_text_search(
         self, env: SimpleNamespace
     ) -> None:
+        """``text_search`` 是应用层分词结果（DESIGN §5.1），落库时就该算好。
+
+        ``content_word`` 只索引这一列，所以它留空等于"1~2 字中文查询永远搜不到"。
+        这里同时钉住两件事：正文保持原样（`text_content` 不改写），以及分词覆盖
+        **与 content_fts 相同的四列**——`search_extra`（来源名/平台）也在词级索引里。
+        """
         source = _source(env.conn, env.tmp)
         _seed(env.conn, source_id=source["source_id"], text="  Hello　World  ")
         report = env.worker.run_once()
@@ -169,9 +178,59 @@ class TestTextItems:
         row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
         assert row["item_type"] == "text"
         assert row["text_content"] == "  Hello　World  ", "正文保持原样"
-        assert row["text_search"] is None, "没有分词器就不要假装有（DESIGN §5.1）"
+        assert row["text_search"] == "hello world mine local", (
+            "分词结果 = 正文（NFKC 之后）+ search_extra；全角空格被折叠"
+        )
         assert row["search_extra"] == "mine local"
         assert row["char_count"] == len("Hello World"), "字符数按规范化后的文本算"
+
+    def test_chinese_text_gets_single_and_double_character_tokens(
+        self, env: SimpleNamespace
+    ) -> None:
+        """中文要产出单字与双字：单字让 1 字查询可命中，双字让 2 字查询可命中。"""
+        source = _source(env.conn, env.tmp)
+        _seed(env.conn, source_id=source["source_id"], text="蓝发精灵在雨里")
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert "蓝发" in row["text_search"].split()
+        assert "雨" in row["text_search"].split()
+        assert "蓝发精" not in row["text_search"].split(), "三字交给 trigram，不进词级索引"
+
+    def test_pipeline_written_row_is_searchable_by_two_characters(
+        self, env: SimpleNamespace
+    ) -> None:
+        """端到端钉住设计里那条退化点：**真实管线写出的行**，2 字查询必须命中词级索引。
+
+        《DESIGN §5.1》：``trigram`` 在查询串少于 3 字时命中 0；因此 2 字必须由
+        `content_word` 兜住，而它只索引 `text_search`——这一列由 worker 在落库时算好。
+        `tests/test_sqlite_behaviour.py` 用手工种的 `text_search` 断言过这条规则，
+        这里断言的是"管线真的产出了满足它的那一列"。
+        """
+        source = _source(env.conn, env.tmp)
+        _seed(env.conn, source_id=source["source_id"], text="蓝发精灵在雨里")
+        assert env.worker.run_once().succeeded == 1
+        word_hits = env.conn.execute(
+            "SELECT count(*) FROM content_word WHERE content_word MATCH ?", ('"蓝发"',)
+        ).fetchone()[0]
+        trigram_hits = env.conn.execute(
+            "SELECT count(*) FROM content_fts WHERE content_fts MATCH ?", ('"蓝发"',)
+        ).fetchone()[0]
+        assert word_hits == 1, "2 字查询没命中词级索引，说明 text_search 没写对"
+        assert trigram_hits == 0, "trigram 的 2 字退化行为应该保持原样"
+
+    def test_sender_name_enters_search_extra(self, env: SimpleNamespace) -> None:
+        """发送者名是检索维度（DESIGN §5.1），拼进 search_extra 才搜得到。"""
+        source = _source(env.conn, env.tmp)
+        _seed(
+            env.conn,
+            source_id=source["source_id"],
+            text="一段话",
+            sender="蓝发精灵",
+        )
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["search_extra"] == "mine local 蓝发精灵"
+        assert "蓝发" in row["text_search"].split()
 
     def test_same_text_in_two_messages_is_grouped_not_blocked(
         self, env: SimpleNamespace

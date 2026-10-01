@@ -318,6 +318,127 @@ def normalize_text(text: str) -> str:
     return " ".join(normalized.split())
 
 
+# ---------------------------------------------------------------------------
+# 检索分词（DESIGN §5.1）
+#
+# 为什么中文要自己分词：FTS5 没有中文分词器，`unicode61` 会把一整句中文当成**一个**
+# token（中文没有空格），于是 `content_word MATCH '蓝发'` 永远命中不了。而 `trigram`
+# 索引在**查询串少于 3 个字符时命中 0 行且不报错**——"雨""蓝发"这种最常见的查询会
+# 静默返回空结果。所以：
+#
+#   * `tokenize_document`（写侧）：CJK 连续串产出**全部单字 + 全部双字**，
+#     拉丁/数字/下划线的连续串产出整词。单字让 1 字查询可命中，双字让 2 字查询可命中，
+#     而 3 字以上交给 trigram 索引拿子串与容错。
+#   * `tokenize_query`（读侧）：原始词长 1~2 时它在词级索引里就是那个词本身；
+#     长度 ≥3 的词走 trigram，不用它。
+#
+# 两侧必须共用本模块：写侧与读侧的切法一旦不同，索引里有的词查询侧就找不到。
+# ---------------------------------------------------------------------------
+
+#: 视为"中日韩文字"的码点区间（Han 基本区与扩展 A/兼容、假名、谚文）
+_CJK_RANGES: tuple[tuple[int, int], ...] = (
+    (0x3400, 0x4DBF),  # CJK 扩展 A
+    (0x4E00, 0x9FFF),  # CJK 基本区
+    (0xF900, 0xFAFF),  # CJK 兼容表意文字
+    (0x3040, 0x30FF),  # 平假名 + 片假名
+    (0xAC00, 0xD7A3),  # 谚文音节
+    (0x1100, 0x11FF),  # 谚文字母
+    (0x20000, 0x2FA1F),  # CJK 扩展 B 及以后
+)
+
+
+def is_cjk(char: str) -> bool:
+    """这个字符算不算"中日韩文字"（决定是按字切还是按词切）。"""
+    code = ord(char)
+    return any(low <= code <= high for low, high in _CJK_RANGES)
+
+
+def _is_word_char(char: str) -> bool:
+    """拉丁/数字/下划线：算"词字符"，连续的一段当成一个整词。
+
+    ``_`` 算词字符是有意的：标签名形如 ``blue_hair``，拆成两个词会让"按标签名搜"
+    变成两个 AND 条件，命中范围与直觉不符。
+    """
+    return not is_cjk(char) and (char.isalnum() or char == "_")
+
+
+def _runs(text: str) -> list[tuple[bool, str]]:
+    """把文本切成"连续的 CJK 段"与"连续的词字符段"，其余字符当分隔符丢弃。"""
+    runs: list[tuple[bool, str]] = []
+    current: list[str] = []
+    current_is_cjk: bool | None = None
+    for char in text:
+        if is_cjk(char):
+            kind = True
+        elif _is_word_char(char):
+            kind = False
+        else:
+            if current and current_is_cjk is not None:
+                runs.append((current_is_cjk, "".join(current)))
+            current, current_is_cjk = [], None
+            continue
+        if current_is_cjk is None:
+            current_is_cjk = kind
+        elif current_is_cjk != kind:
+            runs.append((current_is_cjk, "".join(current)))
+            current, current_is_cjk = [], kind
+        current.append(char)
+    if current and current_is_cjk is not None:
+        runs.append((current_is_cjk, "".join(current)))
+    return runs
+
+
+def tokenize_document(text: str | None) -> tuple[str, ...]:
+    """写侧分词：产出写进 ``content_item.text_search`` 的词元（DESIGN §5.1）。
+
+    CJK 段 → 全部单字 + 全部双字；词字符段 → 整词（大小写折叠）。
+    标点、空白、emoji 都是分隔符，不进索引（emoji 查询不承诺可搜）。
+    """
+    if not text:
+        return ()
+    tokens: list[str] = []
+    for is_cjk_run, run in _runs(normalize_text(text)):
+        if is_cjk_run:
+            tokens.extend(run)
+            tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+        else:
+            tokens.append(run.casefold())
+    return tuple(tokens)
+
+
+def tokenize_query(term: str) -> tuple[str, ...]:
+    """读侧分词：把一个**原始查询词**变成词级索引要匹配的词元。
+
+    长度 ≥3 的词走 trigram 索引（子串语义），不经过这里。这里处理 1~2 字的词：
+    它们本身就是词元（单字对应单字 token，双字对应双字 token），所以只需要按
+    同样的规则切一次（拉丁词折叠大小写、去掉标点）。
+
+    刻意保持与写侧同一套规则：查询侧切出来的词元必须都在写侧产出的词元集合里，
+    否则索引里有、查询却找不到。将来读侧真要分叉（例如拉丁前缀匹配），差异写在这里。
+    """
+    return tokenize_document(term)
+
+
+def search_tokens(*parts: str | None) -> str | None:
+    """把参与检索的几列拼起来分词，得到写进 ``content_item.text_search`` 的串。
+
+    这是 ``content_word``（词级索引）的**唯一来源**。四列都为空时返回 ``None``——
+    "没有可检索文本"与"分词结果为空"是两件事，前者不该被重算命令反复当成"还没分词"。
+    """
+    text = " ".join(part for part in parts if part)
+    tokens = tokenize_document(text)
+    return " ".join(tokens) if tokens else None
+
+
+def search_extra_value(*parts: str | None) -> str:
+    """``content_item.search_extra`` 的合成规则（DESIGN §5.1）。
+
+    参与检索的"补充字段"拼成一个串：来源名、平台、发送者名、标签名与同义词、
+    链接标题。它是派生的——改标签或改来源名之后必须重算（见 ``SearchIndex.rebuild``）。
+    """
+    return " ".join(part.strip() for part in parts if part and part.strip())
+
+
 __all__ = [
     "AiInvolvement",
     "AuthzMode",
@@ -339,5 +460,10 @@ __all__ = [
     "TagCandidate",
     "TagNamespace",
     "TagSource",
+    "is_cjk",
     "normalize_text",
+    "search_extra_value",
+    "search_tokens",
+    "tokenize_document",
+    "tokenize_query",
 ]

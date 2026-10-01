@@ -38,7 +38,7 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,6 +46,8 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+from pc.domain import search_extra_value, search_tokens
 
 #: 默认路径（相对仓库根）
 DEFAULT_ENV_FILE = Path(".env")
@@ -1256,6 +1258,92 @@ def _fts_row_count(conn: sqlite3.Connection, virtual: str) -> int:
     return int(row[0]) if row else 0
 
 
+#: 参与检索的四列（DESIGN §5.1）。`content_fts` 索引它们，`text_search` 由它们分词而来。
+SEARCH_SOURCE_COLUMNS: tuple[str, ...] = ("text_content", "ocr_text", "caption", "search_extra")
+
+
+def stale_search_row_count(conn: sqlite3.Connection) -> int:
+    """有多少行"有可检索文本、却还没有分词结果"。
+
+    升级前落库的老行、以及改过分词规则之后的行都会落在这里。``pc doctor`` 与
+    ``pc search``（0 结果时）用它提示"该跑一次派生列重算了"，而不是让人对着空结果猜。
+    """
+    row = conn.execute(
+        "SELECT count(*) FROM content_item "
+        " WHERE text_search IS NULL AND deleted_at IS NULL "
+        "   AND (text_content IS NOT NULL OR ocr_text IS NOT NULL "
+        "        OR caption IS NOT NULL OR search_extra IS NOT NULL)"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def refresh_search_derived(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = 500,
+    progress: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """重算两列检索派生数据（``text_search``、``search_extra``），返回统计。
+
+    **为什么要重算**：这两列是派生的（DESIGN §2.3 的派生数据纪律）——
+
+    * 分词规则变了（本仓库从"没有分词器"变成"单字 + 双字"），老行得跟着变；
+    * ``search_extra`` 含来源名、发送者名与**标签名**，改标签或改来源名之后它就过期了。
+
+    分批提交（DESIGN §2.3）：SQLite 是单写者，一次更新十万行会让写锁长时间不释放。
+    本函数幂等：算出来的值与现有值相同就不写（``WHERE`` 里带比较），重复跑只花读的时间。
+    """
+    size = max(1, int(batch_size))
+    total = int(conn.execute("SELECT count(*) FROM content_item").fetchone()[0])
+    updated = 0
+    scanned = 0
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            "SELECT c.content_id, c.text_content, c.ocr_text, c.caption, c.text_search,"
+            "       c.search_extra, s.name AS source_name, s.platform,"
+            "       m.sender_display_name,"
+            "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
+            "          JOIN tag t ON t.tag_id = ta.tag_id"
+            "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "
+            "  FROM content_item c"
+            "  JOIN message m ON m.message_id = c.message_id"
+            "  JOIN source s ON s.source_id = m.source_id"
+            " WHERE c.content_id > ? ORDER BY c.content_id LIMIT ?",
+            (last_id, size),
+        ).fetchall()
+        if not rows:
+            break
+        pending: list[tuple[str | None, str, int]] = []
+        for row in rows:
+            last_id = int(row["content_id"])
+            scanned += 1
+            extra = search_extra_value(
+                row["source_name"],
+                row["platform"],
+                row["sender_display_name"],
+                row["tag_names"],
+            )
+            tokens = search_tokens(
+                row["text_content"], row["ocr_text"], row["caption"], extra
+            )
+            if tokens == row["text_search"] and extra == row["search_extra"]:
+                continue
+            pending.append((tokens, extra, last_id))
+        if pending:
+            with transaction(conn):
+                for tokens, extra, content_id in pending:
+                    conn.execute(
+                        "UPDATE content_item SET text_search = ?, search_extra = ?, updated_at = ? "
+                        "WHERE content_id = ?",
+                        (tokens, extra, now_iso(), content_id),
+                    )
+            updated += len(pending)
+        if progress is not None:
+            progress(scanned, total)
+    return {"scanned": scanned, "updated": updated, "total": total}
+
+
 # ---------------------------------------------------------------------------
 # 设置层读写（DESIGN §6.2）
 # ---------------------------------------------------------------------------
@@ -1486,6 +1574,7 @@ __all__ = [
     "MIN_SQLITE_VERSION",
     "PRAGMA_BASELINE",
     "RUNTIME_DIR_SPECS",
+    "SEARCH_SOURCE_COLUMNS",
     "SETTING_CHANGE_VIA",
     "SETTING_SOURCES",
     "DatabaseError",
@@ -1523,6 +1612,7 @@ __all__ = [
     "read_env_file",
     "read_settings",
     "recorded_checksum",
+    "refresh_search_derived",
     "reindex_fts",
     "resolve_db_path",
     "resolve_paths",
@@ -1531,6 +1621,7 @@ __all__ = [
     "settings_revision",
     "split_statements",
     "sqlite_version_ok",
+    "stale_search_row_count",
     "transaction",
     "write_setting_change",
 ]

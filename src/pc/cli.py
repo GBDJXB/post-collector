@@ -609,21 +609,45 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
 
 
 def cmd_db_reindex(args: argparse.Namespace) -> int:
-    """全量重建两个 FTS5 索引（索引是派生数据，随时可重建，DESIGN §9.1）。"""
+    """重建两个 FTS5 索引；``--recompute-derived`` 时先重算两列检索派生数据。
+
+    索引是派生数据（DESIGN §9.1），随时可重建。但**派生列**不是索引：``text_search``
+    与 ``search_extra`` 是应用层算出来写在表里的，索引只是把它们搬进倒排表。所以
+    "搜不到"分两种情况：索引坏了（重建索引即可）、派生列过期或从来没算过（要先重算）。
+    这个开关一次把两件事都做完，顺序不能反。
+    """
     from pc.adapters import sqlite as db
 
     resolved, _ = _db_and_paths(args)
     try:
         with db.open_db(resolved.path, expect_exists=True) as conn:
-            result = db.reindex_fts(conn)
+            if getattr(args, "recompute_derived", False):
+                stale = db.stale_search_row_count(conn)
+                print(f"  · 待重算：{stale} 行没有分词结果（其余行只是核对，值相同不写）")
+                result = db.refresh_search_derived(
+                    conn,
+                    batch_size=getattr(args, "batch_size", None) or 500,
+                    progress=_reindex_progress,
+                )
+                print(
+                    f"  ✓ 派生列：扫描 {result['scanned']} 行，更新 {result['updated']} 行"
+                    f"（共 {result['total']} 行）"
+                )
+            reindexed = db.reindex_fts(conn)
     except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
 
-    for name in sorted(result["after"]):
-        before = result["before"].get(name, 0)
-        print(f"  ✓ {name}：{before} 行 → {result['after'][name]} 行")
+    for name in sorted(reindexed["after"]):
+        before = reindexed["before"].get(name, 0)
+        print(f"  ✓ {name}：{before} 行 → {reindexed['after'][name]} 行")
     return 0
+
+
+def _reindex_progress(scanned: int, total: int) -> None:
+    """每两千行报一次进度：十万行的重算要跑一会儿，静默会让人以为卡住了。"""
+    if scanned % 2000 == 0 or scanned >= total:
+        print(f"    … 已核对 {scanned}/{total} 行")
 
 
 def _project_root(args: argparse.Namespace) -> Path:
@@ -1438,6 +1462,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_reindex = p_db_sub.add_parser("reindex", help="全量重建两个 FTS5 索引")
     p_db_reindex.add_argument("--path", help=db_path_help)
     p_db_reindex.add_argument("--root", help=root_help)
+    p_db_reindex.add_argument(
+        "--recompute-derived",
+        action="store_true",
+        help="重建索引之前先重算 text_search / search_extra（升级后或改过分词规则后跑一次）",
+    )
+    p_db_reindex.add_argument(
+        "--batch-size", type=int, help="重算派生列时每批提交多少行（默认 500）"
+    )
     p_db_reindex.set_defaults(func=cmd_db_reindex)
 
     # -- 来源与导入 ---------------------------------------------------------

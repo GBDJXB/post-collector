@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**557 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**601 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,11 +26,11 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **557 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **601 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
-| 重建检索索引 | `uv run pc db reindex` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段 |
+| 重建检索索引 | `uv run pc db reindex [--recompute-derived] [--batch-size N]` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段。**`--recompute-derived` 先重算两列派生数据**（`text_search`、`search_extra`）再重建：升级后、改过分词规则后、打标之后都该跑一次——派生列过期时索引再新也搜不到。分批提交、幂等（值相同不写） |
 | 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
 | 看设置项生效值 | `uv run pc config show [--explain] [--key K] [--json]` | 逐项打印生效值 + **来源**（env / db / yaml / default），回答「这个值为什么是 8」。数据库不可达不影响退出码，只降级成文件与环境层并打印一行说明 |
 | 首次播种设置项 | `uv run pc config seed` | 只插入缺失的键，**绝不覆盖已有值**；重复运行安全。播种不写 `setting_change`（那不是谁做的改动） |
@@ -89,7 +89,7 @@ post-collector/
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 557 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 601 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
 
 ## 边界约束
 
@@ -150,7 +150,7 @@ post-collector/
 - **幂等护栏**：处理前先查这条消息有没有内容项，有就直接成功返回。崩溃恢复会把任务重置为排队并重跑，护栏保证不会产生第二份内容。
 - **一份字节只有一行 `media`**：`media.sha256` 唯一；多个内容项各自通过 `content_media` 引用同一行（内容项与媒体是**多对多**）。`media.scan_status` 是**字节**的属性，复用时不因某次"扩展名骗人"就改写它；本次判定落在 `content_item.status` 上。
 - **隔离区是独立的存储后端行**：扫描不通过的字节写进 `quarantine_root` 并记 `storage_backend_id = local-quarantine`、`quarantine_key` 非空。`media.object_key` 因此**是相对所属后端根目录的键**——判断"这份字节在主存储还是隔离区"要看 `quarantine_key`，不能只看 `object_key`。
-- **`text_content` 存原文、`text_search` 刻意留空**：`text_search` 的契约是"应用层分词结果，空格连接"（DESIGN §5.1）；本切片没有分词器，塞进未分词原文只会让 `content_word` 里出现一个巨大的单 token。词级检索随检索切片一起接，届时**要覆盖这一列**（不是只在插入时写）。trigram 索引已经在 `text_content` 上工作，所以 ≥3 字符的子串检索今天是可用的；<3 字符命中 0 行（§5.1 已实测）。
+- **`text_content` 存原文，`text_search` 存应用层分词结果**：`text_search` 是 `content_word`（词级索引）的唯一来源，由 worker 在落库时用 `pc.domain.search_tokens()` 算好。分词规则是**CJK 单字 + 双字、拉丁/数字/下划线按整词（大小写折叠）**——原因是 FTS5 没有中文分词器，而 `trigram` 在查询串少于 3 字时命中 0：没有单字 token，1 字查询搜不到；没有双字 token，2 字查询（中文最常见的查询）搜不到，而且**不报错**。`text_search` 覆盖与 `content_fts` **相同的四列**（`text_content`/`ocr_text`/`caption`/`search_extra`），否则"2 字的标签名/来源名"在词级索引里无处可查。**改分词规则必须让老行跟上**：`pc db reindex --recompute-derived`（先重算两列派生数据、再重建索引）；`pc doctor` 与 `pc search`（0 结果时）会提示还有多少行没分词。
 - **`pc import` 必须把目录持久化进 `source.config["roots"]`**：worker 在另一个时刻取字节，它只读那里；目录只活在命令行参数里的话，导入能成功而处理阶段拿不到引用（无法续跑）。`--dry-run` 除外——它什么都不写。
 - **连接器的根可以是一个文件**：`pc upload a.jpg` / `pc import a.jpg` 时根就是那个文件本身，`discover()` 必须只产出它（`relative` 取文件名）。这条曾经是缺陷：`Path("a.jpg").rglob("*")` 是空的，于是"导入单个文件"静默地什么都不做。修法是让文件根产出它自己，而**不是**把根换成父目录——那会把整个目录都导进来，是另一种误伤。单文件路径照样进 `source.config["roots"]`。
 - **内容身份用的就是内容层那两个哈希**：媒体取字节的 `sha256`（等于 `media.sha256`），文本取 `sha256(normalize_text(原文))`（等于 `content_item.content_hash`）。两处同一套判据，只差空白的文本文件因此算同一条，而不是先分裂成两条再靠 `dup_group_id` 归组。**0 字节的文件一律不产生消息**——所有空文件的哈希是同一个值，拿它当身份会让它们互相顶掉；这不会丢内容，媒体的同名侧车文本本身就是文本文件、会被单独发现（有测试钉着这个坑）。

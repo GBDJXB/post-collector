@@ -32,7 +32,13 @@ from pc.adapters.magic_scan import MagicNumberScanner, declared_mime_for_name, i
 from pc.adapters.registry import SourceConfigError, UnsupportedSourceKindError, connector_for
 from pc.adapters.sqlite import now_iso, transaction
 from pc.config import IngestLimits, JobSettings
-from pc.domain import MediaTooLargeError, ObjectKey, normalize_text
+from pc.domain import (
+    MediaTooLargeError,
+    ObjectKey,
+    normalize_text,
+    search_extra_value,
+    search_tokens,
+)
 from pc.services.ingest import JOB_TYPE_PROCESS
 from pc.services.sources import ensure_default_backend, load_authorizations
 
@@ -400,7 +406,11 @@ class Worker:
     ) -> tuple[str, str]:
         """一个短事务写下全部结果（DESIGN §2.3 的单写者纪律）。"""
         message_id = int(message["message_id"])
-        source_extra = f"{source.get('name')} {source.get('platform')}".strip()
+        # search_extra 是 content_fts 的合成列（DESIGN §5.1）：来源名、平台、发送者名。
+        # 标签名与同义词在打标落地后由检索层的 index()/rebuild() 重算进来。
+        source_extra = search_extra_value(
+            source.get("name"), source.get("platform"), message.get("sender_display_name")
+        )
         quarantined = 0
         linked = 0
 
@@ -480,11 +490,10 @@ class Worker:
                     # text_content 是内容项正文（**不加改动**；不可变原文另外存在
                     # message.text_raw 里），它喂给 content_fts 的 trigram 索引
                     collected.text_raw,
-                    # text_search 的契约是"应用层分词结果，空格连接"（DESIGN §5.1）。
-                    # 本切片没有分词器，**刻意留空**而不是塞进未分词原文：塞进去只会让
-                    # content_word 里出现一个巨大的单 token，看起来能用其实没用。
-                    # 词级检索随检索切片一起接（届时要覆盖这一列）。
-                    None,
+                    # text_search 是应用层分词结果（DESIGN §5.1），喂给 content_word。
+                    # 与 content_fts 相同的四列一起分词：否则"2 字的标签名/来源名"在词级
+                    # 索引里无处可查，1~2 字查询会静默落空。
+                    search_tokens(collected.text_raw, None, None, source_extra),
                     source_extra,
                     collected.text_hash,
                     len(collected.text_normalized or ""),
@@ -508,13 +517,16 @@ class Worker:
         content_id = int(
             self._conn.execute(
                 "INSERT INTO content_item ("
-                "  uuid, message_id, item_type, ordinal, search_extra, byte_size, status, first_seen_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
+                "  uuid, message_id, item_type, ordinal, text_search, search_extra,"
+                "  byte_size, status, first_seen_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
                 (
                     str(uuid.uuid4()),
                     message_id,
                     item_type_for(blob.mime_detected),
                     ordinal,
+                    # 媒体项今天没有正文；caption/OCR 落地后它们会自动经由这里进词级索引
+                    search_tokens(None, None, None, source_extra),
                     source_extra,
                     blob.size_bytes,
                     status,
