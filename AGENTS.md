@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**510 条 + 2 条环境跳过、10 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**557 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **510 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 6~13 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **557 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -39,7 +39,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 导入本地文件 | `uv run pc import PATH... --source NAME [--process] [--dry-run] [--limit N]` | 只做 L2（落 `message` + 入队）；`--process` 接着跑 worker。**路径（含单个文件）会持久化进 `source.config`**——worker 在另一个时刻取字节，只读那里 |
 | 手工上传 | `uv run pc upload PATH... [--note TEXT] [--source NAME] [--no-process] [--dry-run]` | root 自己丢文件进来的正式入口：**身份按内容哈希**（重传同一份内容不会变成两条）、`sent_at` 留空、`--note` 记来源线索。默认用（必要时新建）`kind=manual` 的「manual」来源，**不需要任何凭证**；**默认接着处理**（媒体引用是文件路径，原文件被删就只能死信） |
 | 跑处理管线 | `uv run pc work [--once] [--max N] [--loop] [--interval S]` | 抢占任务 → 取字节 → 扫描 → 哈希去重 → 落 media/content_item/content_media；确定性失败进死信，偶发失败退避重试 |
-| 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；带「备注」列（来源备注，没有则 `-`）；未建库时只提示不报错 |
+| 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；带「备注」列（来源备注，没有则 `-`）；未建库时只提示不报错。**表格按显示宽度对齐**（中文/全角算 2 格，组合记号与零宽符算 0 格），每列有上限、超出用 `…` 截断——上限就是 `cli.ITEM_LIST_MAX_WIDTHS` / `SOURCE_LIST_MAX_WIDTHS`，**加一列必须同时加上限**（`tests/test_cli_table.py` 有断言盯着）；上限只作用于表格，`--json` 永远是完整值 |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -89,7 +89,7 @@ post-collector/
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 510 条 + 2 条跳过（Windows 无符号链接权限），10 秒上下全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 557 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
 
 ## 边界约束
 

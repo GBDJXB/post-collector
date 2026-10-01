@@ -25,7 +25,8 @@ import os
 import platform
 import sys
 import time
-from collections.abc import Sequence
+import unicodedata
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -699,17 +700,170 @@ def _build_worker(conn: Any, paths: Any, root: Path, *, worker_id: str | None = 
     )
 
 
-def _print_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
-    """等宽列打印；不用第三方表格库，免得为了排版多一个依赖。"""
-    text_rows = [["" if cell is None else str(cell) for cell in row] for row in rows]
-    widths = [
-        max(len(headers[index]), *(len(row[index]) for row in text_rows)) if text_rows else len(headers[index])
-        for index in range(len(headers))
-    ]
-    print("  " + "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+# ---------------------------------------------------------------------------
+# 等宽表格
+#
+# 终端里"字符数"不等于"占几格"：一个汉字占 2 格，组合记号与零宽字符占 0 格。用
+# len() 排版会让中文表格整体错位——这是开发者调试时最先受不了的一类问题。所以这里
+# 统一按**显示宽度**测量与截断，并且给每一列一个上限（否则一列会由最长的那个单元格
+# 决定，中文内容下等于没有上限）。
+# ---------------------------------------------------------------------------
+
+#: 截断标记。刻意只用一个字符；如果哪个终端把 `…` 渲染成 2 格（歧义宽度按 CJK 习惯
+#: 渲染），把它换成 "..." 即可——其余代码不用动。
+ELLIPSIS = "…"
+
+#: 不占格的 Unicode 类别：Mn/Me 是组合记号与变体选择符，Cf 是零宽连接符与零宽空格
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
+
+#: `pc item list` 的表头与列宽上限（显示格）。**每一列都必须有上限**：
+#: tests/test_cli_table.py 有一条断言盯着，新增列却忘了给上限会直接红。
+ITEM_LIST_HEADERS: tuple[str, ...] = (
+    "id",
+    "类型",
+    "状态",
+    "来源",
+    "内容",
+    "扫描",
+    "媒体",
+    "备注",
+    "建库时间",
+)
+ITEM_LIST_MAX_WIDTHS: dict[str, int] = {
+    "id": 8,  # content_id 增长很慢
+    "类型": 8,  # item_type ∈ text/image/video/audio/file
+    "状态": 12,  # content_item.status 最长 quarantined（11）
+    "来源": 16,  # 用户命名；默认来源 manual 只有 6
+    "内容": 36,  # 文本摘要或媒体摘要；中文下 36 格＝18 个字
+    "扫描": 12,  # media.scan_status ∈ clean/suspicious
+    "媒体": 6,  # 媒体引用计数
+    "备注": 24,  # 来源备注（人写的自由文本）
+    "建库时间": 24,  # ISO-8601 UTC 毫秒固定 24 格，永不截断
+}
+
+#: `pc source list` 的表头与列宽上限
+SOURCE_LIST_HEADERS: tuple[str, ...] = (
+    "id",
+    "名称",
+    "平台",
+    "kind",
+    "信任",
+    "状态",
+    "授权",
+    "方式",
+    "软删",
+)
+SOURCE_LIST_MAX_WIDTHS: dict[str, int] = {
+    "id": 8,
+    "名称": 20,
+    "平台": 12,
+    "kind": 10,  # bot_api/webhook/rss/export/user_api/manual
+    "信任": 4,
+    "状态": 6,  # 启用 / 停用
+    "授权": 20,  # 最长"授权已撤销或已过期"（18 格）
+    "方式": 24,  # 两个授权方式拼接：manual_export、root_self 恰好 24 格
+    "软删": 24,  # ISO-8601 UTC 毫秒，或 "-"
+}
+
+
+def _display_width(text: str) -> int:
+    """这个字符串在终端里占几格。
+
+    - East Asian **W**（汉字、假名、谚文）与 **F**（全角）算 2 格；
+    - **Mn / Me**（组合记号、变体选择符）与 **Cf**（零宽连接符、零宽空格）算 0 格；
+      注意 ``unicodedata.combining()`` 靠不住——U+FE0F 这类变体选择符的规范组合类是 0，
+      但仍然不占格，所以按**类别**判断；
+    - 其余算 1 格，**包括歧义宽度 ``A``**（``…``、``·``、``—``、``“``）。
+
+    歧义宽度按 1 处理是唯一一处主观判断，选择与 ``wcwidth`` / ``rich`` 的默认一致：
+    如果某个终端把 `…` 渲染成 2 格，那么所有 Python 表格工具都会同样错位，所以更可能
+    是 1 格。中文正文是 ``W``（无歧义），不受这个判断影响。
+    """
+    total = 0
+    for char in text:
+        if unicodedata.category(char) in _ZERO_WIDTH_CATEGORIES:
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return total
+
+
+def _truncate_display(text: str, limit: int) -> str:
+    """按**显示宽度**截断到 ``limit`` 格，超出的部分换成 ``ELLIPSIS``。
+
+    宽度是逐字符累加的，所以宽字符**不会被切成两半**（放不下就整字符停下）。
+    代价是截断点可能落在一个组合序列中间（``e`` + 组合重音会只剩 ``e``），这是可接受
+    的显示瑕疵，不值得为此引入字素簇库。
+    """
+    if limit < 2:
+        raise ValueError(f"列宽上限至少要有 2 格，收到 {limit}")
+    if _display_width(text) <= limit:
+        return text
+    budget = limit - _display_width(ELLIPSIS)
+    kept: list[str] = []
+    used = 0
+    for char in text:
+        width = _display_width(char)
+        if used + width > budget:
+            break
+        kept.append(char)
+        used += width
+    return "".join(kept) + ELLIPSIS
+
+
+def _pad_display(text: str, width: int) -> str:
+    """按显示宽度右侧补空格到 ``width`` 格（已经超宽时原样返回，不截断）。"""
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _flatten_cell(cell: Any) -> str:
+    """单元格 → 单行字符串：``None`` 当空串，控制字符（换行、制表符）换成空格。
+
+    换行必须在排版前处理掉，否则一个多行备注会把整张表撕成两半。
+    """
+    if cell is None:
+        return ""
+    text = str(cell)
+    return "".join(" " if unicodedata.category(char) == "Cc" else char for char in text)
+
+
+def _prepare_row(row: Sequence[Any], headers: Sequence[str], limits: Mapping[str, int]) -> list[str]:
+    """按表头取单元格、拍平成单行、按列上限截断。行比表头短则补空，长则忽略多余的。"""
+    prepared: list[str] = []
+    for index, header in enumerate(headers):
+        text = _flatten_cell(row[index] if index < len(row) else None)
+        limit = limits.get(header)
+        prepared.append(_truncate_display(text, limit) if limit else text)
+    return prepared
+
+
+def _print_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    *,
+    max_widths: Mapping[str, int] | None = None,
+) -> None:
+    """等宽列打印；不用第三方表格库，免得为了排版多一个依赖。
+
+    ``max_widths`` 按**列名**给每列的上限（显示格）：列顺序调整了也不会错配，漏给某列
+    则那一列无上限。单元格先按上限截断、再算列宽，因此无论内容多长，行宽都有确定上界。
+
+    **保留行尾填充**（不做 rstrip）：补到定宽之后，"每行显示宽度严格相等"就是列对齐的
+    等价判据，测试可以直接断言整行宽度，而不必按列切分字符串。
+    """
+    limits = dict(max_widths or {})
+    cells = [_prepare_row(row, headers, limits) for row in rows]
+
+    widths: list[int] = []
+    for index, header in enumerate(headers):
+        column = [cells[row][index] for row in range(len(cells))] or [header]
+        natural = max(_display_width(item) for item in [header, *column])
+        limit = limits.get(header)
+        widths.append(min(limit, natural) if limit else natural)
+
+    print("  " + "  ".join(_pad_display(header, widths[i]) for i, header in enumerate(headers)))
     print("  " + "  ".join("-" * width for width in widths))
-    for row in text_rows:
-        print("  " + "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
+    for row in cells:
+        print("  " + "  ".join(_pad_display(cell, widths[i]) for i, cell in enumerate(row)))
 
 
 def cmd_source_add(args: argparse.Namespace) -> int:
@@ -799,9 +953,7 @@ def cmd_source_list(args: argparse.Namespace) -> int:
                 row["deleted_at"] or "-",
             ]
         )
-    _print_table(
-        ["id", "名称", "平台", "kind", "信任", "状态", "授权", "方式", "软删"], table
-    )
+    _print_table(SOURCE_LIST_HEADERS, table, max_widths=SOURCE_LIST_MAX_WIDTHS)
     return 0
 
 
@@ -1175,16 +1327,11 @@ def cmd_item_list(args: argparse.Namespace) -> int:
     table: list[list[Any]] = []
     for row in rows:
         if row["text_content"]:
-            summary = str(row["text_content"])[:32].replace("\n", " ")
-            if len(str(row["text_content"])) > 32:
-                summary += "…"
+            summary = str(row["text_content"])
         elif row["sha256"]:
             summary = f"媒体 {row['sha256'][:12]}…（{_human_size(row['byte_size'])}）"
         else:
             summary = "（空）"
-        note = str(row["origin_note"] or "").replace("\n", " ")
-        if len(note) > 24:
-            note = note[:24] + "…"
         table.append(
             [
                 row["content_id"],
@@ -1194,13 +1341,12 @@ def cmd_item_list(args: argparse.Namespace) -> int:
                 summary,
                 row["scan_status"] or "-",
                 row["media_count"],
-                note or "-",
+                row["origin_note"] or "-",
                 row["created_at"],
             ]
         )
-    _print_table(
-        ["id", "类型", "状态", "来源", "内容", "扫描", "媒体", "备注", "建库时间"], table
-    )
+    # 截断与对齐都交给 _print_table（按显示宽度，中文算 2 格）；这里只做领域格式化
+    _print_table(ITEM_LIST_HEADERS, table, max_widths=ITEM_LIST_MAX_WIDTHS)
     print(f"  共 {total} 个内容项（上面显示最近 {len(rows)} 条）")
     return 0
 
