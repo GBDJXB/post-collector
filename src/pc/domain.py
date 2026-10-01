@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
+from types import MappingProxyType
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -114,6 +116,25 @@ class TagSource(StrEnum):
     AUTO = "auto"  # 本地模型，必须带 model_version_id 与 confidence
     SUGGESTED = "suggested"  # LLM 建议：不进检索、不进统计、不参与自动决策
     MERGED = "merged"  # 标签归并后的重定向产物
+
+
+#: ``content_item.item_type`` 的取值（与 0001 的 CHECK 约束逐字一致）。
+#: CLI 的 ``--type`` 选项与检索的"类型可搜"都从这里取，避免两处各写一份而漂移。
+ITEM_TYPES: tuple[str, ...] = ("text", "image", "video", "audio", "link", "sticker", "file")
+
+#: 类型的中文说法：进 ``search_extra`` 之后，"图片/视频"这类词也能搜到对应类型的内容。
+#: 这不是查询期的意图识别（那需要维护词表、行为难解释），只是一段固定的可搜文本。
+ITEM_TYPE_LABELS: Mapping[str, str] = MappingProxyType(
+    {
+        "text": "文本",
+        "image": "图片",
+        "video": "视频",
+        "audio": "音频",
+        "link": "链接",
+        "sticker": "贴纸",
+        "file": "文件",
+    }
+)
 
 
 class AiInvolvement(StrEnum):
@@ -433,13 +454,60 @@ def search_tokens(*parts: str | None) -> str | None:
 def search_extra_value(*parts: str | None) -> str:
     """``content_item.search_extra`` 的合成规则（DESIGN §5.1）。
 
-    参与检索的"补充字段"拼成一个串：来源名、平台、发送者名、标签名与同义词、
-    链接标题。它是派生的——改标签或改来源名之后必须重算（见 ``SearchIndex.rebuild``）。
+    参与检索的"补充字段"按**固定顺序**拼成一个串，这个顺序就是本函数的契约：
+
+        来源名 → 平台 → 发送者名 → item_type → item_type 中文标签 → 文件名 →
+        标签名与同义词 → 来源备注（origin_note）
+
+    顺序只影响可读性与 bm25 的列内位置，但必须写死一处：落库（``pipeline``）与批量重算
+    （``refresh_search_derived``）是两处调用，各拼一套就会漂移，而漂移的表现是"刚入库的
+    搜得到、重算之后的搜不到"。
+
+    自由文本（文件名、备注）在拼接前按 :data:`SEARCH_EXTRA_TEXT_LIMIT` 截断——它们是用户
+    可控的字符串，不设上限的话一个超长备注就能把索引撑大；文件名另有更严的 255 字符上限
+    （:data:`FILE_NAME_LIMIT`，在 :func:`filename_from_ref` 里生效）。它是派生的——改标签、
+    改来源名或补上文件名之后必须重算（见 ``SearchIndex.rebuild``）。
     """
-    return " ".join(part.strip() for part in parts if part and part.strip())
+    capped = [
+        part.strip()[:SEARCH_EXTRA_TEXT_LIMIT] if part and part.strip() else None for part in parts
+    ]
+    return " ".join(part for part in capped if part)
+
+
+#: 文件名与备注这类自由文本进入 ``search_extra`` 时各自的长度上限（字符）
+FILE_NAME_LIMIT = 255
+
+#: ``search_extra`` 里单个自由文本片段的上限（字符）：备注可能很长，索引不该跟着长
+SEARCH_EXTRA_TEXT_LIMIT = 500
+
+
+def filename_from_ref(ref: str) -> str | None:
+    """从平台侧的媒体引用里取出**文件名**（本地路径、URL 都适用）。
+
+    只保留 basename：数据库里不存位置（AGENTS「不把媒体文件路径写进数据库」），而且
+    DESIGN §6.6 要求「文件名不参与路径拼接」——本函数的返回值只用于展示与检索。
+
+    规则：剥掉 URL 的 query 与 fragment、把反斜杠当分隔符、去掉控制字符、截断到
+    :data:`FILE_NAME_LIMIT`；结果为空则返回 ``None``（"没有名字"与"名字是空串"是两件事）。
+    **只有站点没有路径的 URL**（``https://example.com/``）也返回 ``None``：那里取出来的
+    是主机名，把它当文件名既不准确，又会在「文件名」列里显示成一条假信息。
+    """
+    trimmed = ref.split("?", 1)[0].split("#", 1)[0].rstrip("/\\")
+    if "://" in trimmed:
+        _, _, remainder = trimmed.partition("://")
+        if "/" not in remainder:
+            return None
+    base = trimmed.replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(char for char in base if unicodedata.category(char) != "Cc")
+    cleaned = cleaned.strip()[:FILE_NAME_LIMIT]
+    return cleaned or None
 
 
 __all__ = [
+    "FILE_NAME_LIMIT",
+    "ITEM_TYPES",
+    "ITEM_TYPE_LABELS",
+    "SEARCH_EXTRA_TEXT_LIMIT",
     "AiInvolvement",
     "AuthzMode",
     "ClassificationResult",
@@ -460,6 +528,7 @@ __all__ = [
     "TagCandidate",
     "TagNamespace",
     "TagSource",
+    "filename_from_ref",
     "is_cjk",
     "normalize_text",
     "search_extra_value",

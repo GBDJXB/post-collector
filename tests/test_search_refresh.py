@@ -40,23 +40,36 @@ def _seed_item(
     text_search: str | None = None,
     tags: tuple[str, ...] = (),
     deleted: bool = False,
+    item_type: str = "text",
+    refs: tuple[str, ...] = (),
+    origin_note: str | None = None,
 ) -> int:
     """直接写一条内容项；``text_search`` 默认留空，模拟升级前落库的老行。"""
     message_id = int(
         conn.execute(
-            "INSERT INTO message (uuid, source_id, platform_msg_id, sender_display_name, text_raw) "
-            "VALUES (?, ?, ?, ?, ?) RETURNING message_id",
-            (str(uuid.uuid4()), source_id, msg_id, sender, text),
+            "INSERT INTO message (uuid, source_id, platform_msg_id, sender_display_name,"
+            " text_raw, origin_note, media_refs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
+            (
+                str(uuid.uuid4()),
+                source_id,
+                msg_id,
+                sender,
+                text,
+                origin_note,
+                json.dumps(list(refs)),
+            ),
         ).fetchone()[0]
     )
     content_id = int(
         conn.execute(
             "INSERT INTO content_item "
             "(uuid, message_id, item_type, ordinal, text_content, text_search, deleted_at) "
-            "VALUES (?, ?, 'text', 0, ?, ?, ?) RETURNING content_id",
+            "VALUES (?, ?, ?, 0, ?, ?, ?) RETURNING content_id",
             (
                 str(uuid.uuid4()),
                 message_id,
+                item_type,
                 text,
                 text_search,
                 "2026-01-01T00:00:00.000Z" if deleted else None,
@@ -90,11 +103,102 @@ def _row(conn: Any, content_id: int) -> dict[str, Any]:
     return dict(conn.execute("SELECT * FROM content_item WHERE content_id = ?", (content_id,)).fetchone())
 
 
+class TestNameBackfill:
+    """文件名回填（0005 加的列）：只补无歧义的情形。"""
+
+    def test_single_reference_media_row_gets_its_name(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db,
+            source_id=source_id,
+            item_type="image",
+            refs=(r"D:\素材\电脑壁纸.jpg",),
+        )
+        assert _row(fresh_db, content_id)["original_name"] is None
+        result = db.refresh_search_derived(fresh_db)
+        assert result["named"] == 1
+        row = _row(fresh_db, content_id)
+        assert row["original_name"] == "电脑壁纸.jpg"
+        assert "电脑壁纸.jpg" in row["search_extra"], "名字进 search_extra 才搜得到"
+        assert "壁纸" in row["text_search"].split(), "2 字查询靠词级索引"
+        assert "image" in row["search_extra"].split() and "图片" in row["search_extra"].split()
+
+    def test_multi_reference_message_is_not_guessed(self, fresh_db: Any) -> None:
+        """多附件消息里"哪个引用对应哪个内容项"是隐藏耦合，回填不猜。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db,
+            source_id=source_id,
+            item_type="image",
+            refs=("a.jpg", "b.jpg"),
+        )
+        result = db.refresh_search_derived(fresh_db)
+        assert result["named"] == 0
+        assert _row(fresh_db, content_id)["original_name"] is None
+
+    def test_text_row_is_not_backfilled(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(fresh_db, source_id=source_id, text="一段话", refs=())
+        db.refresh_search_derived(fresh_db)
+        assert _row(fresh_db, content_id)["original_name"] is None
+
+    def test_existing_name_is_kept(self, fresh_db: Any) -> None:
+        """已经有名字的行原样保留：重算不去猜、也不覆盖。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db, source_id=source_id, item_type="image", refs=("a.jpg",)
+        )
+        fresh_db.execute(
+            "UPDATE content_item SET original_name = '我自己起的名字.jpg' WHERE content_id = ?",
+            (content_id,),
+        )
+        db.refresh_search_derived(fresh_db)
+        assert _row(fresh_db, content_id)["original_name"] == "我自己起的名字.jpg"
+
+    def test_origin_note_enters_the_index(self, fresh_db: Any) -> None:
+        """备注进 search_extra：你写"电脑壁纸"就该能搜到它。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db,
+            source_id=source_id,
+            item_type="image",
+            refs=("壁纸.jpg",),
+            origin_note="电脑壁纸",
+        )
+        db.refresh_search_derived(fresh_db)
+        row = _row(fresh_db, content_id)
+        assert row["search_extra"].endswith("电脑壁纸"), "备注排在合成顺序的最后"
+        assert _match(fresh_db, "content_word", "电脑") == 1
+        assert _match(fresh_db, "content_fts", "电脑壁") == 1
+
+    def test_second_run_is_idempotent(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, item_type="image", refs=("a.jpg",))
+        first = db.refresh_search_derived(fresh_db)
+        second = db.refresh_search_derived(fresh_db)
+        assert first["updated"] == 1 and first["named"] == 1
+        assert second["updated"] == 0 and second["named"] == 0
+
+
 class TestStaleCount:
     def test_counts_rows_with_text_but_no_tokens(self, fresh_db: Any) -> None:
         source_id = _seed_source(fresh_db)
         _seed_item(fresh_db, source_id=source_id, text="蓝发精灵")
         assert db.stale_search_row_count(fresh_db) == 1
+
+    def test_counts_media_rows_whose_name_can_be_filled(self, fresh_db: Any) -> None:
+        """能补出名字的媒体行也算"待重算"——否则补完仍会被提示"还没分词"。"""
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, item_type="image", refs=("壁纸.jpg",))
+        assert db.stale_search_row_count(fresh_db) == 1
+        db.refresh_search_derived(fresh_db)
+        assert db.stale_search_row_count(fresh_db) == 0
+
+    def test_unfillable_rows_are_not_counted(self, fresh_db: Any) -> None:
+        """补不出名字的行不该永远被提示（那是永远为真的假告警）。"""
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, item_type="image", refs=("a.jpg", "b.jpg"))
+        assert db.stale_search_row_count(fresh_db) == 0
 
     def test_rows_without_any_searchable_text_are_not_stale(self, fresh_db: Any) -> None:
         """四列全空的媒体项没什么可分词的，不该被反复当成"还没分词"。"""
@@ -190,7 +294,7 @@ class TestRefresh:
 
     def test_empty_database_is_fine(self, fresh_db: Any) -> None:
         result = db.refresh_search_derived(fresh_db)
-        assert result == {"scanned": 0, "updated": 0, "total": 0}
+        assert result == {"scanned": 0, "updated": 0, "named": 0, "total": 0}
 
     def test_soft_deleted_rows_are_refreshed_too(self, fresh_db: Any) -> None:
         """软删的行也要算——它可能被恢复，恢复后立刻可搜才不意外。"""

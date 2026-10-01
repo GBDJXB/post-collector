@@ -71,12 +71,13 @@ def _seed(
     attempts: int = 0,
     max_attempts: int = 5,
     sender: str | None = None,
+    note: str | None = None,
 ) -> tuple[int, int]:
     """直接写一条消息 + 一个排队任务（绕开连接器，便于构造边界情况）。"""
     message_id = conn.execute(
         "INSERT INTO message (uuid, source_id, platform_msg_id, message_type, text_raw,"
-        " sender_display_name, media_refs) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
+        " sender_display_name, origin_note, media_refs) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
         (
             str(uuid.uuid4()),
             source_id,
@@ -84,6 +85,7 @@ def _seed(
             "media" if refs else "text",
             text,
             sender,
+            note,
             json.dumps(list(refs)),
         ),
     ).fetchone()[0]
@@ -178,10 +180,10 @@ class TestTextItems:
         row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
         assert row["item_type"] == "text"
         assert row["text_content"] == "  Hello　World  ", "正文保持原样"
-        assert row["text_search"] == "hello world mine local", (
-            "分词结果 = 正文（NFKC 之后）+ search_extra；全角空格被折叠"
+        assert row["text_search"] == "hello world mine local text 文 本 文本", (
+            "分词结果 = 正文（NFKC 之后）+ search_extra（含类型值与中文标签）"
         )
-        assert row["search_extra"] == "mine local"
+        assert row["search_extra"] == "mine local text 文本"
         assert row["char_count"] == len("Hello World"), "字符数按规范化后的文本算"
 
     def test_chinese_text_gets_single_and_double_character_tokens(
@@ -219,7 +221,11 @@ class TestTextItems:
         assert trigram_hits == 0, "trigram 的 2 字退化行为应该保持原样"
 
     def test_sender_name_enters_search_extra(self, env: SimpleNamespace) -> None:
-        """发送者名是检索维度（DESIGN §5.1），拼进 search_extra 才搜得到。"""
+        """发送者名是检索维度（DESIGN §5.1），拼进 search_extra 才搜得到。
+
+        ``search_extra`` 的合成顺序是固定契约（``domain.search_extra_value`` 的 docstring）：
+        来源名 → 平台 → 发送者名 → 类型 → 类型中文 → 文件名 → 标签名 → 备注。
+        """
         source = _source(env.conn, env.tmp)
         _seed(
             env.conn,
@@ -229,8 +235,66 @@ class TestTextItems:
         )
         env.worker.run_once()
         row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
-        assert row["search_extra"] == "mine local 蓝发精灵"
+        assert row["search_extra"] == "mine local 蓝发精灵 text 文本"
         assert "蓝发" in row["text_search"].split()
+
+    def test_item_type_is_searchable_in_both_scripts(self, env: SimpleNamespace) -> None:
+        """类型既进 search_extra（可搜"图片/image"），也仍是精确过滤器。"""
+        source = _source(env.conn, env.tmp)
+        image = env.tmp / "壁纸.jpg"
+        image.write_bytes(JPEG)
+        _seed(env.conn, source_id=source["source_id"], refs=(str(image),))
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["item_type"] == "image"
+        assert "image" in row["search_extra"].split()
+        assert "图片" in row["search_extra"].split()
+        assert row["search_extra"].split()[-3:] == ["image", "图片", "壁纸.jpg"]
+
+    def test_media_item_keeps_its_file_name(self, env: SimpleNamespace) -> None:
+        """文件名落进 original_name，并进 search_extra（正是"按名字找图"的入口）。"""
+        source = _source(env.conn, env.tmp)
+        photo = env.tmp / "电脑壁纸.jpg"
+        photo.write_bytes(JPEG)
+        _seed(env.conn, source_id=source["source_id"], refs=(str(photo),), note="从某个群里存的")
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["original_name"] == "电脑壁纸.jpg"
+        assert "电脑壁纸.jpg" in row["search_extra"]
+        assert row["search_extra"].endswith("从某个群里存的"), "备注排在最后（合成顺序契约）"
+        assert "壁纸" in row["text_search"].split(), "2 字查询走词级索引"
+        assert "jpg" in row["text_search"].split(), "扩展名随文件名一起可搜"
+
+    def test_file_name_never_keeps_a_directory(self, env: SimpleNamespace) -> None:
+        """只存 basename：数据库里不存位置（AGENTS「不把媒体文件路径写进数据库」）。"""
+        source = _source(env.conn, env.tmp)
+        nested = env.tmp / "素材" / "某个群"
+        nested.mkdir(parents=True)
+        photo = nested / "猫.png"
+        photo.write_bytes(PNG)
+        _seed(env.conn, source_id=source["source_id"], refs=(str(photo),))
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["original_name"] == "猫.png"
+        assert "素材" not in row["search_extra"] and "某个群" not in row["search_extra"]
+
+    def test_text_item_has_no_file_name_yet(self, env: SimpleNamespace) -> None:
+        """纯文本文件没有 media ref，名字在 L2 之后就丢了 → 这一刀留空（见 AGENTS）。
+
+        它按内容仍然可搜；补齐文本文件名需要给信封加字段，是单独一刀的事。这里同时钉住
+        "类型标签进得去、文件名进不去"，避免将来有人以为文本项已经有名字了。
+        """
+        source = _source(env.conn, env.tmp)
+        _seed(env.conn, source_id=source["source_id"], text="文件名暂时搜不到，但内容可以")
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["item_type"] == "text"
+        assert row["original_name"] is None
+        assert row["search_extra"] == "mine local text 文本"
+        word_hits = env.conn.execute(
+            "SELECT count(*) FROM content_word WHERE content_word MATCH ?", ('"内容"',)
+        ).fetchone()[0]
+        assert word_hits == 1, "文本项按内容照样可搜"
 
     def test_same_text_in_two_messages_is_grouped_not_blocked(
         self, env: SimpleNamespace

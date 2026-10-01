@@ -47,7 +47,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from pc.domain import search_extra_value, search_tokens
+from pc.domain import (
+    ITEM_TYPE_LABELS,
+    filename_from_ref,
+    search_extra_value,
+    search_tokens,
+)
 
 #: 默认路径（相对仓库根）
 DEFAULT_ENV_FILE = Path(".env")
@@ -1263,18 +1268,50 @@ SEARCH_SOURCE_COLUMNS: tuple[str, ...] = ("text_content", "ocr_text", "caption",
 
 
 def stale_search_row_count(conn: sqlite3.Connection) -> int:
-    """有多少行"有可检索文本、却还没有分词结果"。
+    """有多少行的检索派生数据是过期的（没有分词结果，或者补得出的文件名还没写）。
 
-    升级前落库的老行、以及改过分词规则之后的行都会落在这里。``pc doctor`` 与
-    ``pc search``（0 结果时）用它提示"该跑一次派生列重算了"，而不是让人对着空结果猜。
+    升级前落库的老行、改过分词规则之后的行、以及"入库时还没记文件名"的媒体行都会落在这里。
+    ``pc doctor`` 与 ``pc search``（0 结果时）用它提示"该跑一次派生列重算了"，而不是让人
+    对着空结果猜。
+
+    文件名那一项**只数补得出来的行**（该消息恰好一个媒体引用）：补不出来的行不该被反复
+    提示"待重算"，那会变成永远为真的假告警。
     """
     row = conn.execute(
-        "SELECT count(*) FROM content_item "
-        " WHERE text_search IS NULL AND deleted_at IS NULL "
-        "   AND (text_content IS NOT NULL OR ocr_text IS NOT NULL "
-        "        OR caption IS NOT NULL OR search_extra IS NOT NULL)"
+        "SELECT count(*) FROM content_item c JOIN message m ON m.message_id = c.message_id "
+        " WHERE c.deleted_at IS NULL AND ("
+        "   (c.text_search IS NULL AND (c.text_content IS NOT NULL OR c.ocr_text IS NOT NULL"
+        "        OR c.caption IS NOT NULL OR c.search_extra IS NOT NULL))"
+        "   OR (c.original_name IS NULL AND c.item_type <> 'text'"
+        "       AND json_array_length(m.media_refs) = 1)"
+        " )"
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def _backfill_original_name(row: Mapping[str, Any]) -> str | None:
+    """老行的文件名回填规则（只在**无歧义**时给出）。
+
+    文件名是 0005 才加的列，之前落库的媒体项没有它。能从 ``message.media_refs`` 反解，
+    但"哪些引用对应哪一个内容项"只在**恰好一个引用**时才是确定的——多附件消息里那个
+    对应关系是 ordinal 与引用顺序之间的隐藏耦合，写进回填逻辑迟早出错。所以：
+
+    * 已有名字 → 原样保留（不回写、不猜）；
+    * 文本项 → 留空（它没有 media ref，补齐要等信封加字段）；
+    * 媒体项且该消息**恰好一个引用** → 取那个引用的 basename；
+    * 其余 → 留空，并如实说明"补不出来"。
+    """
+    if row["original_name"]:
+        return str(row["original_name"])
+    if row["item_type"] == "text":
+        return None
+    try:
+        refs = json.loads(row["media_refs"] or "[]")
+    except (TypeError, json.JSONDecodeError):  # pragma: no cover - 由 CHECK (json_valid) 挡住
+        return None
+    if not isinstance(refs, list) or len(refs) != 1:
+        return None
+    return filename_from_ref(str(refs[0]))
 
 
 def refresh_search_derived(
@@ -1284,17 +1321,19 @@ def refresh_search_derived(
     content_ids: Sequence[int] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """重算两列检索派生数据（``text_search``、``search_extra``），返回统计。
+    """重算检索派生数据（``text_search``、``search_extra``，并补 ``original_name``）。
 
-    **为什么要重算**：这两列是派生的（DESIGN §2.3 的派生数据纪律）——
+    **为什么要重算**：这三列是派生的（DESIGN §2.3 的派生数据纪律）——
 
     * 分词规则变了（本仓库从"没有分词器"变成"单字 + 双字"），老行得跟着变；
-    * ``search_extra`` 含来源名、发送者名与**标签名**，改标签或改来源名之后它就过期了。
+    * ``search_extra`` 含来源名、发送者名、类型、文件名与**标签名**，这些变了它就过期了；
+    * ``original_name`` 是 0005 才加的列，之前落库的媒体项没有它（回填规则见
+      :func:`_backfill_original_name`）。
 
     ``content_ids`` 给了就只算这几行（供单行更新用），否则全表分批。
 
     分批提交（DESIGN §2.3）：SQLite 是单写者，一次更新十万行会让写锁长时间不释放。
-    本函数幂等：算出来的值与现有值相同就不写（比较后再决定），重复跑只花读的时间。
+    本函数幂等：三列算出来都与现有值相同就不写（比较后再决定），重复跑只花读的时间。
     """
     size = max(1, int(batch_size))
     wanted = list(dict.fromkeys(int(item) for item in content_ids)) if content_ids else None
@@ -1304,41 +1343,53 @@ def refresh_search_derived(
         else int(conn.execute("SELECT count(*) FROM content_item").fetchone()[0])
     )
     updated = 0
+    named = 0
     scanned = 0
 
     for rows in _derived_batches(conn, wanted=wanted, size=size):
-        pending: list[tuple[str | None, str, int]] = []
+        pending: list[tuple[str | None, str | None, str | None, int]] = []
         for row in rows:
             scanned += 1
+            name = _backfill_original_name(row)
             extra = search_extra_value(
                 row["source_name"],
                 row["platform"],
                 row["sender_display_name"],
+                row["item_type"],
+                ITEM_TYPE_LABELS.get(str(row["item_type"])),
+                name,
                 row["tag_names"],
+                row["origin_note"],
             )
             tokens = search_tokens(row["text_content"], row["ocr_text"], row["caption"], extra)
-            if tokens == row["text_search"] and extra == row["search_extra"]:
+            if (
+                tokens == row["text_search"]
+                and extra == row["search_extra"]
+                and name == row["original_name"]
+            ):
                 continue
-            pending.append((tokens, extra, int(row["content_id"])))
+            if row["original_name"] is None and name is not None:
+                named += 1
+            pending.append((tokens, extra, name, int(row["content_id"])))
         if pending:
             with transaction(conn):
-                for tokens, extra, content_id in pending:
+                for tokens, extra, name, content_id in pending:
                     conn.execute(
-                        "UPDATE content_item SET text_search = ?, search_extra = ?, updated_at = ? "
-                        "WHERE content_id = ?",
-                        (tokens, extra, now_iso(), content_id),
+                        "UPDATE content_item SET text_search = ?, search_extra = ?,"
+                        " original_name = ?, updated_at = ? WHERE content_id = ?",
+                        (tokens, extra, name, now_iso(), content_id),
                     )
             updated += len(pending)
         if progress is not None:
             progress(scanned, total)
-    return {"scanned": scanned, "updated": updated, "total": total}
+    return {"scanned": scanned, "updated": updated, "named": named, "total": total}
 
 
-#: 重算派生列时要读的字段（含标签名的拼接）
+#: 重算派生列时要读的字段（含标签名的拼接与回填文件名所需的 media_refs/origin_note）
 _SEARCH_DERIVED_SELECT = (
     "SELECT c.content_id, c.text_content, c.ocr_text, c.caption, c.text_search,"
-    "       c.search_extra, s.name AS source_name, s.platform,"
-    "       m.sender_display_name,"
+    "       c.search_extra, c.original_name, c.item_type, s.name AS source_name, s.platform,"
+    "       m.sender_display_name, m.origin_note, m.media_refs,"
     "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
     "          JOIN tag t ON t.tag_id = ta.tag_id"
     "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "

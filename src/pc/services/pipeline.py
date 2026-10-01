@@ -33,8 +33,10 @@ from pc.adapters.registry import SourceConfigError, UnsupportedSourceKindError, 
 from pc.adapters.sqlite import now_iso, transaction
 from pc.config import IngestLimits, JobSettings
 from pc.domain import (
+    ITEM_TYPE_LABELS,
     MediaTooLargeError,
     ObjectKey,
+    filename_from_ref,
     normalize_text,
     search_extra_value,
     search_tokens,
@@ -75,6 +77,7 @@ class MediaBlob:
     mime_detected: str | None
     mime_declared: str | None
     extension: str | None
+    name: str | None  # 引用里的文件名（只留 basename）；进 content_item.original_name
     passed: bool
     gray: bool
     scan_engine: str
@@ -131,9 +134,12 @@ def _iso_minutes_ago(minutes: int) -> str:
 
 
 def _ref_name(ref: str) -> str:
-    """取引用里的文件名部分（本地路径、URL 都适用），用于猜"声明的类型"。"""
-    trimmed = ref.split("?", 1)[0].split("#", 1)[0].rstrip("/\\")
-    return os.path.basename(trimmed.replace("\\", "/")) or trimmed
+    """取引用里的文件名部分，用于猜"声明的类型"（规则见 ``domain.filename_from_ref``）。
+
+    猜类型需要一个字符串，而"没有名字"（``None``）在这里等价于空串——反正魔数嗅探会
+    给出真正的判定，声明值只是用来与它比对的参考。
+    """
+    return filename_from_ref(ref) or ""
 
 
 class Worker:
@@ -377,6 +383,7 @@ class Worker:
             mime_detected=verdict.details.get("mime_detected"),
             mime_declared=declared,
             extension=os.path.splitext(name)[1].lower().lstrip(".") or None,
+            name=filename_from_ref(ref),
             passed=verdict.passed,
             gray=verdict.gray,
             scan_engine=verdict.engine,
@@ -406,11 +413,16 @@ class Worker:
     ) -> tuple[str, str]:
         """一个短事务写下全部结果（DESIGN §2.3 的单写者纪律）。"""
         message_id = int(message["message_id"])
-        # search_extra 是 content_fts 的合成列（DESIGN §5.1）：来源名、平台、发送者名。
+        # search_extra 是 content_fts 的合成列（DESIGN §5.1）：来源名、平台、发送者名，
+        # 再加上每个内容项各自的类型/文件名与整条消息共用的来源备注。**逐项合成**而不是
+        # 先拼一个公共串：类型与文件名是 per-item 的（一条消息里的图与文本项不一样）。
         # 标签名与同义词在打标落地后由检索层的 index()/rebuild() 重算进来。
-        source_extra = search_extra_value(
-            source.get("name"), source.get("platform"), message.get("sender_display_name")
+        shared_parts = (
+            source.get("name"),
+            source.get("platform"),
+            message.get("sender_display_name"),
         )
+        origin_note = message.get("origin_note")
         quarantined = 0
         linked = 0
 
@@ -433,14 +445,12 @@ class Worker:
 
             ordinal = 0
             if collected.text_raw is not None and collected.text_normalized is not None:
-                self._insert_text_item(
-                    message_id, collected, source_extra, ordinal, source
-                )
+                self._insert_text_item(message_id, collected, shared_parts, origin_note, ordinal, source)
                 ordinal += 1
 
             for blob in collected.blobs:
                 _, is_quarantined = self._insert_media_item(
-                    message_id, blob, source_extra, ordinal, source
+                    message_id, blob, shared_parts, origin_note, ordinal, source
                 )
                 ordinal += 1
                 linked += 1
@@ -456,10 +466,16 @@ class Worker:
         self,
         message_id: int,
         collected: Collected,
-        source_extra: str,
+        shared_parts: tuple[Any, ...],
+        origin_note: str | None,
         ordinal: int,
         source: Mapping[str, Any],
     ) -> int:
+        # 文本项的文件名留空：本地来源的纯文本文件在 L2 之后就没有名字了（它没有 media ref），
+        # 补齐它需要给信封加字段，属于另一刀（见 AGENTS 的检索约束）。
+        extra = search_extra_value(
+            *shared_parts, "text", ITEM_TYPE_LABELS["text"], None, origin_note
+        )
         group = None
         if collected.text_hash:
             prior = self._conn.execute(
@@ -479,9 +495,9 @@ class Worker:
             self._conn.execute(
                 "INSERT INTO content_item ("
                 "  uuid, message_id, item_type, ordinal, text_content, text_search,"
-                "  search_extra, content_hash, char_count, byte_size,"
+                "  search_extra, original_name, content_hash, char_count, byte_size,"
                 "  dup_group_id, canonical_id, first_seen_at"
-                ") VALUES (?, ?, 'text', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                ") VALUES (?, ?, 'text', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) "
                 "RETURNING content_id",
                 (
                     str(uuid.uuid4()),
@@ -493,8 +509,8 @@ class Worker:
                     # text_search 是应用层分词结果（DESIGN §5.1），喂给 content_word。
                     # 与 content_fts 相同的四列一起分词：否则"2 字的标签名/来源名"在词级
                     # 索引里无处可查，1~2 字查询会静默落空。
-                    search_tokens(collected.text_raw, None, None, source_extra),
-                    source_extra,
+                    search_tokens(collected.text_raw, None, None, extra),
+                    extra,
                     collected.text_hash,
                     len(collected.text_normalized or ""),
                     len((collected.text_raw or "").encode("utf-8")),
@@ -509,25 +525,33 @@ class Worker:
         self,
         message_id: int,
         blob: MediaBlob,
-        source_extra: str,
+        shared_parts: tuple[Any, ...],
+        origin_note: str | None,
         ordinal: int,
         source: Mapping[str, Any],
     ) -> tuple[int, bool]:
         status = "quarantined" if blob.quarantined else "active"
+        item_type = item_type_for(blob.mime_detected)
+        # 文件名来自这条内容自己的引用（多附件消息里每个附件各带各的名字）；扩展名会随它
+        # 一起进 search_extra，于是 `pc search jpg` 这类查询不用额外读 media 表。
+        extra = search_extra_value(
+            *shared_parts, item_type, ITEM_TYPE_LABELS.get(item_type), blob.name, origin_note
+        )
         content_id = int(
             self._conn.execute(
                 "INSERT INTO content_item ("
                 "  uuid, message_id, item_type, ordinal, text_search, search_extra,"
-                "  byte_size, status, first_seen_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
+                "  original_name, byte_size, status, first_seen_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
                 (
                     str(uuid.uuid4()),
                     message_id,
-                    item_type_for(blob.mime_detected),
+                    item_type,
                     ordinal,
                     # 媒体项今天没有正文；caption/OCR 落地后它们会自动经由这里进词级索引
-                    search_tokens(None, None, None, source_extra),
-                    source_extra,
+                    search_tokens(None, None, None, extra),
+                    extra,
+                    blob.name,
                     blob.size_bytes,
                     status,
                     now_iso(),

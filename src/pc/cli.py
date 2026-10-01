@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from pc import __version__
+from pc import __version__, domain
 
 #: 关键文件清单：doctor 逐项检查存在性
 _EXPECTED_FILES: tuple[str, ...] = (
@@ -684,7 +684,7 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
                 )
                 print(
                     f"  ✓ 派生列：扫描 {result['scanned']} 行，更新 {result['updated']} 行"
-                    f"（共 {result['total']} 行）"
+                    f"（其中补上文件名 {result['named']} 行；共 {result['total']} 行）"
                 )
             reindexed = db.reindex_fts(conn)
     except db.DatabaseError as exc:
@@ -1790,7 +1790,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument(
         "--type",
         action="append",
-        choices=["text", "image", "video", "audio", "link", "sticker", "file"],
+        choices=list(domain.ITEM_TYPES),
         help="只看某种类型（可重复）",
     )
     p_search.add_argument(

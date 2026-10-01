@@ -27,6 +27,7 @@ EXPECTED_MIGRATION_NAMES = {
     2: "0002_content_hash_not_unique.sql",
     3: "0003_message_media_refs.sql",
     4: "0004_manual_source_and_origin_note.sql",
+    5: "0005_search_names_and_time.sql",
 }
 
 
@@ -237,6 +238,24 @@ def test_content_hash_index_is_partial_but_not_unique(applied_schema: Any) -> No
         "content_hash 不能是唯一索引：同文本跨消息必须能共存（0002 迁移）"
     )
     assert "WHERE content_hash IS NOT NULL AND deleted_at IS NULL" in index_sql
+
+
+def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
+    """0005 的两件事：文件名列（可空）与按消息时间排序用的部分索引。
+
+    两者都服务于 §5.6 的检索预算与"按文件名/消息时间检索"：列提供展示与回填的落点，
+    索引保证按 `sent_at` 排序不需要把 join 结果整体排序（十万行一次排序足以击穿 P99）。
+    """
+    columns = {str(row[1]): row for row in applied_schema.execute("PRAGMA table_info(content_item)")}
+    assert "original_name" in columns, "0005 应该给 content_item 加上 original_name"
+    assert columns["original_name"][3] == 0, "文件名可空：不是每条内容都有名字"
+    assert columns["original_name"][4] is None, "不给默认值（NULL 就表示「没有名字」）"
+
+    index_sql = _index_sqls(applied_schema, "message").get("message_sent_idx")
+    assert index_sql is not None, "0005 应该建 message_sent_idx"
+    assert index_sql == (
+        "CREATE INDEX message_sent_idx ON message (sent_at DESC) WHERE deleted_at IS NULL"
+    ), f"索引形状不符：{index_sql}"
 
 
 def test_egress_state_defaults_to_local_only(applied_schema: Any) -> None:

@@ -14,7 +14,17 @@ from __future__ import annotations
 
 import pytest
 
-from pc.domain import search_extra_value, search_tokens, tokenize_document, tokenize_query
+from pc.domain import (
+    FILE_NAME_LIMIT,
+    ITEM_TYPE_LABELS,
+    ITEM_TYPES,
+    SEARCH_EXTRA_TEXT_LIMIT,
+    filename_from_ref,
+    search_extra_value,
+    search_tokens,
+    tokenize_document,
+    tokenize_query,
+)
 
 
 class TestDocumentTokens:
@@ -106,6 +116,13 @@ class TestDerivedColumnHelpers:
     def test_search_extra_ignores_blanks(self) -> None:
         assert search_extra_value("  ", "", None, "  ") == ""
 
+    def test_search_extra_caps_free_text(self) -> None:
+        """自由文本（文件名、备注）有上限：它们是用户可控的，索引不该被一个超长备注撑大。"""
+        long_note = "备" + "注" * 900
+        composed = search_extra_value(None, "mine", long_note)
+        assert composed.startswith("mine ")
+        assert len(composed.split()[-1]) == SEARCH_EXTRA_TEXT_LIMIT
+
     def test_search_tokens_covers_search_extra(self) -> None:
         """``text_search`` 涵盖与 ``content_fts`` 相同的四列。
 
@@ -114,3 +131,39 @@ class TestDerivedColumnHelpers:
         tokens = search_tokens(None, None, None, search_extra_value("mine", "local"))
         assert tokens is not None
         assert "mine" in tokens.split()
+
+
+class TestFilenameFromRef:
+    """从平台侧引用里取文件名：只留 basename，且不做任何猜测。"""
+
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            (r"D:\素材\壁纸.jpg", "壁纸.jpg"),
+            ("/home/u/pics/a b.png", "a b.png"),
+            ("https://cdn.example.com/x/y/z.webp?v=1#frag", "z.webp"),
+            ("s3://bucket/key.png", "key.png"),
+            ("a.jpg", "a.jpg"),
+            (r"..\..\etc\passwd", "passwd"),
+            ("bad\x01name.jpg", "badname.jpg"),
+        ],
+    )
+    def test_extracts_basename(self, ref: str, expected: str) -> None:
+        assert filename_from_ref(ref) == expected
+
+    @pytest.mark.parametrize("ref", ["", "   ", "/", "\\", "https://example.com/", "https://example.com"])
+    def test_no_name_is_none(self, ref: str) -> None:
+        """没有名字就返回 None：站点的根地址取出来是主机名，不该冒充文件名。"""
+        assert filename_from_ref(ref) is None
+
+    def test_long_name_is_capped(self) -> None:
+        assert len(filename_from_ref("长" * 400 + ".jpg") or "") == FILE_NAME_LIMIT
+
+
+class TestItemTypeLabels:
+    def test_labels_cover_every_type(self) -> None:
+        assert set(ITEM_TYPES) == set(ITEM_TYPE_LABELS), "类型清单与中文标签必须一一对应"
+
+    def test_types_match_the_schema_check(self) -> None:
+        """取值清单与 0001 的 CHECK 逐字一致——CLI 的 --type 选项也用它。"""
+        assert set(ITEM_TYPES) == {"text", "image", "video", "audio", "link", "sticker", "file"}
