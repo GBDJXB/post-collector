@@ -431,7 +431,7 @@ def _doctor_database_section(root: Path) -> None:
 
 
 def _doctor_search_section(root: Path) -> None:
-    """doctor 的检索段：索引规模 + 有多少行还没分词。
+    """doctor 的检索段：索引规模 + 有多少行的派生数据过期（没分词，或文件名还没补）。
 
     "搜不到"最常见的两个原因就在这里：索引是空的（还没重建），或者派生列没算过
     （升级前落库的老行）。两者都只报告，不改动任何东西，也不影响退出码。
@@ -471,8 +471,9 @@ def _doctor_search_section(root: Path) -> None:
     print(f"  ✓ 索引 {counts_text}（有效内容 {items} 条）")
     if stale:
         print(
-            f"  · {stale} 条内容有可检索文本却还没有分词结果："
-            "跑 `pc db reindex --recompute-derived`（1~2 字的中文查询会搜不到它们）"
+            f"  · {stale} 条内容的检索派生数据过期（没分词，或文件名还没补上）："
+            "跑 `pc db reindex --recompute-derived`"
+            "（1~2 字的中文查询与按文件名的查询会搜不到它们）"
         )
     elif items and not any(counts.values()):
         print("  · 索引是空的：跑 `pc db reindex --recompute-derived` 重建")
@@ -1528,6 +1529,8 @@ def cmd_search(args: argparse.Namespace) -> int:
                 "跑 `pc db reindex --recompute-derived` 之后再来搜。"
             )
         print("    小提示：1~2 字的中文查询走词级索引，3 字以上走子串索引；换个数试试。")
+        print("    也可以试试文件名或它的扩展名（壁纸、jpg）、类型（图片/image），")
+        print("    或者你上传时用 --note 写的备注（见 `pc item list` 的备注列）。")
         return 0
 
     table = [

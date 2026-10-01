@@ -270,13 +270,7 @@ class SqliteFtsSearch:
 
         mark = time.perf_counter()
         rows = self._fetch_page(
-            where,
-            params,
-            size + 1,
-            offset,
-            driver=driver,
-            order_column=time_column,
-            filters=filters,
+            where, params, size + 1, offset, driver=driver, order_column=time_column
         )
         timings["main"] = (time.perf_counter() - mark) * 1000
         has_more = len(rows) > size
@@ -294,7 +288,7 @@ class SqliteFtsSearch:
         next_cursor = None
         if has_more and page_rows:
             last = page_rows[-1]
-            moment = last["sent_at"] if time_column == "m.sent_at" else last["first_seen_at"]
+            moment = last["sent_at"] if time_column == "c.sent_at" else last["first_seen_at"]
             next_cursor = self._encode_cursor(
                 self._time_field(filters), str(moment), int(last["content_id"])
             )
@@ -422,7 +416,7 @@ class SqliteFtsSearch:
         """在候选 id 集内按时间倒序取一页（关键词 + `--sort time` 这条组合）。"""
         if not ids:
             return [], False, None
-        column = "m.sent_at" if time_field == TIME_FIELD_SENT else "c.first_seen_at"
+        column = "c.sent_at" if time_field == TIME_FIELD_SENT else "c.first_seen_at"
         marks = ",".join("?" * len(ids))
         where = f"c.content_id IN ({marks})"
         params: list[Any] = list(ids)
@@ -448,29 +442,14 @@ class SqliteFtsSearch:
         return str(filters.get("time_field") or TIME_FIELD_INGEST)
 
     def _time_column(self, filters: Mapping[str, Any]) -> str:
-        """当前时间字段对应的列（``sent`` 走消息时间，其余一律入库时间）。"""
-        return "m.sent_at" if self._time_field(filters) == TIME_FIELD_SENT else "c.first_seen_at"
+        """当前时间字段对应的列。
 
-    def _from_clause_for(self, filters: Mapping[str, Any], driver: str | None = None) -> str:
-        """按时间字段选 FROM：按消息时间排序时**由 message 驱动**（否则要整体排序）。
-
-        ``sent`` 路径用 ``CROSS JOIN`` 强制连接顺序，理由与标签驱动集相同（见
-        :meth:`_from_clause`）：不加这一句，SQLite 可能仍从 content_item 出发再按
-        ``m.sent_at`` 排序，十万行一次排序就足以击穿 §5.6 的 P99。
+        ``sent`` 用 ``content_item.sent_at`` 而不是 ``message.sent_at``：它是消息时间的
+        **副本**（0006），存在的唯一理由就是让"按消息时间过滤 + 排序"能在单表索引
+        （``content_item_sent_idx``）上走完。混合两张表的 ``ORDER BY`` 用不上任何索引，
+        实测十万条会退化成一次整体排序（P50 354 ms），见 ``0006`` 的文件头。
         """
-        if self._time_field(filters) != TIME_FIELD_SENT:
-            return self._from_clause(driver)
-        if driver is not None:
-            return (
-                f"  FROM message m CROSS JOIN ({driver}) AS t"
-                " CROSS JOIN content_item c ON c.message_id = m.message_id"
-                " AND c.content_id = t.content_id"
-                "  JOIN source s ON s.source_id = m.source_id"
-            )
-        return (
-            "  FROM message m CROSS JOIN content_item c ON c.message_id = m.message_id"
-            "  JOIN source s ON s.source_id = m.source_id"
-        )
+        return "c.sent_at" if self._time_field(filters) == TIME_FIELD_SENT else "c.first_seen_at"
 
     # -- 候选与过滤 ---------------------------------------------------------
 
@@ -538,13 +517,14 @@ class SqliteFtsSearch:
 
     _SELECT_HIT = (
         "SELECT c.content_id, c.item_type, c.status, c.nsfw_level, c.first_seen_at,"
+        "       c.sent_at,"
         "       c.canonical_id, c.dup_group_id, c.byte_size, c.char_count,"
         "       substr(c.text_content, 1, 400) AS text_content,"
         "       substr(c.ocr_text, 1, 200) AS ocr_text,"
         "       substr(c.caption, 1, 200) AS caption,"
         "       substr(c.search_extra, 1, 300) AS search_extra,"
         "       c.original_name,"
-        "       m.source_id, m.sent_at, m.origin_note, m.sender_display_name,"
+        "       m.source_id, m.origin_note, m.sender_display_name,"
         "       s.name AS source_name"
     )
 
@@ -717,11 +697,9 @@ class SqliteFtsSearch:
         *,
         driver: str | None = None,
         order_column: str = "c.first_seen_at",
-        filters: Mapping[str, Any] | None = None,
     ) -> list[Any]:
-        source = self._from_clause_for(filters or {}, driver) if filters is not None else self._from_clause(driver)
         sql = (
-            f"{self._SELECT_HIT}{source} WHERE {where}"
+            f"{self._SELECT_HIT}{self._from_clause(driver)} WHERE {where}"
             f" ORDER BY {order_column} DESC, c.content_id DESC LIMIT ?"
         )
         args = [*params, int(count)]
@@ -772,16 +750,11 @@ class SqliteFtsSearch:
             ]
             if usage and min(usage) > 0:
                 return min(usage), "estimate"
-        total, capped = self._count_capped(where, params, filters=filters, driver=driver)
+        total, capped = self._count_capped(where, params, driver=driver)
         return total, "at_least" if capped else "exact"
 
     def _count_capped(
-        self,
-        where: str,
-        params: Sequence[Any],
-        *,
-        filters: Mapping[str, Any] | None = None,
-        driver: str | None = None,
+        self, where: str, params: Sequence[Any], *, driver: str | None = None
     ) -> tuple[int, bool]:
         """数到 :data:`COUNT_CAP` 就停（§5.6 M1b）。
 
@@ -789,8 +762,10 @@ class SqliteFtsSearch:
             ``(数量, 是否被截断)``。被截断时数量就是上限值，调用方要如实说"至少这么多"，
             而不是把它当成精确总数——那正是 M1b 要避免的误导。
         """
-        source = self._from_clause_for(filters or {}, driver)
-        sql = f"SELECT count(*) FROM (SELECT 1{source} WHERE {where} LIMIT ?)"
+        sql = (
+            "SELECT count(*) FROM (SELECT 1"
+            f"{self._from_clause(driver)} WHERE {where} LIMIT ?)"
+        )
         value = int(self._conn.execute(sql, [*params, COUNT_CAP + 1]).fetchone()[0])
         if value > COUNT_CAP:
             return COUNT_CAP, True

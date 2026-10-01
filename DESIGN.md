@@ -456,6 +456,7 @@ content_item(content_id INTEGER PRIMARY KEY, uuid TEXT, message_id INTEGER REFER
      text_search TEXT,                                      -- 派生：应用层分词结果（空格连接），喂给 FTS5 的 content_word
      search_extra TEXT,                                     -- 派生：来源/发送者/类型/文件名/标签/备注的拼接，喂给 FTS5 的 content_fts
      original_name TEXT,                                    -- 这条内容进来时的文件名（只存 basename；展示与"按名字搜"用，见 5.1）
+     sent_at TEXT,                                          -- 派生：message.sent_at 的副本，供"按消息时间排序"走单表索引（见 3.7 与 5.6）
      content_hash TEXT,                                     -- 规范化内容的 SHA-256（文本项）
      phash INTEGER, dhash INTEGER, ahash INTEGER,           -- 感知哈希（图片项；64 位有符号）
      embedding_id TEXT, vector_ref TEXT,                    -- 阶段 3 再定实现（见 5.2）
@@ -936,6 +937,28 @@ v2 曾判定 SQLite"超出舒适区、本项目不推荐"，**v3 反转了这个
 3. **深分页场景本身量错了**：原来一次采样连翻 20 页，量的不是"取第 20 页"而是"翻 20 次"。改为预热时算好游标、只量第 20 页的取数（键集分页的关键性质正是第 20 页与第 1 页同价）。
 
 复测后最慢场景 P99 **240 ms**，仍在 500 ms 预算内，但余量从"约 30 倍"降到"约 2 倍"——差距来自这次量的是完整路径（候选集 + 过滤 + 组装 + 命中片段），而不是裸 SQL。**这条余量是要盯住的数字**：候选集取 bm25 前 500 名（`candidates` 一段就占 35 ms）与召回宽度直接相关，收紧它要以召回为代价，所以下一步该先建评估集（§5.3 阶段 2 的计划），而不是凭感觉调参数。
+
+**第二个钟（按消息时间）加进来之后的复测（v3.1 补记）**
+
+新增场景"按消息时间过滤并翻到第 20 页"（`--time-field sent`，`since` + `sort=time` + 键集游标）。第一次实现的 P50 **354.3 ms / P99 381.5 ms**：P99 在 500 ms 内，**P50 却越过了 150 ms**；而基准脚本当时只判 P99，于是它报了"达标"——数字漂亮但口径没被守住（脚本已改为两个口径都判）。
+
+原因由 `EXPLAIN QUERY PLAN` 给出，不是猜测：`ORDER BY m.sent_at DESC, c.content_id DESC` 的第二个键在**另一张表**上，SQLite 只肯用单表索引满足整条 ORDER BY，于是规划器选了另一条覆盖索引整体扫描 message，再 `USE TEMP B-TREE FOR ORDER BY`——十万行一次排序。改成把消息时间**复制到 `content_item`**（0006，派生列）并建单表复合索引之后，同一条查询 P50 **38.1 ms / P99 42.0 ms**；只加 `message(sent_at)` 单列索引（0005 的做法）救不了它，因为问题不在索引有没有，而在排序键跨表。
+
+| 场景 | P50 | P95 | P99 | 相对预算余量 |
+|---|---|---|---|---|
+| 纯过滤列表（时间倒序 50 条） | 50.4 ms | 53.5 ms | 57.1 ms | 约 8.8 倍 |
+| 纯关键词宽命中（1 字，走词级索引） | 16.9 ms | 17.9 ms | 18.6 ms | 约 27 倍 |
+| 中日文混排查询（2 字） | 16.6 ms | 17.9 ms | 19.2 ms | 约 26 倍 |
+| 短词（2 字，trigram 用不上） | 16.6 ms | 17.8 ms | 18.6 ms | 约 27 倍 |
+| 关键词 + 标签 + 时间 | 46.0 ms | 48.5 ms | 51.3 ms | 约 9.7 倍 |
+| 三标签交集 | 20.3 ms | 22.2 ms | 23.8 ms | 约 21 倍 |
+| 深分页（第 20 页，keyset） | 42.9 ms | 45.8 ms | 50.5 ms | 约 9.9 倍 |
+| 受限内容过滤（`nsfw_level`） | 50.3 ms | 54.0 ms | 59.0 ms | 约 8.5 倍 |
+| 按消息时间过滤并翻到第 20 页（`sent`） | 38.1 ms | 40.6 ms | 42.0 ms | 约 12 倍 |
+| 4 个并发读者（160 次采样） | 97.9 ms | — | 112.5 ms | 约 4.4 倍 |
+| 后台写入同时发生（60 次采样） | 39.3 ms | — | 42.7 ms | 约 12 倍 |
+
+库体积 **302.4 MB**（3.02 KB/条，比上一版 2.61 KB/条涨了 16%：`search_extra` 现在多带类型、文件名与备注，且 `content_item` 多一列 `sent_at`），写入 10 万条约 **55 秒**（1,814 条/秒，比上一版快是因为本次机器负载不同，不是代码变快——两次都在同一台机器上，但写入速率受磁盘与杀软影响，只作为量级参考）。**最慢场景的 P99 从 240 ms 降到 59 ms**：那三条"关键词 + 标签 + 时间"的余量问题在这一轮里没有复现（同一台机器、同一份合成数据规则），如实记录，不改结论——下一轮仍要盯 §5.6 的两个口径。
 
 ### 3.8 删除、去重与引用计数的可测试语义
 
@@ -2170,7 +2193,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -v pcdata:/data \
 | **root 手工上传成为一等来源，凭证改为"按需"**（阶段 1） | §1.5 的 MVP 一直写着"官方导出导入 **+ 手工上传**"，但实现里只有 `export` 一种来源，手工上传只能借 `kind='export'` + `mode='manual_export'` 凑合——那套说法的含义是"我导出了平台数据"，与"我本人就是来源"是两件事。另外"凭证 + 范围 + 证明三者齐备"被默认成"所有来源都要凭证"，而 root 自己丢进来的文件根本没有凭证可谈 | `source.kind` 增加 `manual`、`source_authorization.mode` 增加 `root_self`（§3.2 两处 CHECK 放宽，由 `0004` **重建表**完成）；`message` 增加 `origin_note`（"我后来想起来了"的钩子，可选、不进索引、不进 `raw_payload`）；同一端口上增加第二种**身份策略**：`export` 按相对路径（时间取 mtime），`manual` 按内容哈希（`upload:<媒体 sha256>[:<文本 sha256>]`，时间留空），两者共用一个实现；`Connector.capabilities()` 增加 `requires_credential`，本地来源声明 `False` 并**不造占位凭证**（§1.3、§6.1 补写这条规则），平台型来源声明 `True` 且被 `credential_secret` 阻塞。迁移器为此新增受控的 `-- pc:foreign_keys=off` 指令通道（提交前 `PRAGMA foreign_key_check` 兜底） |
 | **`pc upload` 成为正式入口（含"单文件根"缺陷修复）** | §1.5 把"手工上传"写成阶段 1 的来源之一，但实现里没有对应的命令，只能借 `pc import` + `kind=export` 凑合（身份按路径、时间取 mtime，与"我本人上传"的语义不符）。写端到端测试时又暴露出一个更基础的缺陷：`LocalFilesConnector.discover()` 用 `root.rglob("*")` 扫描，**根是文件时一个都发现不了**——于是 `pc import a.jpg` 静默地什么都不做（既有测试一直传目录，所以没照出来） | 新增 `pc upload PATH... [--note TEXT] [--source NAME] [--no-process] [--dry-run]`：默认用（必要时新建）`kind=manual` 的 `manual` 来源，身份按内容哈希、`sent_at` 留空、`--note` 写 `message.origin_note`、**默认接着处理**（媒体引用是文件路径，原文件被删就只能死信）；`pc import` 与 `pc upload` 共用 `_ingest_loop` 与 `_prepare_local_connector`，差别只在来源怎么来。`discover()` 改为**根可以是文件**（产出它自己，`relative` 取文件名），因此命令行原样把用户给的路径当根，**不**换成父目录（那会把整个目录导进来——写测试时先踩到的是这一种误伤）；`pc item list` 增加「备注」列；`pc source add` 的 `--kind` 增加 `manual`、`--authorize` 可留空（按 kind 取默认）。新增 `tests/test_cli_upload.py`（18 条端到端）与连接器侧 5 条发现测试 |
 | **检索层落地（阶段 1，v3.1）** | §5.1 的双索引、§5.5 的可解释性、§5.6 的 M1/M1b/M2/M6 都只有机制描述，没有实现；`SearchIndex` 端口只有声明。更关键的是**基准脚本自己写了一份 SQL**（当时业务层还没实现），于是"预算达标"证明的是策略，不是线上路径 | 新增 `adapters/fts_search.py`（双索引候选、候选内过滤、键集分页、三条 SQL 组装、命中理由与各段耗时）与 `services/search.py`（可见性政策、来源/标签解析、页大小闸门）；`pc search` 与 `pc doctor` 的 `[检索]` 段接线；`tools/bench_search.py` 改为**驱动真实实现**并覆盖 §5.6 清单九项。落地后立刻发现三处真问题并修掉（截断计数、标签查询计划按扫描量切换、深分页场景量错），详见 §3.7 的复测小节 | **排序加权推迟**：§5.1 写着"BM25 × 时间衰减 × 来源信任度"，本切片只做了 bm25 与显式时间序。理由：没有评估集时调权重是盲调，先要有可度量的相关性判据（§5.3 阶段 2）。**M3/M4/M5 随服务化切片**：缩略图规则、启动预热、事件循环纪律都依赖 `pc serve`，CLI 是一次性进程；本切片只落了 M6 的 CLI 版（`--timings` + 超 200 ms 提示）。**打标切片欠一条**：写 `tag_assignment` 之后必须维护 `tag.usage_count` 并调用 `SearchIndex.index()`，否则标签维度的"约 N 条"会退回逐行计数 |
-| **检索维度补齐：文件名 / 文件类型 / 消息时间 / 备注**（阶段 1，v3.1） | §5.1 的可检索字段只有正文、OCR、caption 与一类"补充字段"，落到实现里就是来源名与发送者名——**文件名**（用户最容易用来找东西的那一列）与**用户自己写的备注**（`message.origin_note`）都搜不到；时间只有"入库时间"一个钟（`message.sent_at` 没有索引也没有查询入口）；类型只能当过滤器用，`pc search 图片` 这类自然写法命中 0 行 | 新增 `0005_search_names_and_time.sql`：`content_item.original_name`（只存 basename，展示与回填用）+ `message_sent_idx (sent_at DESC) WHERE deleted_at IS NULL`（按消息时间排序要能沿索引走，否则十万行一次排序击穿 §5.6）。`search_extra` 的合成按固定顺序扩展为"来源/平台/发送者/类型值/类型中文/文件名/标签/备注"，落库与重算两处同步；老行按**无歧义**规则回填文件名（该消息恰好一个 media 引用时取 basename，多附件与文本项留空）。查询侧新增 `--time-field ingest\|sent`（同时管 `--since/--until`、`--sort time` 与游标，游标里编了字段、混用直接报错），`sent` 路径由 message 驱动（`CROSS JOIN` 强制顺序）。**明确推迟**：查询期类型意图词表、`--ext`/`--name` 专用过滤器（名字与扩展名已可搜），以及**纯文本文件的名字**——它没有 media ref，名字在 L2 之后就丢了，补齐要给 `SourceMessage` 加字段并给 `message` 加列，作为单独一刀（届时 §3.2 与本节要一并更新） |
+| **检索维度补齐：文件名 / 文件类型 / 消息时间 / 备注**（阶段 1，v3.1） | §5.1 的可检索字段只有正文、OCR、caption 与一类"补充字段"，落到实现里就是来源名与发送者名——**文件名**（用户最容易用来找东西的那一列）与**用户自己写的备注**（`message.origin_note`）都搜不到；时间只有"入库时间"一个钟（`message.sent_at` 没有索引也没有查询入口）；类型只能当过滤器用，`pc search 图片` 这类自然写法命中 0 行 | 新增 `0005_search_names_and_time.sql`：`content_item.original_name`（只存 basename，展示与回填用）+ `message_sent_idx`。`search_extra` 的合成按固定顺序扩展为"来源/平台/发送者/类型值/类型中文/文件名/标签/备注"，落库与重算两处同步；老行按**无歧义**规则回填文件名（该消息恰好一个 media 引用时取 basename，多附件与文本项留空）。查询侧新增 `--time-field ingest\|sent`（同时管 `--since/--until`、`--sort time` 与游标，游标里编了字段、混用直接报错）。**基准推翻了 0005 的时间方案**：`ORDER BY m.sent_at, c.content_id` 的第二个键在另一张表上，单表索引满足不了整条 ORDER BY，十万条实测 P50 354 ms（越过 P50 150 ms，而 P99 381 ms 仍在 500 ms 内——基准当时只判 P99，已改为两个口径都判）。于是新增 `0006_sent_at_on_content_item.sql`：把消息时间复制成 `content_item.sent_at`（派生列，事实源仍是 message）并建 `(sent_at DESC, content_id DESC)` 单表部分索引、删掉没人用的 `message_sent_idx`，同一条查询 P50 38 ms / P99 42 ms（§3.7 记了修改前后两轮完整数字）。**明确推迟**：查询期类型意图词表、`--ext`/`--name` 专用过滤器（名字与扩展名已可搜），以及**纯文本文件的名字**——它没有 media ref，名字在 L2 之后就丢了，补齐要给 `SourceMessage` 加字段并给 `message` 加列，作为单独一刀（届时 §3.2 与本节要一并更新） |
 
 | **端口数量保持 13 个不变**（v3） | 新增 `Database` 端口会让文档写 14、代码是 13，两份事实源立刻矛盾 | 不新增端口，改为在 9.2 立一条硬约束："数据库访问收敛在单一适配器内，PRAGMA、事务边界、类型转换都在那里"；3.5 与 8.3 说明这条约束如何把将来迁 PG 的成本压到最低 |
 

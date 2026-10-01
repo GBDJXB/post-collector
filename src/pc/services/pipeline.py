@@ -423,6 +423,9 @@ class Worker:
             message.get("sender_display_name"),
         )
         origin_note = message.get("origin_note")
+        # 消息时间抄到内容项上：它是**派生的**（事实源仍是 message.sent_at），只为让
+        # "按消息时间排序"能在单表索引上走完（跨表 ORDER BY 用不上任何索引，见 0006）。
+        sent_at = message.get("sent_at")
         quarantined = 0
         linked = 0
 
@@ -445,12 +448,14 @@ class Worker:
 
             ordinal = 0
             if collected.text_raw is not None and collected.text_normalized is not None:
-                self._insert_text_item(message_id, collected, shared_parts, origin_note, ordinal, source)
+                self._insert_text_item(
+                    message_id, collected, shared_parts, origin_note, sent_at, ordinal, source
+                )
                 ordinal += 1
 
             for blob in collected.blobs:
                 _, is_quarantined = self._insert_media_item(
-                    message_id, blob, shared_parts, origin_note, ordinal, source
+                    message_id, blob, shared_parts, origin_note, sent_at, ordinal, source
                 )
                 ordinal += 1
                 linked += 1
@@ -468,6 +473,7 @@ class Worker:
         collected: Collected,
         shared_parts: tuple[Any, ...],
         origin_note: str | None,
+        sent_at: str | None,
         ordinal: int,
         source: Mapping[str, Any],
     ) -> int:
@@ -495,9 +501,9 @@ class Worker:
             self._conn.execute(
                 "INSERT INTO content_item ("
                 "  uuid, message_id, item_type, ordinal, text_content, text_search,"
-                "  search_extra, original_name, content_hash, char_count, byte_size,"
+                "  search_extra, original_name, sent_at, content_hash, char_count, byte_size,"
                 "  dup_group_id, canonical_id, first_seen_at"
-                ") VALUES (?, ?, 'text', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) "
+                ") VALUES (?, ?, 'text', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) "
                 "RETURNING content_id",
                 (
                     str(uuid.uuid4()),
@@ -511,6 +517,7 @@ class Worker:
                     # 索引里无处可查，1~2 字查询会静默落空。
                     search_tokens(collected.text_raw, None, None, extra),
                     extra,
+                    sent_at,
                     collected.text_hash,
                     len(collected.text_normalized or ""),
                     len((collected.text_raw or "").encode("utf-8")),
@@ -527,6 +534,7 @@ class Worker:
         blob: MediaBlob,
         shared_parts: tuple[Any, ...],
         origin_note: str | None,
+        sent_at: str | None,
         ordinal: int,
         source: Mapping[str, Any],
     ) -> tuple[int, bool]:
@@ -541,8 +549,8 @@ class Worker:
             self._conn.execute(
                 "INSERT INTO content_item ("
                 "  uuid, message_id, item_type, ordinal, text_search, search_extra,"
-                "  original_name, byte_size, status, first_seen_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
+                "  original_name, sent_at, byte_size, status, first_seen_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
                 (
                     str(uuid.uuid4()),
                     message_id,
@@ -552,6 +560,7 @@ class Worker:
                     search_tokens(None, None, None, extra),
                     extra,
                     blob.name,
+                    sent_at,
                     blob.size_bytes,
                     status,
                     now_iso(),

@@ -1284,6 +1284,7 @@ def stale_search_row_count(conn: sqlite3.Connection) -> int:
         "        OR c.caption IS NOT NULL OR c.search_extra IS NOT NULL))"
         "   OR (c.original_name IS NULL AND c.item_type <> 'text'"
         "       AND json_array_length(m.media_refs) = 1)"
+        "   OR c.sent_at IS NOT m.sent_at"
         " )"
     ).fetchone()
     return int(row[0]) if row else 0
@@ -1321,19 +1322,21 @@ def refresh_search_derived(
     content_ids: Sequence[int] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """重算检索派生数据（``text_search``、``search_extra``，并补 ``original_name``）。
+    """重算检索派生数据（``text_search``、``search_extra``，补 ``original_name`` 与 ``sent_at``）。
 
-    **为什么要重算**：这三列是派生的（DESIGN §2.3 的派生数据纪律）——
+    **为什么要重算**：这几列是派生的（DESIGN §2.3 的派生数据纪律）——
 
     * 分词规则变了（本仓库从"没有分词器"变成"单字 + 双字"），老行得跟着变；
     * ``search_extra`` 含来源名、发送者名、类型、文件名与**标签名**，这些变了它就过期了；
     * ``original_name`` 是 0005 才加的列，之前落库的媒体项没有它（回填规则见
-      :func:`_backfill_original_name`）。
+      :func:`_backfill_original_name`）；
+    * ``sent_at`` 是 0006 才加的列（消息时间的副本，供"按消息时间排序"走单表索引），
+      老行需要从 ``message.sent_at`` 对齐过来。
 
     ``content_ids`` 给了就只算这几行（供单行更新用），否则全表分批。
 
     分批提交（DESIGN §2.3）：SQLite 是单写者，一次更新十万行会让写锁长时间不释放。
-    本函数幂等：三列算出来都与现有值相同就不写（比较后再决定），重复跑只花读的时间。
+    本函数幂等：算出来的值与现有值相同就不写（比较后再决定），重复跑只花读的时间。
     """
     size = max(1, int(batch_size))
     wanted = list(dict.fromkeys(int(item) for item in content_ids)) if content_ids else None
@@ -1347,10 +1350,11 @@ def refresh_search_derived(
     scanned = 0
 
     for rows in _derived_batches(conn, wanted=wanted, size=size):
-        pending: list[tuple[str | None, str | None, str | None, int]] = []
+        pending: list[tuple[str | None, str | None, str | None, str | None, int]] = []
         for row in rows:
             scanned += 1
             name = _backfill_original_name(row)
+            sent_at = row["message_sent_at"]
             extra = search_extra_value(
                 row["source_name"],
                 row["platform"],
@@ -1366,18 +1370,19 @@ def refresh_search_derived(
                 tokens == row["text_search"]
                 and extra == row["search_extra"]
                 and name == row["original_name"]
+                and sent_at == row["sent_at"]
             ):
                 continue
             if row["original_name"] is None and name is not None:
                 named += 1
-            pending.append((tokens, extra, name, int(row["content_id"])))
+            pending.append((tokens, extra, name, sent_at, int(row["content_id"])))
         if pending:
             with transaction(conn):
-                for tokens, extra, name, content_id in pending:
+                for tokens, extra, name, sent_at, content_id in pending:
                     conn.execute(
                         "UPDATE content_item SET text_search = ?, search_extra = ?,"
-                        " original_name = ?, updated_at = ? WHERE content_id = ?",
-                        (tokens, extra, name, now_iso(), content_id),
+                        " original_name = ?, sent_at = ?, updated_at = ? WHERE content_id = ?",
+                        (tokens, extra, name, sent_at, now_iso(), content_id),
                     )
             updated += len(pending)
         if progress is not None:
@@ -1385,11 +1390,12 @@ def refresh_search_derived(
     return {"scanned": scanned, "updated": updated, "named": named, "total": total}
 
 
-#: 重算派生列时要读的字段（含标签名的拼接与回填文件名所需的 media_refs/origin_note）
+#: 重算派生列时要读的字段（含标签名拼接、文件名回填与消息时间对齐所需的列）
 _SEARCH_DERIVED_SELECT = (
     "SELECT c.content_id, c.text_content, c.ocr_text, c.caption, c.text_search,"
-    "       c.search_extra, c.original_name, c.item_type, s.name AS source_name, s.platform,"
-    "       m.sender_display_name, m.origin_note, m.media_refs,"
+    "       c.search_extra, c.original_name, c.sent_at, c.item_type, s.name AS source_name,"
+    "       s.platform, m.sender_display_name, m.origin_note, m.media_refs,"
+    "       m.sent_at AS message_sent_at,"
     "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
     "          JOIN tag t ON t.tag_id = ta.tag_id"
     "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "

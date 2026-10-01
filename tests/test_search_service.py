@@ -68,9 +68,9 @@ def _seed_item(
         conn.execute(
             "INSERT INTO content_item ("
             "  uuid, message_id, item_type, ordinal, text_content, text_search, search_extra,"
-            "  original_name, status, nsfw_level, first_seen_at, deleted_at, canonical_id,"
-            "  dup_group_id"
-            ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
+            "  original_name, sent_at, status, nsfw_level, first_seen_at, deleted_at,"
+            "  canonical_id, dup_group_id"
+            ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING content_id",
             (
                 str(uuid.uuid4()),
                 message_id,
@@ -79,6 +79,9 @@ def _seed_item(
                 search_tokens(text, None, None, extra),
                 extra,
                 original_name,
+                # sent_at 在 content_item 上是消息时间的派生副本（0006）：真实落库路径
+                # （pipeline）两处都写，这里必须照着写，否则测的是"只有一侧有值"的假象。
+                sent_at,
                 status,
                 nsfw_level,
                 first_seen_at,

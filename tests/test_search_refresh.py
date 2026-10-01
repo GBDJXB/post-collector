@@ -43,13 +43,18 @@ def _seed_item(
     item_type: str = "text",
     refs: tuple[str, ...] = (),
     origin_note: str | None = None,
+    sent_at: str | None = None,
 ) -> int:
-    """直接写一条内容项；``text_search`` 默认留空，模拟升级前落库的老行。"""
+    """直接写一条内容项；``text_search`` 默认留空，模拟升级前落库的老行。
+
+    ``sent_at`` 只写进 ``message``（老行的样子）：``content_item.sent_at`` 是 0006 才有的
+    派生副本，正是重算要补的东西。
+    """
     message_id = int(
         conn.execute(
             "INSERT INTO message (uuid, source_id, platform_msg_id, sender_display_name,"
-            " text_raw, origin_note, media_refs) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
+            " text_raw, origin_note, media_refs, sent_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
             (
                 str(uuid.uuid4()),
                 source_id,
@@ -58,6 +63,7 @@ def _seed_item(
                 text,
                 origin_note,
                 json.dumps(list(refs)),
+                sent_at,
             ),
         ).fetchone()[0]
     )
@@ -178,6 +184,41 @@ class TestNameBackfill:
         second = db.refresh_search_derived(fresh_db)
         assert first["updated"] == 1 and first["named"] == 1
         assert second["updated"] == 0 and second["named"] == 0
+
+
+class TestSentAtAlignment:
+    """``content_item.sent_at`` 是消息时间的**派生副本**（0006），重算要把它对齐。"""
+
+    def test_old_row_without_the_copy_is_repaired(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db, source_id=source_id, text="一段话", sent_at="2026-01-05T00:00:00.000Z"
+        )
+        assert _row(fresh_db, content_id)["sent_at"] is None, "老行只有 message 那一侧有值"
+        assert db.stale_search_row_count(fresh_db) >= 1, "不一致的行要算作待重算"
+        db.refresh_search_derived(fresh_db)
+        assert _row(fresh_db, content_id)["sent_at"] == "2026-01-05T00:00:00.000Z"
+        assert db.stale_search_row_count(fresh_db) == 0
+
+    def test_diverged_row_is_realigned(self, fresh_db: Any) -> None:
+        """两处不一致时以 ``message.sent_at`` 为准（它才是事实源）。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db, source_id=source_id, text="一段话", sent_at="2026-01-05T00:00:00.000Z"
+        )
+        fresh_db.execute(
+            "UPDATE content_item SET sent_at = '1999-01-01T00:00:00.000Z' WHERE content_id = ?",
+            (content_id,),
+        )
+        db.refresh_search_derived(fresh_db)
+        assert _row(fresh_db, content_id)["sent_at"] == "2026-01-05T00:00:00.000Z"
+
+    def test_both_null_is_not_stale(self, fresh_db: Any) -> None:
+        """手工上传两侧都是空：这是正常状态，不该被反复提示重算。"""
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, text="手工上传的内容", sent_at=None)
+        db.refresh_search_derived(fresh_db)
+        assert db.stale_search_row_count(fresh_db) == 0
 
 
 class TestStaleCount:

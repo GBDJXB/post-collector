@@ -72,12 +72,13 @@ def _seed(
     max_attempts: int = 5,
     sender: str | None = None,
     note: str | None = None,
+    sent_at: str | None = None,
 ) -> tuple[int, int]:
     """直接写一条消息 + 一个排队任务（绕开连接器，便于构造边界情况）。"""
     message_id = conn.execute(
         "INSERT INTO message (uuid, source_id, platform_msg_id, message_type, text_raw,"
-        " sender_display_name, origin_note, media_refs) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
+        " sender_display_name, origin_note, media_refs, sent_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING message_id",
         (
             str(uuid.uuid4()),
             source_id,
@@ -87,6 +88,7 @@ def _seed(
             sender,
             note,
             json.dumps(list(refs)),
+            sent_at,
         ),
     ).fetchone()[0]
     job_id = conn.execute(
@@ -277,6 +279,31 @@ class TestTextItems:
         row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
         assert row["original_name"] == "猫.png"
         assert "素材" not in row["search_extra"] and "某个群" not in row["search_extra"]
+
+    def test_message_time_is_copied_onto_the_item(self, env: SimpleNamespace) -> None:
+        """``content_item.sent_at`` 是消息时间的派生副本（0006），落库时就要抄下来。
+
+        缺了它，"按消息时间排序"会去 join 另一张表——十万条实测退化成一次整体排序
+        （P50 354 ms）；有了单表副本与索引，同一条查询是亚毫秒级。
+        """
+        source = _source(env.conn, env.tmp)
+        photo = env.tmp / "猫.png"
+        photo.write_bytes(PNG)
+        _seed(env.conn, source_id=source["source_id"], refs=(str(photo),), sent_at="2026-02-03T04:05:06.000Z")
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["sent_at"] == "2026-02-03T04:05:06.000Z"
+        assert row["sent_at"] == env.conn.execute("SELECT sent_at FROM message").fetchone()[0]
+
+    def test_manual_upload_has_no_message_time(self, env: SimpleNamespace) -> None:
+        """手工上传没有消息时间：两侧都是空，这是正常状态而不是缺失数据。"""
+        source = _source(env.conn, env.tmp)
+        photo = env.tmp / "猫.png"
+        photo.write_bytes(PNG)
+        _seed(env.conn, source_id=source["source_id"], refs=(str(photo),), sent_at=None)
+        env.worker.run_once()
+        row = dict(env.conn.execute("SELECT * FROM content_item").fetchone())
+        assert row["sent_at"] is None
 
     def test_text_item_has_no_file_name_yet(self, env: SimpleNamespace) -> None:
         """纯文本文件没有 media ref，名字在 L2 之后就丢了 → 这一刀留空（见 AGENTS）。

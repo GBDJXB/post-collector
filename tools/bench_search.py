@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sqlite3
 import statistics
@@ -40,13 +41,14 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pc.adapters import sqlite as db
-from pc.domain import search_extra_value, search_tokens
+from pc.domain import ITEM_TYPE_LABELS, search_extra_value, search_tokens
 from pc.services.search import SearchQuery, run_search
 
 #: 伪随机词表：中文词、日文片假名、拉丁词混排
@@ -145,21 +147,46 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
                         break
                 picks.append(chosen)
             source_name = SOURCE_NAMES[rng.randint(0, len(SOURCE_NAMES) - 1)]
-            # 派生列按生产的同一套规则算：分词结果 + 检索补充字段（标签名 + 来源名）
+            # 文件名：只有媒体项才有（这一批全是 image），照生产规则只留 basename
+            file_name = f"素材-{content_id:06d}.jpg"
+            # 消息时间：按内容 id 递减，模拟"越新的内容消息时间越晚"；每 11 条留一条空值
+            # （对应手工上传那种没有消息时间的内容），让"空值排最后/被时间范围排除"这两条
+            # 也能在真实规模上被量到，而不是只在小测试里成立。
+            sent_at = (
+                None
+                if content_id % 11 == 0
+                else f"2026-{(content_id % 12) + 1:02d}-{(content_id % 28) + 1:02d}"
+                f"T{content_id % 24:02d}:00:00.000Z"
+            )
+            # 派生列按生产的同一套规则算：分词结果 + 检索补充字段
+            # （标签名 + 来源名 + 类型 + 文件名）
             extra = search_extra_value(
-                " ".join(TAG_NAMES[tag_id - 1] for tag_id in picks if tag_id), source_name
+                " ".join(TAG_NAMES[tag_id - 1] for tag_id in picks if tag_id),
+                source_name,
+                "image",
+                ITEM_TYPE_LABELS["image"],
+                file_name,
             )
             tokens = search_tokens(text, ocr_text, caption, extra)
             conn.execute(
-                "INSERT INTO message (message_id, uuid, source_id, platform_msg_id) "
-                "VALUES (?, ?, ?, ?)",
-                (message_id, f"msg-{message_id}", rng.randint(1, len(SOURCE_NAMES)), f"pm-{message_id}"),
+                "INSERT INTO message (message_id, uuid, source_id, platform_msg_id, sent_at,"
+                " media_refs) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    message_id,
+                    f"msg-{message_id}",
+                    rng.randint(1, len(SOURCE_NAMES)),
+                    f"pm-{message_id}",
+                    sent_at,
+                    json.dumps([f"D:/素材/{file_name}"]),
+                ),
             )
             conn.execute(
                 "INSERT INTO content_item "
                 "(content_id, uuid, message_id, item_type, ordinal, text_content, ocr_text, "
-                " caption, text_search, search_extra, nsfw_level, status) "
-                "VALUES (?, ?, ?, 'image', 0, ?, ?, ?, ?, ?, ?, 'active')",
+                " caption, text_search, search_extra, original_name, sent_at, nsfw_level,"
+                " status, first_seen_at) "
+                "VALUES (?, ?, ?, 'image', 0, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
                 (
                     content_id,
                     f"ci-{content_id}",
@@ -169,7 +196,11 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
                     caption,
                     tokens,
                     extra,
+                    file_name,
+                    # 消息时间的派生副本（0006）：真实落库路径两处都写，基准也一样
+                    sent_at,
                     2 if content_id % 97 == 0 else 0,
+                    f"2026-01-01T00:00:{content_id % 60:02d}.000Z",
                 ),
             )
             conn.execute(
@@ -301,6 +332,34 @@ def _query_nsfw_filter(conn: sqlite3.Connection) -> int:
     return _hits(conn, SearchQuery(nsfw_max_level=1, limit=PAGE_SIZE))
 
 
+def _query_sent_time_page(conn: sqlite3.Connection) -> int:
+    """按「收到消息时间」过滤 + 排序，并翻到第 20 页（§5.6 的第二个钟）。
+
+    这条路径与入库时间那条**不是同一个查询形状**：它由 message 驱动、沿
+    ``message_sent_idx`` 走，否则十万行一次排序。时间范围取一段能命中约十分之一的区间，
+    排序与游标都按消息时间——这正是 `--time-field sent` 的真实形态。
+    """
+    global _SENT_20_CURSOR
+    query = SearchQuery(
+        since="2026-06-01T00:00:00.000Z",
+        time_field="sent",
+        sort="time",
+        limit=PAGE_SIZE,
+    )
+    if _SENT_20_CURSOR is None:
+        cursor: str | None = None
+        for _ in range(19):
+            cursor = run_search(conn, replace(query, cursor=cursor))["next_cursor"]
+            if cursor is None:
+                break
+        _SENT_20_CURSOR = cursor or ""
+    return _hits(conn, replace(query, cursor=_SENT_20_CURSOR or None))
+
+
+#: 按消息时间翻到第 20 页的游标（首次调用时算好，理由同 :func:`_query_deep_paging`）
+_SENT_20_CURSOR: str | None = None
+
+
 SCENARIOS: tuple[tuple[str, Callable[[sqlite3.Connection], int]], ...] = (
     ("纯过滤列表（时间倒序 50 条）", _query_plain_list),
     ("纯关键词宽命中（1 字，走词级索引）", _query_keyword_broad),
@@ -310,6 +369,7 @@ SCENARIOS: tuple[tuple[str, Callable[[sqlite3.Connection], int]], ...] = (
     ("三标签交集", _query_three_tag_intersection),
     ("深分页（连续 20 页，keyset）", _query_deep_paging),
     ("受限内容过滤（nsfw_level）", _query_nsfw_filter),
+    ("按消息时间过滤并翻到第 20 页", _query_sent_time_page),
 )
 
 
@@ -511,9 +571,16 @@ def main(argv: list[str] | None = None) -> int:
         for name, func in SCENARIOS:
             func(conn)  # 预热：把懒加载的游标与页缓存填上，别算进采样
             result = measure(conn, func, args.runs)
-            verdict = "达标" if result["p99"] < BUDGET_P99_MS else "超预算"
+            # 两个口径都要判：P99 管尾部，P50 管"随手一查"的体感。只判 P99 会漏掉
+            # "每次都慢但慢得很稳定"的形状——那正是实际使用里最难受的一种。
+            over = []
+            if result["p50"] >= BUDGET_P50_MS:
+                over.append(f"P50 {result['p50']:.0f} ms")
             if result["p99"] >= BUDGET_P99_MS:
-                failures.append(f"{name}：P99 {result['p99']:.0f} ms")
+                over.append(f"P99 {result['p99']:.0f} ms")
+            verdict = "达标" if not over else "超预算"
+            if over:
+                failures.append(f"{name}：" + "、".join(over))
             print(
                 f"      {name:<34} {result['p50']:>7.1f}ms {result['p95']:>7.1f}ms "
                 f"{result['p99']:>7.1f}ms {result['rows']:>5}  {verdict}"

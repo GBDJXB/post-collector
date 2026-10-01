@@ -51,3 +51,34 @@ def test_synthetic_data_uses_the_production_tokenizer(bench: ModuleType) -> None
     source = BENCH_PATH.read_text(encoding="utf-8")
     assert "search_tokens(" in source
     assert "search_extra_value(" in source
+
+
+def test_synthetic_data_carries_names_and_message_times(
+    bench: ModuleType, tmp_path: Path
+) -> None:
+    """两个检索维度都要在合成数据里真实存在，否则新场景量的是一条退化路径。
+
+    没有 ``message.sent_at`` 时"按消息时间排序"量的是全 NULL；没有 ``original_name``
+    时文件名检索恒为空。两者都会让基准看起来很漂亮却什么都没测到。
+    """
+    import sqlite3
+
+    path = tmp_path / "bench-seed.sqlite3"
+    bench.build_database(path, 300)
+    conn = sqlite3.connect(path)
+    rows = {
+        "messages": conn.execute("SELECT count(*) FROM message").fetchone()[0],
+        "with_sent_at": conn.execute(
+            "SELECT count(*) FROM message WHERE sent_at IS NOT NULL"
+        ).fetchone()[0],
+        "named": conn.execute(
+            "SELECT count(*) FROM content_item WHERE original_name IS NOT NULL"
+        ).fetchone()[0],
+        "names_in_index": conn.execute(
+            "SELECT count(*) FROM content_item WHERE search_extra LIKE '%.jpg%'"
+        ).fetchone()[0],
+    }
+    conn.close()
+    assert rows["with_sent_at"] > 0, "合成数据里必须有消息时间"
+    assert rows["with_sent_at"] < rows["messages"], "也要留一部分空值（手工上传那种）"
+    assert rows["named"] == rows["names_in_index"] == rows["messages"] > 0
