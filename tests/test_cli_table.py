@@ -205,9 +205,12 @@ class TestDeclarations:
     def test_source_list_caps_cover_every_column(self) -> None:
         assert set(cli.SOURCE_LIST_MAX_WIDTHS) == set(cli.SOURCE_LIST_HEADERS)
 
+    def test_search_caps_cover_every_column(self) -> None:
+        assert set(cli.SEARCH_MAX_WIDTHS) == set(cli.SEARCH_HEADERS)
+
     @pytest.mark.parametrize(
         "limits",
-        [cli.ITEM_LIST_MAX_WIDTHS, cli.SOURCE_LIST_MAX_WIDTHS],
+        [cli.ITEM_LIST_MAX_WIDTHS, cli.SOURCE_LIST_MAX_WIDTHS, cli.SEARCH_MAX_WIDTHS],
     )
     def test_every_cap_is_usable(self, limits: dict[str, int]) -> None:
         for header, limit in limits.items():
@@ -311,6 +314,27 @@ class TestRealCommands:
         table_lines = out_lines[:2 + 1]  # 表头 + 分隔线 + 1 个来源
         widths = {_width(line) for line in table_lines}
         assert len(widths) == 1, f"行宽不一致：{sorted(widths)}\n" + "\n".join(table_lines)
+
+    def test_search_lines_are_all_the_same_display_width(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """检索结果表也要等宽：命中片段里有中文与方括号，最容易把对齐搞坏。"""
+        workspace = self._bootstrap(tmp_path, monkeypatch)
+        assert cli.main(["db", "apply", "--path", workspace["db"]]) == 0
+        text_file = tmp_path / "素材" / "一句话.txt"
+        text_file.parent.mkdir(parents=True, exist_ok=True)
+        text_file.write_text("蓝发精灵站在雨里", encoding="utf-8")
+        assert cli.main(["upload", str(text_file), "--path", workspace["db"]]) == 0
+        capsys.readouterr()
+
+        assert cli.main(["search", "雨", "--path", workspace["db"]]) == 0
+        out_lines = [
+            line for line in capsys.readouterr().out.splitlines() if line.startswith("  ")
+        ]
+        table_lines = out_lines[:2 + 1]  # 表头 + 分隔线 + 1 条命中
+        widths = {_width(line) for line in table_lines}
+        assert len(widths) == 1, f"行宽不一致：{sorted(widths)}\n" + "\n".join(table_lines)
+        assert "[雨]" in "".join(table_lines), "命中片段要标出命中的位置"
 
     def test_json_output_is_never_truncated(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

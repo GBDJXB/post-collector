@@ -277,6 +277,114 @@ class TestFilterPath:
             svc.run_search(fresh_db, SearchQuery(limit=50, tags=("rain",)))
         ) == [corpus["ids"]["snow"]]
 
+    def test_two_tags_on_the_same_item_match(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        """正例的 AND：两个标签都挂在同一条内容上时必须命中。
+
+        这条是回归测试：标签过滤会用"最小集合当驱动表、其余 EXISTS"的写法，而驱动子查询
+        在 FROM 里、EXISTS 在 WHERE 末尾——参数顺序一旦错位，FTS 不会报错，只会静默查不到。
+        只测"两个不共现的标签查不到"是抓不到那个 bug 的。
+        """
+        content_id = corpus["ids"]["rain"]
+        for name in ("夜雨", "蓝"):
+            fresh_db.execute(
+                "INSERT INTO tag (uuid, name, name_norm, namespace) VALUES (?, ?, ?, 'general')",
+                (f"t-{name}", name, name),
+            )
+            tag_id = int(fresh_db.execute("SELECT max(tag_id) FROM tag").fetchone()[0])
+            fresh_db.execute(
+                "INSERT INTO tag_assignment (content_id, tag_id, source) VALUES (?, ?, 'human')",
+                (content_id, tag_id),
+            )
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, tags=("夜雨", "蓝")))
+        assert _ids(result) == [content_id]
+
+    def test_three_tags_intersection(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        content_id = corpus["ids"]["snow"]
+        for name in ("雪", "夜", "读书"):
+            fresh_db.execute(
+                "INSERT INTO tag (uuid, name, name_norm, namespace) VALUES (?, ?, ?, 'general')",
+                (f"t3-{name}", name, name),
+            )
+            tag_id = int(fresh_db.execute("SELECT max(tag_id) FROM tag").fetchone()[0])
+            fresh_db.execute(
+                "INSERT INTO tag_assignment (content_id, tag_id, source) VALUES (?, ?, 'human')",
+                (content_id, tag_id),
+            )
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, tags=("雪", "夜", "读书")))
+        assert _ids(result) == [content_id]
+
+
+class TestTotals:
+    """总数的三种口径（§5.6 M1b）：精确 / 至少 N 条 / 约 N 条。"""
+
+    def test_plain_list_is_exact(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        result = svc.run_search(fresh_db, SearchQuery(limit=50))
+        assert result["total_kind"] == "exact"
+
+    def test_cap_turns_it_into_at_least(
+        self, fresh_db: Any, corpus: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """超过上限就不再数下去，并如实说"至少这么多"。"""
+        from pc.adapters import fts_search
+
+        monkeypatch.setattr(fts_search, "COUNT_CAP", 2)
+        result = svc.run_search(fresh_db, SearchQuery(limit=50))
+        assert result["total"] == 2
+        assert result["total_kind"] == "at_least"
+        # has_more 说的是"这一页之外还有没有"，与总数是不是被截断无关
+        assert result["has_more"] is (len(result["hits"]) == 50)
+
+    def test_tag_usage_gives_an_estimate(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        """标签维度用 tag.usage_count（打标切片维护的计数器），代价接近零。"""
+        tag_id = int(
+            fresh_db.execute("SELECT tag_id FROM tag WHERE name = 'rain'").fetchone()[0]
+        )
+        fresh_db.execute("UPDATE tag SET usage_count = 7 WHERE tag_id = ?", (tag_id,))
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, tags=("rain",)))
+        assert (result["total"], result["total_kind"]) == (7, "estimate")
+
+    def test_unmaintained_counter_falls_back_to_counting(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        """计数器还是 0（打标切片之前）时不能报 0——退回真实计数，并标成精确。"""
+        result = svc.run_search(fresh_db, SearchQuery(limit=50, tags=("rain",)))
+        assert result["total_kind"] == "exact"
+        assert result["total"] == 1
+
+    def test_keyword_has_no_total(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        result = svc.run_search(fresh_db, SearchQuery(q="蓝发", limit=50))
+        assert result["total"] is None and result["total_kind"] is None
+
+
+class TestTagPlanSelection:
+    """标签集规模决定查询计划（驱动集 vs 时间索引），两种都要给出正确结果。"""
+
+    def test_small_tag_set_drives_the_query(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        engine = SqliteFtsSearch(fresh_db)
+        driver, suffix, driver_params, suffix_params = engine._tag_driver([1, 2], limit=50)
+        assert driver is not None, "稀疏组合应当物化最小集合当驱动集"
+        assert len(driver_params) == 1
+        assert len(suffix_params) == len(suffix)
+
+    def test_dense_tag_uses_the_time_index(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
+        """常见标签：沿时间索引扫几十行就凑满一页，不该花几万次回表。"""
+        fresh_db.execute("UPDATE tag SET usage_count = 100000 WHERE tag_id = 1")
+        engine = SqliteFtsSearch(fresh_db)
+        driver, suffix, driver_params, _suffix_params = engine._tag_driver([1], limit=50)
+        assert driver is None and driver_params == [], "高密度应当让时间索引驱动"
+        assert suffix
+
+    def test_results_are_the_same_either_way(
+        self, fresh_db: Any, corpus: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """两种计划必须给出同一批结果——计划只该影响速度，不该影响命中。"""
+        from pc.adapters import fts_search
+
+        default = _ids(svc.run_search(fresh_db, SearchQuery(limit=50, tags=("rain",))))
+        monkeypatch.setattr(fts_search, "TAG_SCAN_LIMIT", 0)  # 强制走驱动集
+        driven = _ids(svc.run_search(fresh_db, SearchQuery(limit=50, tags=("rain",))))
+        assert default == driven
+
     def test_keyword_with_filters(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
         """首选交互路径：关键词 + 来源 + 时间范围。"""
         result = svc.run_search(
@@ -284,6 +392,30 @@ class TestFilterPath:
             SearchQuery(q="蓝发", limit=50, source="alpha", since="2026-01-05"),
         )
         assert _ids(result) == [corpus["ids"]["rain"]]
+
+    def test_keyword_with_time_sort_keeps_the_keyword(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        """`--sort time` 只改排法，不能把关键词丢掉。
+
+        早先的实现是"只有相关度排序才算关键词查询"，于是 `pc search 雨 --sort time` 退化成
+        纯过滤列表，返回一堆不相干的内容且不报错——这条回归测试盯住它。
+        """
+        result = svc.run_search(fresh_db, SearchQuery(q="蓝发", limit=50, sort="time"))
+        assert result["sort"] == "time"
+        assert set(_ids(result)) == {corpus["ids"]["rain"], corpus["ids"]["rain2"]}
+        assert corpus["ids"]["snow"] not in _ids(result), "不含关键词的内容不该出现"
+
+    def test_keyword_with_time_sort_pages_by_cursor(
+        self, fresh_db: Any, corpus: dict[str, Any]
+    ) -> None:
+        first = svc.run_search(fresh_db, SearchQuery(q="蓝发", limit=1, sort="time"))
+        assert first["has_more"] is True and first["next_cursor"]
+        second = svc.run_search(
+            fresh_db, SearchQuery(q="蓝发", limit=1, sort="time", cursor=first["next_cursor"])
+        )
+        assert not (set(_ids(first)) & set(_ids(second)))
+        assert _ids(first) == [corpus["ids"]["rain2"]], "按时间倒序：最新的是 rain2"
 
 
 class TestKeywordPath:

@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**653 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」与「按关键词把它搜出来」这两条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；**检索链路真实可用**（应用层分词写入 `text_search` → FTS5 双索引候选 → 候选内过滤与 canonical 折叠 → 三条 SQL 组装 → `pc search` 输出命中理由；预算与达成机制见 DESIGN §5.6）；测试套件覆盖以上全部，**698 条 + 2 条环境跳过、25 秒上下、不依赖任何外部服务**；**但打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -22,16 +22,16 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 操作 | 命令 | 说明 |
 | --- | --- | --- |
 | 安装依赖 | `uv sync` | 会一并装上 dev 组（pytest / ruff / httpx）；只要运行时用 `uv sync --no-dev`。生成 `uv.lock`，必须提交 |
-| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`）。体检含只读「数据库」段（**不可达不影响退出码**）与「运行时目录」段（逐项打印落点与**来源**，并报告 `config/app.yaml` 的缺口） |
+| 环境体检 | `uv run python -m pc doctor` | 等价 `uv run pc doctor`；装依赖前的替代写法是 `PYTHONPATH=src python -m pc doctor`（不带 `uv run` 会报 `No module named pc`）。体检含只读「数据库」段、只读「检索」段（两个 FTS5 索引各多少行、有多少条内容还没分词）与「运行时目录」段（逐项打印落点与**来源**，并报告 `config/app.yaml` 的缺口）；**任何一段不可达都不影响退出码** |
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **653 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **698 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 25~30 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
 | 重建检索索引 | `uv run pc db reindex [--recompute-derived] [--batch-size N]` | 重建两个 FTS5 索引（索引是派生数据，随时可重建）。正常路径由 6 个触发器维持同步，这条是兜底与排错手段。**`--recompute-derived` 先重算两列派生数据**（`text_search`、`search_extra`）再重建：升级后、改过分词规则后、打标之后都该跑一次——派生列过期时索引再新也搜不到。分批提交、幂等（值相同不写） |
-| 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑九类检索场景并报 P50/P95/P99（口径见 DESIGN §5.6）；`--assert` 时超预算即退出码 1。**这是性能红线的执行入口**：任何改动检索路径的提交都要跑它。`--keep` 保留合成库以便排查 |
+| 检索性能基准 | `uv run python tools/bench_search.py --scale 100000 --assert` | 在合成库上跑 DESIGN §5.6 验收清单的九项（场景 1~6 + 冷启动首查 + 后台写入 + 4 并发读者）并报 P50/P95/P99；`--assert` 时超预算即退出码 1。**它驱动的是真实检索实现**（`services.search.run_search`），派生列也由生产的分词函数算出——基准走旁路就会出现"基准达标而线上很慢"。`--keep` 保留合成库以便排查 |
 | 看设置项生效值 | `uv run pc config show [--explain] [--key K] [--json]` | 逐项打印生效值 + **来源**（env / db / yaml / default），回答「这个值为什么是 8」。数据库不可达不影响退出码，只降级成文件与环境层并打印一行说明 |
 | 首次播种设置项 | `uv run pc config seed` | 只插入缺失的键，**绝不覆盖已有值**；重复运行安全。播种不写 `setting_change`（那不是谁做的改动） |
 | 登记来源 | `uv run pc source add NAME [--kind export\|manual] [--roots DIR] [--authorize MODE] [--evidence TEXT]` | 一个事务里同时写 `source` 与 `source_authorization`（**三者齐备才可采集**，DESIGN §1.3）；`--roots` 会写进 `source.config`。**`--authorize` 可留空**：按 kind 取默认（`manual`→`root_self`，其余→`manual_export`）。`--kind manual` 的 `--roots` 也可以不写——`pc upload` 自己会补 |
@@ -39,7 +39,8 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 导入本地文件 | `uv run pc import PATH... --source NAME [--process] [--dry-run] [--limit N]` | 只做 L2（落 `message` + 入队）；`--process` 接着跑 worker。**路径（含单个文件）会持久化进 `source.config`**——worker 在另一个时刻取字节，只读那里 |
 | 手工上传 | `uv run pc upload PATH... [--note TEXT] [--source NAME] [--no-process] [--dry-run]` | root 自己丢文件进来的正式入口：**身份按内容哈希**（重传同一份内容不会变成两条）、`sent_at` 留空、`--note` 记来源线索。默认用（必要时新建）`kind=manual` 的「manual」来源，**不需要任何凭证**；**默认接着处理**（媒体引用是文件路径，原文件被删就只能死信） |
 | 跑处理管线 | `uv run pc work [--once] [--max N] [--loop] [--interval S]` | 抢占任务 → 取字节 → 扫描 → 哈希去重 → 落 media/content_item/content_media；确定性失败进死信，偶发失败退避重试 |
-| 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；带「备注」列（来源备注，没有则 `-`）；未建库时只提示不报错。**表格按显示宽度对齐**（中文/全角算 2 格，组合记号与零宽符算 0 格），每列有上限、超出用 `…` 截断——上限就是 `cli.ITEM_LIST_MAX_WIDTHS` / `SOURCE_LIST_MAX_WIDTHS`，**加一列必须同时加上限**（`tests/test_cli_table.py` 有断言盯着）；上限只作用于表格，`--json` 永远是完整值 |
+| 看内容 | `uv run pc item list [--limit N] [--source NAME] [--status S] [--json]` | 这是「内容真的进库了」最直接的证据；带「备注」列（来源备注，没有则 `-`）；未建库时只提示不报错。**表格按显示宽度对齐**（中文/全角算 2 格，组合记号与零宽符算 0 格），每列有上限、超出用 `…` 截断——上限就是 `cli.ITEM_LIST_MAX_WIDTHS` / `SOURCE_LIST_MAX_WIDTHS` / `SEARCH_MAX_WIDTHS`，**加一列必须同时加上限**（`tests/test_cli_table.py` 有断言盯着）；上限只作用于表格，`--json` 永远是完整值 |
+| 检索 | `uv run pc search [关键词...] [--source N] [--tag N] [--type T] [--status S] [--since D] [--until D] [--nsfw-level 0..4] [--include-duplicates] [--sort relevance\|time] [--limit N] [--page N] [--cursor C] [--timings] [--json]` | 多个关键词是 AND；**1~2 字中文走词级索引、≥3 字走 trigram**（前者少于 3 字命中 0 且不报错）。默认只看 `active` 且 `nsfw_level <= 0`、折叠重复项——放宽要显式给参数。关键词检索**不给精确总数**（只给候选数，§5.6 M1b），纯过滤列表给。时间序翻页用 `--cursor`（取自 `--json` 的 `next_cursor`），相关度用 `--page`。每条结果都带"为什么命中"（命中词、命中列、带 `[]` 的片段）。0 结果且存在未分词的老行时会提示跑 `--recompute-derived` |
 
 Windows PowerShell 下如需在未装依赖时运行 CLI：`$env:PYTHONPATH="src"; python -m pc doctor`；装好依赖后一律用 `uv run`，不必设 `PYTHONPATH`。
 
@@ -70,7 +71,7 @@ post-collector/
     ├── domain.py                 状态枚举、跨层数据结构、跨层错误与文本规范化（零第三方依赖）
     ├── ports/                    13 个端口接口（Protocol），业务代码只依赖这一层
     ├── config.py                 设置层与 L2 配置段：注册表校验、四层解析、变更闸门、快照、限额与安全策略
-    ├── cli.py                    doctor / config / db / source / import / upload / work / item 全部已接线
+    ├── cli.py                    doctor / config / db / source / import / upload / work / item / search 全部已接线
     ├── adapters/
     │   ├── sqlite.py             库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写、派生检索列重算
     │   ├── fts_search.py         FTS5 检索适配器：双索引候选、候选内求交、键集分页、可解释性、各段耗时
@@ -89,8 +90,8 @@ post-collector/
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
 | `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5 重建与派生列重算、setting 读写）、FTS5 检索（双索引候选、候选内求交、键集分页）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
 | `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账）、检索（可见性政策、来源与标签解析、页大小与预算闸门、可解释性） | 可用（单元与端到端测试覆盖） |
-| `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + 检索（分词、派生列重算、过滤/分页/可解释性/语句计数）+ schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 653 条 + 2 条跳过（Windows 无符号链接权限），25 秒上下全绿 |
+| `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list`、`search` | 可用 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端（导入、上传、检索各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + 检索（分词、派生列重算、过滤/分页/可解释性/语句计数、基准脚本自身）+ schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 698 条 + 2 条跳过（Windows 无符号链接权限），25 秒上下全绿 |
 
 ## 边界约束
 
@@ -112,6 +113,17 @@ post-collector/
 - **同一端口可以有多套身份策略**：`kind='export'` 按相对路径定身份（`platform_msg_id = 根标签/相对路径`，时间取 mtime），`kind='manual'` 按内容定身份（`upload:<媒体 sha256>[:<文本 sha256>]`，`sent_at` 留空）。两者共用同一个连接器实现，靠构造参数区分——**不要**为"又一种上传入口"写第二个类，那会把取字节/扫描/限流的逻辑复制一遍。
 - **适配器不自己开数据库连接**：连接器由 `pc.adapters.registry.connector_for()` 构造，来源行与它的授权行由服务层读好后注入，`authorize()` 只对注入的记录做判断。凭证解密将来也只加在 `registry.py` 这一处（DESIGN §6.1）。
 - **扫描是 fail closed 的**：`MagicNumberScanner` 对未知类型、压缩包、可执行文件、PDF、脚本一律 `passed=False`，把 SVG 与"扩展名与魔数不符"标成 `gray=True`；`passed=False` 的含义是"不许直接落盘"，调用方应当隔离并开复核任务，**不是丢弃**。
+
+**检索（DESIGN §5）**
+
+- **两个索引分工明确，按查询词切换**：CJK ≥3 字走 `content_fts`（trigram，子串与容错），CJK 1~2 字与拉丁词走 `content_word`（应用层分词结果 + 拉丁前缀匹配）。**混长度的查询用一侧取候选、另一侧当过滤器**（一条 SQL），不要"选一个索引了事"——那会静默漏掉一半词。判据与词元都由 `pc.domain` 的同一套函数给出（`normalize_text`/`tokenize_document`/`tokenize_query`）。
+- **用户输入永不透传成检索语法**：每个词用 FTS5 短语引号包起来、词之间 AND（拉丁词加 `*` 做前缀）；内含引号翻倍；**没有可搜词元的词**（纯标点/emoji）直接丢掉，而不是交给 `MATCH` 当空短语（那会报语法错）。这样 `NEAR`/`*`/`^` 都只是普通字符。
+- **默认可见性只能用参数放宽**：`deleted_at IS NULL` + `status='active'` + `nsfw_level <= 0` + 折叠重复项（canonical）。折叠带**守卫**：代表项自己被软删或不再 active 时，这一行仍要出现（否则删一行会让整组内容消失）。
+- **不返回精确总数**（§5.6 M1b）：关键词检索只给候选数（`total=None`）；带标签的查询用 `tag.usage_count` 估（`total_kind="estimate"`，**打标切片必须维护这个计数器**，为 0 时退回真实计数）；其余条件数到 `COUNT_CAP=5000` 就停（`at_least`）。`has_more` 说的是"这一页之外还有没有"，与总数口径无关。
+- **组装固定三条 SQL，不允许 N+1**：主查询 + tag 批量 + 媒体批量；可解释性（命中词、命中列、片段高亮）从**已取回的列**算，不许为了 `snippet()` 逐行再查一次 FTS。`tests/test_search_service.py` 用语句计数盯着（关键词一页 5 条、纯过滤一页 4 条）。
+- **结果集的规模决定查询计划，不是拍脑袋的常数**：标签过滤在"时间索引 + EXISTS"与"物化最小标签集当驱动表（`CROSS JOIN` 强制顺序）"之间按**估算扫描行数**切换（`TAG_SCAN_LIMIT`）。两张表上都实测过，选错差一个数量级（§3.7 记了修改前后的数字）。**参数顺序必须与 SQL 文本一致**——驱动子查询在 FROM 里、EXISTS 在 WHERE 末尾，拼错了不报错、只是静默查不到东西（有回归测试）。
+- **分页有两条路**：时间序用键集游标（`next_cursor`，不透明串，第 20 页与第 1 页同价），相关度用候选集内 `--page`（候选耗尽仍未凑满一页时标 `incomplete`，如实说"结果可能不完整"）。页大小上限 50 与预算绑定，不由设置项放开。
+- **引擎可替换**：过滤器是结构化字典，查询构造全在 `adapters/fts_search.py` 里，业务层不认识任何 FTS5 语法（换 Meilisearch 时只改这一个文件）。**基准脚本驱动真实实现**，不许在工具里复制一份 SQL——否则会出现"基准达标而线上很慢"。
 
 **迁移与数据**
 
@@ -162,7 +174,7 @@ post-collector/
 **性能预算（回归红线）**
 
 - 检索路径有明确的性能承诺：**10 万条规模下，任意关键词与过滤器组合的检索 P50 < 150 ms、P99 < 500 ms**（50 条/页、热缓存、单用户或 ≤4 并发读者；缩略图字节与 AI 解析不计入；口径与机制见 DESIGN §5.6）。
-- **任何改动检索路径的提交都必须跑基准脚本**（`uv run python tools/bench_search.py --scale 100000 --assert`，见「开发命令」表），确认 P50 / P99 没有越过预算；越过就必须在同一个提交里修回或给出书面解释。首次 10 万条实测见 DESIGN §3.7（最慢场景 P99 16.8 ms，余量约 30 倍）。
+- **任何改动检索路径的提交都必须跑基准脚本**（`uv run python tools/bench_search.py --scale 100000 --assert`，见「开发命令」表），确认 P50 / P99 没有越过预算；越过就必须在同一个提交里修回或给出书面解释。实测见 DESIGN §3.7：接了真实检索实现之后，最慢场景 P99 240 ms（关键词 + 标签 + 时间）对 500 ms 预算，**余量约 2 倍**——余量比裸 SQL 时代小得多，动检索路径之前先看那张表；第一次复测有三处超预算，都是真问题（截断计数、标签查询计划、深分页量错），记录在同一节。
 - 三个最容易击穿预算的实现错误，评审时优先看：**组装结果出现 N+1**、**缩略图在查询时同步生成或内联 base64**、**数据库调用写在 `async def` 端点里**。
 - 分页上限 50 与预算绑定：`search.default_page_size` 的 `range` 不得放宽到 50 以上，除非同步重写 §5.6 的预算与口径。
 
@@ -219,4 +231,4 @@ post-collector/
 - 设置项字段规范：`config/settings-registry.yaml` 文件头（`label`/`help`/`impact`/`dangerous`/`cost`/`restart_required`/`recompute`/`requires` 各自的用途）。
 - 当前部署形态：`docker-compose.yml` 末尾注释列出待加入的 `worker` / `sync` / `retention` 服务与对应卷。
 
-**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：**检索（FTS5 查询层与分词）**、tag 与打标、链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面、**缩略图与感知哈希**、worker 的常驻服务化（`pc work --loop` 有了，缺的是 systemd / 计划任务那种托管）、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、连接器/存储/扫描器、服务层与 CLI 端到端、设置层、schema 红线与出网守卫；**没有检索与打标的测试**（因为那两块还没有实现）。
+**当前不包含**（不要按「补个小功能」处理，它们各自需要先落一个模块）：tag 与打标（**所以检索结果里的标签只反映库里已有的，`tag.usage_count` 也还没有维护方**）、链接自动抓取、AI 外发、向量检索、多租户、Meilisearch / MinIO、Web 界面（检索服务与适配器已就绪，缺的是一条 HTTP 路由与页面）、**缩略图与感知哈希**（所以结果里 `thumb_key` 恒为空，缩略图规则 M3 未落）、**检索的服务端化**（M4 启动预热、M5 事件循环纪律、M6 的慢查询落库都随 `pc serve` 一起做；CLI 是一次性进程，本切片只做了 M6 的 CLI 版：`--timings` + 超 200 ms 提示）、worker 的常驻服务化（`pc work --loop` 有了，缺的是 systemd / 计划任务那种托管）、**备份的定时调度**（手动入口 `pc db backup` 已经有了，缺的是每日任务）、**匿名提报入口与第二个连接器（DESIGN v3.1 已明确后置到阶段 2）**。测试套件已覆盖数据库适配层、SQLite 行为契约、迁移器、配置段与路径解析、连接器/存储/扫描器、服务层与 CLI 端到端、检索（分词、派生列重算、过滤/分页/可解释性/语句计数、CLI 端到端、基准脚本自身）、设置层、schema 红线与出网守卫；**打标还没有测试**（那一块还没有实现）。

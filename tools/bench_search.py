@@ -1,11 +1,14 @@
-"""检索性能基准：DESIGN §5.6 的预算与九类场景。
+"""检索性能基准：DESIGN §5.6 的预算与验收场景。
 
 它回答一个具体问题：**在 10 万条内容上，「数据层收到已结构化的查询 → 返回前 50 条
 组装好的结果」要多久**。预算口径见 DESIGN §5.6：P50 < 150 ms、P99 < 500 ms
 （热缓存、单用户或 ≤4 并发读者；缩略图字节与 AI 解析不计入）。
 
-刻意说明边界：本脚本跑的是**裸 SQL**——业务检索层还没实现，所以它验证的是
-**schema、索引与查询构造策略**，不是端到端检索路径。结论不要说过了头。
+**它驱动的是真实检索路径**：场景调用 ``pc.services.search.run_search`` /
+``pc.adapters.fts_search.SqliteFtsSearch``，不再是脚本自己写的一份 SQL 副本。这一点很
+重要——基准若走旁路，就可能"基准达标而线上很慢"，而 §5.6 的预算正是要约束线上那条路。
+合成数据的派生列也由生产的同一套函数算出（``pc.domain.search_tokens`` /
+``search_extra_value``），所以词级索引里躺的就是真实分词结果。
 
 用法::
 
@@ -13,9 +16,16 @@
     uv run python tools/bench_search.py --scale 100000 --assert   # 超预算则退出码 1
     uv run python tools/bench_search.py --scale 20000 --keep      # 保留合成库以便排查
 
+与 DESIGN §5.6 验收清单的对应关系（清单共九项）：
+
+* 场景（第 1~6 项）：纯过滤列表、1 字宽命中、2 字混排、2 字短词、关键词+标签+时间、
+  三标签交集、深分页、受限内容过滤（两项各测一次）
+* 冷启动首查（第 7 项，单独记录，作为 M4 是否值得做的判据）
+* 后台写入同时读（第 8 项）与 4 个并发读者（第 9 项）
+
 合成数据的性质（决定了结论的适用范围）：
   * 标签按 Zipf 分布，所以会出现「覆盖 20% 内容的通用标签」这种真实的长尾形态；
-  * 文本是中日文混排的伪随机词，`text_search` 是分词结果，`search_extra` 是标签与来源名的拼接；
+  * 文本是中日文混排的伪随机词，`text_search` 与 `search_extra` 由生产函数算出；
   * 媒体与内容项通过 `content_media` 多对多关联（与 §3.8 的引用计数口径一致）。
 """
 
@@ -36,6 +46,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pc.adapters import sqlite as db
+from pc.domain import search_extra_value, search_tokens
+from pc.services.search import SearchQuery, run_search
 
 #: 伪随机词表：中文词、日文片假名、拉丁词混排
 CJK_WORDS = (
@@ -70,8 +82,8 @@ def _zipf_weights(count: int, exponent: float = 1.07) -> list[float]:
     return [value / total for value in raw]
 
 
-def _make_text(rng: random.Random, words: int) -> tuple[str, str]:
-    """返回 ``(正文, 分词结果)``；分词结果用空格连接，模拟应用层分词。"""
+def _make_text(rng: random.Random, words: int) -> str:
+    """生成一段中日文混排的伪随机文本（正文）。派生列由生产函数从它算出来。"""
     picked: list[str] = []
     for _ in range(words):
         roll = rng.random()
@@ -81,8 +93,7 @@ def _make_text(rng: random.Random, words: int) -> tuple[str, str]:
             picked.append(rng.choice(KANA_WORDS.split()))
         else:
             picked.append(rng.choice(LATIN_WORDS.split()))
-    text = "".join(picked) if rng.random() < 0.5 else " ".join(picked)
-    return text, " ".join(picked)
+    return "".join(picked) if rng.random() < 0.5 else " ".join(picked)
 
 
 def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, Any]:
@@ -110,13 +121,16 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
     weights = _zipf_weights(len(tag_ids))
     rng = random.Random(20260929)
     inserted_tags = 0
+    tag_usage: dict[int, int] = {}
 
     for start in range(0, scale, batch):
         stop = min(start + batch, scale)
         conn.execute("BEGIN IMMEDIATE")
         for content_id in range(start + 1, stop + 1):
             message_id = content_id
-            text, tokens = _make_text(rng, rng.randint(6, 18))
+            text = _make_text(rng, rng.randint(6, 18))
+            ocr_text = text if rng.random() < 0.3 else None
+            caption = f"caption {rng.choice(LATIN_WORDS.split())}" if rng.random() < 0.3 else None
             # 每 20 条造一个"热门标签"覆盖：让同一个标签下的内容量出现长尾
             hot = (content_id % 5) == 0
             picks = [tag_ids[0] if hot else None]
@@ -130,7 +144,12 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
                         chosen = tag_id
                         break
                 picks.append(chosen)
-            extra = " ".join(TAG_NAMES[tag_id - 1] for tag_id in picks if tag_id)
+            source_name = SOURCE_NAMES[rng.randint(0, len(SOURCE_NAMES) - 1)]
+            # 派生列按生产的同一套规则算：分词结果 + 检索补充字段（标签名 + 来源名）
+            extra = search_extra_value(
+                " ".join(TAG_NAMES[tag_id - 1] for tag_id in picks if tag_id), source_name
+            )
+            tokens = search_tokens(text, ocr_text, caption, extra)
             conn.execute(
                 "INSERT INTO message (message_id, uuid, source_id, platform_msg_id) "
                 "VALUES (?, ?, ?, ?)",
@@ -146,10 +165,10 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
                     f"ci-{content_id}",
                     message_id,
                     text,
-                    text if rng.random() < 0.3 else None,
-                    f"caption {rng.choice(LATIN_WORDS.split())}" if rng.random() < 0.3 else None,
+                    ocr_text,
+                    caption,
                     tokens,
-                    f"{extra} {SOURCE_NAMES[rng.randint(0, len(SOURCE_NAMES) - 1)]}",
+                    extra,
                     2 if content_id % 97 == 0 else 0,
                 ),
             )
@@ -177,9 +196,19 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
                     (content_id, tag_id),
                 )
                 inserted_tags += 1
+                tag_usage[tag_id] = tag_usage.get(tag_id, 0) + 1
         conn.execute("COMMIT")
 
+    # usage_count 是"标签维度的总数"的来源（§5.6 M1b 的查询路径要用它）。
+    # 生产里由打标切片维护；合成数据必须自己维护，否则那条路径永远拿不到值。
+    for tag_id, count in tag_usage.items():
+        conn.execute("UPDATE tag SET usage_count = ? WHERE tag_id = ?", (count, tag_id))
+
     finished = time.perf_counter()
+    # 造完数据先把 WAL 合并回主库：不这么做，首轮读取要跨着一个几百 MB 的 WAL 找页，
+    # 量出来的就不是"热缓存的查询耗时"而是"刚写完十万行的 WAL 有多厚"。
+    # 预算的口径是热缓存（§5.6），这里把库收拾成稳定状态再开测。
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     size = path.stat().st_size
     counts = {
         "content_item": conn.execute("SELECT count(*) FROM content_item").fetchone()[0],
@@ -197,181 +226,79 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# 查询构造（M1 / M2：候选集 + 三条 SQL 组装，不出现 N+1）
+# 验收场景（全部走真实检索实现，DESIGN §5.6 清单第 1~6 项）
 # ---------------------------------------------------------------------------
 
 
-def _assemble(conn: sqlite3.Connection, ids: list[int]) -> list[dict[str, Any]]:
-    """把前 N 个 content_id 组装成结果项：**固定 3 条 SQL**（主查询 + tag + 媒体）。"""
-    if not ids:
-        return []
-    marks = ",".join("?" * len(ids))
-    rows = {
-        row["content_id"]: row
-        for row in conn.execute(
-            "SELECT c.content_id, c.item_type, c.text_content, c.first_seen_at, c.nsfw_level, "
-            "       s.name AS source_name "
-            "FROM content_item c JOIN message m ON m.message_id = c.message_id "
-            "JOIN source s ON s.source_id = m.source_id "
-            f"WHERE c.content_id IN ({marks})",
-            ids,
-        ).fetchall()
-    }
-    tags: dict[int, list[str]] = {}
-    for row in conn.execute(
-        "SELECT ta.content_id, t.name FROM tag_assignment ta JOIN tag t ON t.tag_id = ta.tag_id "
-        f"WHERE ta.content_id IN ({marks}) AND ta.revoked_at IS NULL",
-        ids,
-    ).fetchall():
-        tags.setdefault(row["content_id"], []).append(row["name"])
-    media: dict[int, dict[str, Any]] = {}
-    for row in conn.execute(
-        "SELECT cm.content_id, m.thumb_key, m.width, m.height FROM content_media cm "
-        "JOIN media m ON m.media_id = cm.media_id "
-        f"WHERE cm.content_id IN ({marks}) ORDER BY cm.ordinal",
-        ids,
-    ).fetchall():
-        media.setdefault(row["content_id"], {"thumb_key": row["thumb_key"], "w": row["width"]})
-    return [
-        {
-            "content_id": cid,
-            "text": (rows[cid]["text_content"] or "")[:120],
-            "tags": tags.get(cid, []),
-            "thumb": media.get(cid, {}).get("thumb_key"),
-            "source": rows[cid]["source_name"],
-        }
-        for cid in ids
-        if cid in rows
-    ]
-
-
-def _keyword_candidates(conn: sqlite3.Connection, term: str, limit: int = 500) -> list[int]:
-    """M1：先取 bm25 前 N 条作为候选，再在候选集内做过滤。"""
-    if len(term) < 3:
-        sql = (
-            "SELECT rowid FROM content_word WHERE content_word MATCH ? "
-            "ORDER BY bm25(content_word) LIMIT ?"
-        )
-        rows = conn.execute(sql, (term, limit)).fetchall()
-    else:
-        sql = (
-            "SELECT rowid FROM content_fts WHERE content_fts MATCH ? "
-            "ORDER BY bm25(content_fts) LIMIT ?"
-        )
-        rows = conn.execute(sql, (term, limit)).fetchall()
-    return [int(row[0]) for row in rows]
-
-
-def _tag_ids(conn: sqlite3.Connection, names: list[str]) -> list[int]:
-    marks = ",".join("?" * len(names))
-    return [
-        int(row[0])
-        for row in conn.execute(
-            f"SELECT tag_id FROM tag WHERE name IN ({marks})", names
-        ).fetchall()
-    ]
-
-
-# ---------------------------------------------------------------------------
-# 九类场景
-# ---------------------------------------------------------------------------
-
-
-def _query_keyword_broad(conn: sqlite3.Connection) -> int:
-    ids = _keyword_candidates(conn, "雨", PAGE_SIZE)
-    return len(_assemble(conn, ids))
-
-
-def _query_cjk_mixed(conn: sqlite3.Connection) -> int:
-    ids = _keyword_candidates(conn, "蓝发", PAGE_SIZE)
-    return len(_assemble(conn, ids))
-
-
-def _query_short_term(conn: sqlite3.Connection) -> int:
-    # 2 字词：trigram 用不上，必须走词级索引（§5.1 的退化点）
-    ids = _keyword_candidates(conn, "精灵", PAGE_SIZE)
-    return len(_assemble(conn, ids))
-
-
-def _query_keyword_tag_time(conn: sqlite3.Connection) -> int:
-    candidate = _keyword_candidates(conn, "雨", 500)
-    if not candidate:
-        return 0
-    marks = ",".join("?" * len(candidate))
-    tag_ids = _tag_ids(conn, ["blue_hair", "rain"])
-    tag_marks = ",".join("?" * len(tag_ids))
-    rows = conn.execute(
-        "SELECT c.content_id FROM content_item c "
-        f"WHERE c.content_id IN ({marks}) AND c.first_seen_at >= ? "
-        f"  AND EXISTS (SELECT 1 FROM tag_assignment ta WHERE ta.content_id = c.content_id "
-        f"              AND ta.tag_id IN ({tag_marks}) AND ta.revoked_at IS NULL) "
-        "ORDER BY c.first_seen_at DESC LIMIT ?",
-        [*candidate, "2026-01-01T00:00:00.000Z", *tag_ids, PAGE_SIZE],
-    ).fetchall()
-    return len(_assemble(conn, [int(row[0]) for row in rows]))
-
-
-def _query_three_tag_intersection(conn: sqlite3.Connection) -> int:
-    """多标签交集：按集合大小升序求交，而不是 GROUP BY … HAVING（§5.6 M1）。"""
-    tag_ids = _tag_ids(conn, ["rain", "night", "sky"])
-    sets: list[set[int]] = []
-    for tag_id in tag_ids:
-        rows = conn.execute(
-            "SELECT content_id FROM tag_assignment WHERE tag_id = ? AND revoked_at IS NULL",
-            (tag_id,),
-        ).fetchall()
-        sets.append({int(row[0]) for row in rows})
-    if not sets:
-        return 0
-    sets.sort(key=len)
-    result = sets[0]
-    for other in sets[1:]:
-        result &= other
-        if not result:
-            break
-    ids = sorted(result)[:PAGE_SIZE]
-    return len(_assemble(conn, ids))
-
-
-def _query_deep_paging(conn: sqlite3.Connection) -> int:
-    """深分页：keyset 分页而不是 OFFSET（§5.6 M1）。"""
-    cursor: str | None = None
-    for _ in range(20):
-        if cursor is None:
-            rows = conn.execute(
-                "SELECT content_id, first_seen_at FROM content_item "
-                "WHERE deleted_at IS NULL ORDER BY first_seen_at DESC, content_id DESC LIMIT ?",
-                (PAGE_SIZE,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT content_id, first_seen_at FROM content_item "
-                "WHERE deleted_at IS NULL AND (first_seen_at, content_id) < (?, ?) "
-                "ORDER BY first_seen_at DESC, content_id DESC LIMIT ?",
-                (cursor, 0, PAGE_SIZE),
-            ).fetchall()
-        if not rows:
-            return 0
-        cursor = str(rows[-1][1])
-    return len(_assemble(conn, [int(row[0]) for row in rows]))
-
-
-def _query_nsfw_filter(conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        "SELECT content_id FROM content_item WHERE nsfw_level <= 1 AND deleted_at IS NULL "
-        "ORDER BY first_seen_at DESC LIMIT ?",
-        (PAGE_SIZE,),
-    ).fetchall()
-    return len(_assemble(conn, [int(row[0]) for row in rows]))
+def _hits(conn: sqlite3.Connection, query: SearchQuery) -> int:
+    """跑一次真实检索，返回这一页取回多少条。"""
+    return len(run_search(conn, query)["hits"])
 
 
 def _query_plain_list(conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        "SELECT content_id FROM content_item WHERE deleted_at IS NULL "
-        "ORDER BY first_seen_at DESC, content_id DESC LIMIT ?",
-        (PAGE_SIZE,),
-    ).fetchall()
-    return len(_assemble(conn, [int(row[0]) for row in rows]))
+    """纯过滤列表：B 树索引 + 键集分页（M1 的第一条路径）。"""
+    return _hits(conn, SearchQuery(limit=PAGE_SIZE))
+
+
+def _query_keyword_broad(conn: sqlite3.Connection) -> int:
+    """1 字宽命中：trigram 命中 0，必须走词级索引。"""
+    return _hits(conn, SearchQuery(q="雨", limit=PAGE_SIZE))
+
+
+def _query_cjk_mixed(conn: sqlite3.Connection) -> int:
+    """2 字中文：中文最常见的查询形态。"""
+    return _hits(conn, SearchQuery(q="蓝发", limit=PAGE_SIZE))
+
+
+def _query_short_term(conn: sqlite3.Connection) -> int:
+    """另一个 2 字词，且它在词表里是完整词（对照上一条）。"""
+    return _hits(conn, SearchQuery(q="精灵", limit=PAGE_SIZE))
+
+
+def _query_keyword_tag_time(conn: sqlite3.Connection) -> int:
+    """首选交互路径：关键词 + 标签 + 时间范围（在候选集内过滤）。"""
+    return _hits(
+        conn,
+        SearchQuery(
+            q="雨",
+            tags=("blue_hair", "rain"),
+            since="2026-01-01T00:00:00.000Z",
+            limit=PAGE_SIZE,
+        ),
+    )
+
+
+def _query_three_tag_intersection(conn: sqlite3.Connection) -> int:
+    """三标签交集：按集合大小升序取最小的那个当候选集，其余用 EXISTS 过滤。"""
+    return _hits(conn, SearchQuery(tags=("rain", "night", "sky"), limit=PAGE_SIZE))
+
+
+def _query_deep_paging(conn: sqlite3.Connection) -> int:
+    """深分页：第 20 页的取数耗时（§5.6 M1 的键集分页，不是 OFFSET）。
+
+    走到第 20 页的游标只算一次（第一次调用时算好并缓存）：预算约束的是"取第 20 页"
+    这件事本身，而不是"从第一页翻到第二十页"——键集分页的关键性质正是**第 20 页与
+    第 1 页同价**，把 20 次取数都算进一次采样反而看不清这条性质。
+    """
+    global _PAGE_20_CURSOR
+    if _PAGE_20_CURSOR is None:
+        cursor: str | None = None
+        for _ in range(19):
+            cursor = run_search(conn, SearchQuery(limit=PAGE_SIZE, cursor=cursor))["next_cursor"]
+            if cursor is None:
+                break
+        _PAGE_20_CURSOR = cursor or ""
+    cursor = _PAGE_20_CURSOR or None
+    return len(run_search(conn, SearchQuery(limit=PAGE_SIZE, cursor=cursor))["hits"])
+
+
+#: 第 20 页的键集游标（首次调用时算好，见 :func:`_query_deep_paging`）
+_PAGE_20_CURSOR: str | None = None
+
+
+def _query_nsfw_filter(conn: sqlite3.Connection) -> int:
+    """受限内容过滤：允许到 questionable（默认只允许 safe 那一档）。"""
+    return _hits(conn, SearchQuery(nsfw_max_level=1, limit=PAGE_SIZE))
 
 
 SCENARIOS: tuple[tuple[str, Callable[[sqlite3.Connection], int]], ...] = (
@@ -381,7 +308,7 @@ SCENARIOS: tuple[tuple[str, Callable[[sqlite3.Connection], int]], ...] = (
     ("短词（2 字，trigram 用不上）", _query_short_term),
     ("关键词 + 标签 + 时间", _query_keyword_tag_time),
     ("三标签交集", _query_three_tag_intersection),
-    ("深分页（第 20 页，keyset）", _query_deep_paging),
+    ("深分页（连续 20 页，keyset）", _query_deep_paging),
     ("受限内容过滤（nsfw_level）", _query_nsfw_filter),
 )
 
@@ -415,6 +342,24 @@ def measure(
         "max": max(samples),
         "rows": rows,
     }
+
+
+def _breakdown(conn: sqlite3.Connection, name: str) -> str:
+    """跑一次某个场景，把 ``run_search`` 报的各段耗时拼成一行（M6 的耗时分解）。"""
+    queries = {
+        "纯关键词宽命中（1 字，走词级索引）": SearchQuery(q="雨", limit=PAGE_SIZE),
+        "中日文混排查询（2 字）": SearchQuery(q="蓝发", limit=PAGE_SIZE),
+    }
+    query = queries.get(name)
+    if query is None:
+        return "（无）"
+    result = run_search(conn, query)
+    timings = result["timings"]
+    return "  ".join(
+        f"{stage}={timings[stage]:.1f}ms"
+        for stage in ("candidates", "filter", "main", "tags", "media", "total")
+        if stage in timings
+    )
 
 
 def measure_cold(path: Path, func: Callable[[sqlite3.Connection], int]) -> float:
@@ -560,9 +505,11 @@ def main(argv: list[str] | None = None) -> int:
     conn = db.connect(path, expect_exists=True)
     failures: list[str] = []
     try:
-        print(f"\n[2/4] 九类场景（每类 {args.runs} 次采样，{PAGE_SIZE} 条/页）")
+        print(f"\n[2/4] 验收场景（第 1~6 项，每类 {args.runs} 次采样，{PAGE_SIZE} 条/页）")
+        print("      采样前先各跑一次预热（预算口径本来就是热缓存，见 §5.6）")
         print(f"      {'场景':<34} {'P50':>8} {'P95':>8} {'P99':>8} {'行数':>5}  判定")
         for name, func in SCENARIOS:
+            func(conn)  # 预热：把懒加载的游标与页缓存填上，别算进采样
             result = measure(conn, func, args.runs)
             verdict = "达标" if result["p99"] < BUDGET_P99_MS else "超预算"
             if result["p99"] >= BUDGET_P99_MS:
@@ -572,12 +519,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"{result['p99']:>7.1f}ms {result['rows']:>5}  {verdict}"
             )
 
-        print("\n[3/4] 冷启动首查（预热前，仅供对照 M4 是否值得做）")
+        print("\n      耗时分解（关键词一页，M6：慢查询一眼看出是哪一段）")
+        for name in (SCENARIOS[1][0], SCENARIOS[2][0]):
+            print(f"      {name:<34} {_breakdown(conn, name)}")
+
+        print("\n[3/4] 冷启动首查（第 7 项，预热前，仅供对照 M4 是否值得做）")
         for name, func in SCENARIOS[:3]:
             cold = measure_cold(path, func)
             print(f"      {name:<34} {cold:>7.1f}ms")
 
-        print(f"\n[4/4] 并发与并发写入（readers={args.readers}）")
+        print(f"\n[4/4] 并发与并发写入（第 8、9 项，readers={args.readers}）")
         concurrent = measure_concurrent(path, _query_plain_list, args.readers)
         if "error" in concurrent:
             print(f"      并发读者：失败（{concurrent['error']}）")

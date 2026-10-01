@@ -126,6 +126,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("[数据库]（只读探测；不可达不影响本次体检结论）")
     _doctor_database_section(root)
     print()
+    print("[检索]（只读探测：两个 FTS5 索引的规模与派生列是否跟上了）")
+    _doctor_search_section(root)
+    print()
     print("[运行时目录]（运行时产物，已被 .gitignore 忽略）")
     _doctor_runtime_dirs(root)
     print()
@@ -424,6 +427,56 @@ def _doctor_database_section(root: Path) -> None:
         print(f"  · 设置项：已播种 {len(setting_rows)} 项")
     else:
         print("  · 设置项：尚未播种（uv run pc config seed）")
+
+
+def _doctor_search_section(root: Path) -> None:
+    """doctor 的检索段：索引规模 + 有多少行还没分词。
+
+    "搜不到"最常见的两个原因就在这里：索引是空的（还没重建），或者派生列没算过
+    （升级前落库的老行）。两者都只报告，不改动任何东西，也不影响退出码。
+    """
+    from pc.adapters import sqlite as db
+
+    try:
+        db.ensure_version_gate()
+    except db.DatabaseError as exc:
+        print(f"  · {str(exc).splitlines()[0]}")
+        return
+
+    resolved = db.resolve_db_path(
+        None, env_file=root / ".env", app_config=root / "config/app.yaml"
+    )
+    if not resolved.path.is_file():
+        print(f"  · 还没有数据库文件（{resolved.path}）")
+        return
+
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            counts = {
+                name: int(conn.execute(f"SELECT count(*) FROM {name}").fetchone()[0])
+                for name in db.FTS_VIRTUAL_TABLES
+            }
+            stale = db.stale_search_row_count(conn)
+            items = int(
+                conn.execute(
+                    "SELECT count(*) FROM content_item WHERE deleted_at IS NULL"
+                ).fetchone()[0]
+            )
+    except db.DatabaseError as exc:
+        print(f"  · 打不开：{str(exc).splitlines()[0]}")
+        return
+
+    counts_text = "，".join(f"{name} {count} 行" for name, count in sorted(counts.items()))
+    print(f"  ✓ 索引 {counts_text}（有效内容 {items} 条）")
+    if stale:
+        print(
+            f"  · {stale} 条内容有可检索文本却还没有分词结果："
+            "跑 `pc db reindex --recompute-derived`（1~2 字的中文查询会搜不到它们）"
+        )
+    elif items and not any(counts.values()):
+        print("  · 索引是空的：跑 `pc db reindex --recompute-derived` 重建")
+    else:
+        print("  · 派生列已跟上，无需重算")
 
 
 def cmd_db_status(args: argparse.Namespace) -> int:
@@ -763,6 +816,28 @@ ITEM_LIST_MAX_WIDTHS: dict[str, int] = {
     "媒体": 6,  # 媒体引用计数
     "备注": 24,  # 来源备注（人写的自由文本）
     "建库时间": 24,  # ISO-8601 UTC 毫秒固定 24 格，永不截断
+}
+
+#: `pc search` 的表头与列宽上限
+SEARCH_HEADERS: tuple[str, ...] = (
+    "id",
+    "类型",
+    "来源",
+    "命中",
+    "内容",
+    "标签",
+    "备注",
+    "时间",
+)
+SEARCH_MAX_WIDTHS: dict[str, int] = {
+    "id": 8,
+    "类型": 8,  # item_type ∈ text/image/video/audio/link/sticker/file
+    "来源": 16,
+    "命中": 24,  # 命中的词，多个用空格隔开
+    "内容": 40,  # 命中片段（带 [] 标记）或正文摘要
+    "标签": 20,  # 标签名列表（置信度与来源在 --json 里）
+    "备注": 20,  # 来源备注（人写的自由文本）
+    "时间": 24,  # ISO-8601 UTC 毫秒固定 24 格
 }
 
 #: `pc source list` 的表头与列宽上限
@@ -1375,6 +1450,162 @@ def cmd_item_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search(args: argparse.Namespace) -> int:
+    """按关键词与过滤器检索内容（DESIGN §5）。
+
+    默认**只看安全、有效、未软删的内容**（`status='active'` 且 `nsfw_level <= 0`），
+    同一段文本的重复项折叠到代表项——放宽必须显式给参数。关键词检索不返回精确总数
+    （§5.6 M1b），只报候选数；纯过滤列表给精确条数。
+    """
+    from pc import config as config_mod
+    from pc.adapters import sqlite as db
+    from pc.services import search as search_svc
+
+    resolved, _ = _db_and_paths(args)
+    if not resolved.path.is_file():
+        print(f"  · 还没有数据库文件（{resolved.path}）；建库并导入之后这里就能搜到东西。")
+        return 0
+
+    root = _project_root(args)
+    registry: Any = None
+    yaml_defaults: dict[str, Any] = {}
+    registry_note: str | None = None
+    try:
+        registry = config_mod.registry_index(
+            config_mod.load_registry(root / config_mod.DEFAULT_REGISTRY_PATH)
+        )
+        yaml_defaults = config_mod.load_app_defaults(
+            root / config_mod.DEFAULT_APP_CONFIG_PATH, registry=registry
+        )
+    except config_mod.ConfigError as exc:
+        # 页大小读不到就按默认值兜底，但要说清楚——静默降级比报错更难查
+        registry_note = str(exc)
+
+    query = search_svc.SearchQuery(
+        q=" ".join(args.terms),
+        source=args.source,
+        item_types=tuple(args.type or ()),
+        statuses=(args.status,) if args.status else (),
+        tags=tuple(args.tag or ()),
+        since=args.since,
+        until=args.until,
+        nsfw_max_level=args.nsfw_level,
+        include_duplicates=args.include_duplicates,
+        sort=args.sort,
+        limit=args.limit,
+        cursor=args.cursor,
+        page=args.page,
+    )
+
+    with db.open_db(resolved.path, expect_exists=True) as conn:
+        try:
+            result = search_svc.run_search(
+                conn,
+                query,
+                registry=registry,
+                yaml_defaults=yaml_defaults,
+                env=os.environ,
+            )
+        except search_svc.SearchError as exc:
+            print(f"  ✗ {exc}", file=sys.stderr)
+            return 2
+        stale = search_svc.stale_derived_count(conn) if not result["hits"] else 0
+
+    if registry_note:
+        print(f"  · 设置项注册表不可用（{registry_note}），每页条数按默认值兜底。")
+    if args.json:
+        print(cfg_dump_json(result))
+        return 0
+    if not result["hits"]:
+        print("  · 没有匹配的内容。")
+        if stale:
+            print(
+                f"    注意：{stale} 条内容有可检索文本却还没有分词结果（老数据），"
+                "跑 `pc db reindex --recompute-derived` 之后再来搜。"
+            )
+        print("    小提示：1~2 字的中文查询走词级索引，3 字以上走子串索引；换个数试试。")
+        return 0
+
+    table = [
+        [
+            hit["content_id"],
+            hit["item_type"],
+            hit["source"],
+            " ".join(hit["matched_terms"]) or "-",
+            hit["snippet"] or _short_text(hit["text"]) or _media_summary(hit["media"]),
+            " ".join(tag["name"] for tag in hit["tags"]) or "-",
+            hit["origin_note"] or "-",
+            hit["first_seen_at"],
+        ]
+        for hit in result["hits"]
+    ]
+    _print_table(SEARCH_HEADERS, table, max_widths=SEARCH_MAX_WIDTHS)
+    if result["total"] is not None:
+        shown = len(result["hits"])
+        kind = result.get("total_kind") or "exact"
+        if kind == "exact":
+            head = f"  共 {result['total']} 条命中"
+        elif kind == "at_least":
+            head = (
+                f"  至少 {result['total']} 条命中（超过 {result['total']} 条就不再数下去，"
+                "精确总数对翻页没有用；§5.6 M1b）"
+            )
+        else:
+            head = f"  约 {result['total']} 条命中（按标签用量估算，不是精确计数）"
+        print(f"{head}，上面显示 {shown} 条（每页上限 {search_svc.MAX_PAGE_SIZE}）")
+    else:
+        order_text = "时间倒序" if result["sort"] == "time" else "相关度排序"
+        print(
+            f"  候选 {result['candidates']} 条（{order_text}；关键词检索不统计精确总数，"
+            f"这是第 {result.get('page', 1)} 页）"
+        )
+        if result["incomplete"]:
+            print("  注意：候选已扫完仍未凑满一页，结果可能不完整（放宽条件或换更常见的词）。")
+    if result["next_cursor"]:
+        print(f"  下一页：pc search … --cursor {result['next_cursor']}")
+    elif result["has_more"] and result["total"] is None:
+        print(f"  下一页：pc search … --page {int(result.get('page', 1)) + 1}")
+    _print_search_timings(result["timings"], show=args.timings)
+    return 0
+
+
+def _short_text(text: Any, limit: int = 60) -> str:
+    """没有命中片段时给一行正文摘要（表格自己还会按显示宽度截断）。"""
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def _media_summary(media: Mapping[str, Any]) -> str:
+    """媒体项的描述：宽高与缩略图有无（缩略图本切片还不生成，只能如实说）。"""
+    if not media or not media.get("count"):
+        return "（空）"
+    size = f"{media['width']}x{media['height']}" if media.get("width") else "尺寸未知"
+    thumb = "有缩略图" if media.get("thumb_key") else "无缩略图"
+    return f"媒体 x{media['count']}（{size}，{thumb}）"
+
+
+def _print_search_timings(timings: Mapping[str, float], *, show: bool) -> None:
+    """打印各段耗时（DESIGN §5.6 M6）。
+
+    ``--timings`` 时逐段列出；总耗时超过 200 ms 时无论有没有这个开关都提示一行——
+    慢查询不该只在"你恰好加了参数"的时候才被发现。
+    """
+    if show:
+        parts = "  ".join(
+            f"{stage}={timings[stage]:.1f}ms"
+            for stage in ("candidates", "filter", "count", "main", "tags", "media", "total")
+            if stage in timings
+        )
+        print(f"  耗时：{parts}")
+    if timings.get("total", 0) > 200:
+        print(
+            f"  · 慢查询：这一段用了 {timings['total']:.0f} ms"
+            "（预算 P99 < 500 ms，见 DESIGN §5.6）"
+        )
+
+
 def _human_size(size: Any) -> str:
     try:
         value = float(size or 0)
@@ -1552,6 +1783,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--root", help="仓库根目录（默认自动查找，用于读 config/app.yaml）")
     p_work.add_argument("--path", help=db_path_help)
     p_work.set_defaults(func=cmd_work)
+
+    p_search = sub.add_parser("search", help="按关键词与过滤器检索内容")
+    p_search.add_argument("terms", nargs="*", help="关键词（多个词是 AND；留空则只按过滤器列出）")
+    p_search.add_argument("--source", help="只看某个来源（按名字）")
+    p_search.add_argument(
+        "--type",
+        action="append",
+        choices=["text", "image", "video", "audio", "link", "sticker", "file"],
+        help="只看某种类型（可重复）",
+    )
+    p_search.add_argument(
+        "--status",
+        choices=["active", "quarantined", "archived", "deleted"],
+        help="只看某个状态（默认 active）",
+    )
+    p_search.add_argument(
+        "--tag",
+        action="append",
+        help="按标签过滤，多个标签是 AND（写法：名字 或 命名空间:名字）",
+    )
+    p_search.add_argument("--since", help="只看这个时间之后入库的（2026-09-30 或完整 ISO-8601）")
+    p_search.add_argument("--until", help="只看这个时间之前入库的")
+    p_search.add_argument(
+        "--nsfw-level",
+        type=int,
+        default=0,
+        help="允许的最高 NSFW 档位（默认 0=safe；2 及以上要显式给）",
+    )
+    p_search.add_argument(
+        "--include-duplicates", action="store_true", help="不折叠同一段文本的重复项"
+    )
+    p_search.add_argument("--sort", choices=["relevance", "time"], help="排序（默认：有词按相关度，无词按时间）")
+    p_search.add_argument("--limit", type=int, help="每页条数（默认取设置项，硬上限 50）")
+    p_search.add_argument("--page", type=int, default=1, help="相关度排序下的页码（默认 1）")
+    p_search.add_argument("--cursor", help="时间序翻页游标，取自上一次 --json 的 next_cursor")
+    p_search.add_argument("--timings", action="store_true", help="打印各段耗时（排错用）")
+    p_search.add_argument("--json", action="store_true", help="输出 JSON（含命中理由与游标）")
+    p_search.add_argument("--root", help="仓库根目录（默认自动查找，用于读配置）")
+    p_search.add_argument("--path", help=db_path_help)
+    p_search.set_defaults(func=cmd_search)
 
     p_item = sub.add_parser("item", help="内容项：查看库里到底有什么")
     p_item_sub = p_item.add_subparsers(dest="item_command", required=True)

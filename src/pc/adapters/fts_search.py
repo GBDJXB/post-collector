@@ -49,7 +49,16 @@ DEFAULT_CANDIDATE_CAPS: tuple[int, ...] = (500, 2000)
 #: 每页条数硬上限：与 §5.6 的预算绑定，设置项也只能到 50
 MAX_PAGE_SIZE = 50
 
-#: ''喂给 snippet 的窗口半径（字符数）''
+#: 精确统计的上限（§5.6 M1b）：超过它就不再数下去，改为如实说"至少这么多"。
+#: 十万条库上 `COUNT(*)` 要几百毫秒，而它换来的信息是"还有更多"——不值。
+COUNT_CAP = 5000
+
+#: 标签查询的两条路径用**估算的扫描行数**来挑（见 :meth:`SqliteFtsSearch._tag_driver`）：
+#: 预计沿时间索引扫不超过这么多行时，就让时间索引驱动、标签用 EXISTS 逐行判定；
+#: 否则物化最小的标签集当驱动表。两张表上的实测差一个数量级（DESIGN §3.7）。
+TAG_SCAN_LIMIT = 3000
+
+#: 提供给 snippet 的窗口半径（字符数）
 SNIPPET_RADIUS = 24
 
 
@@ -185,7 +194,10 @@ class SqliteFtsSearch:
             order = "time"  # 没有关键词就没有相关度可言，退化成时间序
 
         timings: dict[str, float] = {}
-        plan = self._candidate_plan(terms) if order == "relevance" else None
+        # 有没有关键词决定走哪条路径；`sort` 只决定**排法**，不能拿它当"没有关键词"用：
+        # 早先的写法是"只有 relevance 才算关键词查询"，于是 `--sort time 雨` 会退化成
+        # 纯过滤列表、把关键词整个丢掉（返回一堆不相干的结果，还不报错）。
+        plan = self._candidate_plan(terms)
 
         if plan is None:
             return self._query_by_filter(
@@ -203,6 +215,8 @@ class SqliteFtsSearch:
             filters=filters,
             size=size,
             page=page,
+            cursor=cursor,
+            order=order,
             timings=timings,
             started=started,
         )
@@ -221,7 +235,14 @@ class SqliteFtsSearch:
         started: float,
     ) -> dict[str, Any]:
         """纯过滤/浏览：B 树索引 + 键集分页，没有候选集（§5.6 M1 的第一条路径）。"""
-        base_where, base_params = self._where(filters)
+        driver, tag_clauses, driver_params, suffix_params = self._tag_driver(
+            filters.get("tag_ids") or (), limit=size
+        )
+        base_where, base_params = self._where(filters, skip_tags=True)
+        if tag_clauses:
+            base_where = base_where + " AND " + " AND ".join(tag_clauses)
+        # 参数顺序必须与 SQL 文本一致：驱动子查询（FROM）→ 基础条件（WHERE）→ 追加的 EXISTS
+        base_params = [*driver_params, *base_params, *suffix_params]
         where, params = base_where, list(base_params)
         offset = 0
         if cursor:
@@ -232,14 +253,14 @@ class SqliteFtsSearch:
             offset = max(0, (max(1, int(page)) - 1) * size)
 
         mark = time.perf_counter()
-        rows = self._fetch_page(where, params, size + 1, offset)
+        rows = self._fetch_page(where, params, size + 1, offset, driver=driver)
         timings["main"] = (time.perf_counter() - mark) * 1000
         has_more = len(rows) > size
         page_rows = rows[:size]
         page_ids = [int(row["content_id"]) for row in page_rows]
 
         mark = time.perf_counter()
-        total = self._count(base_where, base_params)
+        total, total_kind = self._total_for(base_where, base_params, filters, driver=driver)
         timings["count"] = (time.perf_counter() - mark) * 1000
 
         hits, tail = self._assemble(page_rows, page_ids, terms, filters)
@@ -252,6 +273,7 @@ class SqliteFtsSearch:
         return {
             "hits": hits,
             "total": total,
+            "total_kind": total_kind,
             "candidates": None,
             "candidate_cap": None,
             "has_more": has_more,
@@ -271,10 +293,16 @@ class SqliteFtsSearch:
         filters: Mapping[str, Any],
         size: int,
         page: int,
+        cursor: str | None,
+        order: str,
         timings: dict[str, float],
         started: float,
     ) -> dict[str, Any]:
-        """关键词：bm25 取候选 → 候选集内过滤 → 组装一页（§5.6 M1 / M1b / M2）。"""
+        """关键词：bm25 取候选 → 候选集内过滤 → 组装一页（§5.6 M1 / M1b / M2）。
+
+        ``order="time"`` 时仍以候选集为范围，只是把这一页按时间倒序取（并支持键集游标）——
+        关键词与排序是两件事，不能因为换了排法就把关键词丢掉。
+        """
         offset = max(0, (max(1, int(page)) - 1) * size)
         filtered: list[tuple[int, float]] = []
         cap_used: int | None = None
@@ -293,30 +321,54 @@ class SqliteFtsSearch:
                 break
 
         incomplete = len(filtered) <= offset + size and cap_used == self._caps[-1]
+        scores = dict(filtered)
+        mark = time.perf_counter()
+        if order == "time":
+            page_rows, has_more, next_cursor = self._time_ordered_page(
+                [content_id for content_id, _score in filtered],
+                size=size,
+                offset=offset,
+                cursor=cursor,
+            )
+            window_ids = [int(row["content_id"]) for row in page_rows]
+            timings["main"] = (time.perf_counter() - mark) * 1000
+            hits, tail = self._assemble(page_rows, window_ids, terms, filters, scores)
+            timings.update(tail)
+            timings["total"] = (time.perf_counter() - started) * 1000
+            return {
+                "hits": hits,
+                "total": None,  # M1b：关键词检索不给精确总数
+                "total_kind": None,
+                "candidates": len(filtered),
+                "candidate_cap": cap_used,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+                "incomplete": incomplete,
+                "terms": list(terms),
+                "sort": "time",
+                "limit": size,
+                "timings": timings,
+            }
+
         window = filtered[offset : offset + size]
         page_ids = [content_id for content_id, _score in window]
-        mark = time.perf_counter()
         rows = self._fetch_rows_by_ids(page_ids)
         timings["main"] = (time.perf_counter() - mark) * 1000
         # 主查询按 id 取，相关度顺序由候选集决定（候选是 bm25 排好的）
         ranks = {content_id: rank for rank, (content_id, _score) in enumerate(filtered)}
-        scores = dict(filtered)
         rows.sort(key=lambda row: ranks.get(int(row["content_id"]), 10**9))
         hits, tail = self._assemble(rows, [int(row["content_id"]) for row in rows], terms, filters, scores)
         timings.update(tail)
 
-        next_cursor = None
-        if len(filtered) > offset + size:
-            # 相关度排序的"下一页"是候选集内的页码，不是键集游标（游标对 bm25 无意义）
-            next_cursor = None
         timings["total"] = (time.perf_counter() - started) * 1000
         return {
             "hits": hits,
             "total": None,  # M1b：关键词检索不给精确总数
+            "total_kind": None,
             "candidates": len(filtered),
             "candidate_cap": cap_used,
             "has_more": len(filtered) > offset + size,
-            "next_cursor": next_cursor,
+            "next_cursor": None,  # 相关度排序的下一页是候选集内的页码，游标对 bm25 无意义
             "incomplete": incomplete,
             "terms": list(terms),
             "sort": "relevance",
@@ -324,6 +376,36 @@ class SqliteFtsSearch:
             "page": max(1, int(page)),
             "timings": timings,
         }
+
+    def _time_ordered_page(
+        self,
+        ids: Sequence[int],
+        *,
+        size: int,
+        offset: int,
+        cursor: str | None,
+    ) -> tuple[list[Any], bool, str | None]:
+        """在候选 id 集内按时间倒序取一页（关键词 + `--sort time` 这条组合）。"""
+        if not ids:
+            return [], False, None
+        marks = ",".join("?" * len(ids))
+        where = f"c.content_id IN ({marks})"
+        params: list[Any] = list(ids)
+        real_offset = 0
+        if cursor:
+            first_seen_at, content_id = self._decode_cursor(cursor)
+            where += " AND (c.first_seen_at, c.content_id) < (?, ?)"
+            params += [first_seen_at, content_id]
+        else:
+            real_offset = offset
+        rows = self._fetch_page(where, params, size + 1, real_offset)
+        has_more = len(rows) > size
+        page_rows = rows[:size]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = self._encode_cursor(str(last["first_seen_at"]), int(last["content_id"]))
+        return page_rows, has_more, next_cursor
 
     # -- 候选与过滤 ---------------------------------------------------------
 
@@ -398,15 +480,115 @@ class SqliteFtsSearch:
         "       substr(c.search_extra, 1, 300) AS search_extra,"
         "       m.source_id, m.sent_at, m.origin_note, m.sender_display_name,"
         "       s.name AS source_name"
-        "  FROM content_item c"
+    )
+
+    _JOINS = (
         "  JOIN message m ON m.message_id = c.message_id"
         "  JOIN source s ON s.source_id = m.source_id"
     )
 
+    @classmethod
+    def _from_clause(cls, driver: str | None = None) -> str:
+        """FROM 子句；``driver`` 给定时用 **CROSS JOIN 强制**它当驱动表。
+
+        为什么要强制：SQLite 会自己挑连接顺序，而"沿时间索引扫全表 + 逐行 EXISTS"
+        与"先取小集合再按主键回表"在十万条上差一个数量级。标签集是已知的小集合
+        （见 :data:`TAG_DRIVER_LIMIT`），这里明确要求以它为外层循环，不让规划器猜。
+        """
+        if driver is None:
+            return f"  FROM content_item c{cls._JOINS}"
+        return (
+            f"  FROM ({driver}) AS t CROSS JOIN content_item c ON c.content_id = t.content_id"
+            f"{cls._JOINS}"
+        )
+
+    def _tag_driver(
+        self, tag_ids: Sequence[int], *, limit: int
+    ) -> tuple[str | None, list[str], list[Any], list[Any]]:
+        """把标签过滤翻译成"驱动集 + 其余 EXISTS 条件"（§5.6 M1 的求交规则）。
+
+        两条路都能给出正确结果，差别只在代价，所以按**估算的扫描行数**挑：
+
+        * 沿时间索引扫到凑满一页需要 ``limit / 命中密度`` 行，密度按各标签规模的乘积估
+          （标签之间近似独立，合成数据与真实标签分布都符合这个假设）；
+        * 物化最小标签集当驱动表需要"最小集合大小"次主键回表。
+
+        密度高（如一个 12% 的常见标签）时时间索引扫几百行就凑满了，花几万次回表是浪费；
+        密度低（如三个各 8% 的标签求交，密度千分之一）时时间索引要扫掉整张表，
+        这时必须换成"小集合驱动"。两张表上都实测过，差一个数量级。
+
+        Returns:
+            ``(驱动子查询 SQL 或 None, 追加的 WHERE 子句, 驱动参数, 追加子句的参数)``。
+            **参数必须按 SQL 里的出现顺序拼**：驱动子查询在 FROM 里（最前），
+            追加子句在 WHERE 的末尾（最后）——顺序错了不会报错，只会静默查不到东西。
+        """
+        ids = [int(tag_id) for tag_id in tag_ids]
+        if not ids:
+            return None, [], [], []
+        sizes = sorted((self._tag_size(tag_id), tag_id) for tag_id in ids)
+        if self._tag_scan_is_cheap(sizes, limit=limit):
+            return None, [self._tag_exists_clause()] * len(sizes), [], [tag for _s, tag in sizes]
+        smallest = sizes[0][1]
+        others = [tag_id for _size, tag_id in sizes[1:]]
+        return (
+            "SELECT content_id FROM tag_assignment"
+            " WHERE tag_id = ? AND revoked_at IS NULL",
+            [self._tag_exists_clause()] * len(others),
+            [smallest],
+            others,
+        )
+
+    def _tag_scan_is_cheap(self, sizes: Sequence[tuple[int, int]], *, limit: int) -> bool:
+        """沿时间索引扫到凑满一页，预计要扫的行数是否可接受。"""
+        total = self._corpus_size_estimate()
+        density = 1.0
+        for size, _tag_id in sizes:
+            density *= min(1.0, max(size, 0) / total)
+        if density <= 0:
+            return False  # 有空集合：扫多久都凑不满一页，交给驱动集路径快速判定
+        return (limit / density) <= TAG_SCAN_LIMIT
+
+    def _corpus_size_estimate(self) -> int:
+        """内容量级的**廉价**估计：主键最大值（一次索引查找，不是一次全表计数）。
+
+        只用来挑查询计划，不参与任何对外输出的数字，所以允许有偏差（软删留下的空洞
+        会让它偏大，那只会让估算更保守）。
+        """
+        row = self._conn.execute("SELECT coalesce(max(content_id), 0) FROM content_item").fetchone()
+        return max(int(row[0]) if row else 0, 1)
+
+    @staticmethod
+    def _tag_exists_clause() -> str:
+        return (
+            "EXISTS (SELECT 1 FROM tag_assignment ta WHERE ta.content_id = c.content_id"
+            " AND ta.tag_id = ? AND ta.revoked_at IS NULL)"
+        )
+
+    def _tag_size(self, tag_id: int) -> int:
+        """标签集合的规模——只用来**挑查询计划**，所以优先用 ``usage_count``。
+
+        计数器还没人维护时（打标切片之前恒为 0）退回真实计数：这里多花几毫秒
+        换来的是"驱动集阈值"判断正确，而阈值判断错了会让查询慢一个数量级。
+        """
+        row = self._conn.execute(
+            "SELECT coalesce(usage_count, 0) FROM tag WHERE tag_id = ?", (tag_id,)
+        ).fetchone()
+        if row and int(row[0]) > 0:
+            return int(row[0])
+        counted = self._conn.execute(
+            "SELECT count(*) FROM tag_assignment WHERE tag_id = ? AND revoked_at IS NULL",
+            (tag_id,),
+        ).fetchone()
+        return int(counted[0]) if counted else 0
+
     def _where(
-        self, filters: Mapping[str, Any], *, skip_ids: bool = False
+        self, filters: Mapping[str, Any], *, skip_ids: bool = False, skip_tags: bool = False
     ) -> tuple[str, list[Any]]:
-        """把结构化过滤器翻成 WHERE 子句（候选集内过滤与纯过滤路径共用一套）。"""
+        """把结构化过滤器翻成 WHERE 子句（候选集内过滤与纯过滤路径共用一套）。
+
+        ``skip_tags`` 时不含标签条件——那条路由 :meth:`_tag_driver` 以"驱动集 + EXISTS"
+        的形式给（见那里的理由）。
+        """
         clauses: list[str] = ["c.deleted_at IS NULL"]
         params: list[Any] = []
 
@@ -437,12 +619,10 @@ class SqliteFtsSearch:
             clauses.append("c.first_seen_at <= ?")
             params.append(str(until))
 
-        for tag_id in filters.get("tag_ids") or ():
-            clauses.append(
-                "EXISTS (SELECT 1 FROM tag_assignment ta WHERE ta.content_id = c.content_id"
-                " AND ta.tag_id = ? AND ta.revoked_at IS NULL)"
-            )
-            params.append(int(tag_id))
+        if not skip_tags:
+            for tag_id in filters.get("tag_ids") or ():
+                clauses.append(self._tag_exists_clause())
+                params.append(int(tag_id))
 
         if filters.get("fold_duplicates", True):
             # canonical 折叠：同一段文本只留代表项。**守卫**：代表项自己被软删或不是
@@ -463,10 +643,16 @@ class SqliteFtsSearch:
         return " AND ".join(clauses), params
 
     def _fetch_page(
-        self, where: str, params: Sequence[Any], count: int, offset: int = 0
+        self,
+        where: str,
+        params: Sequence[Any],
+        count: int,
+        offset: int = 0,
+        *,
+        driver: str | None = None,
     ) -> list[Any]:
         sql = (
-            f"{self._SELECT_HIT} WHERE {where}"
+            f"{self._SELECT_HIT}{self._from_clause(driver)} WHERE {where}"
             " ORDER BY c.first_seen_at DESC, c.content_id DESC LIMIT ?"
         )
         args = [*params, int(count)]
@@ -480,16 +666,63 @@ class SqliteFtsSearch:
             return []
         marks = ",".join("?" * len(ids))
         return self._conn.execute(
-            f"{self._SELECT_HIT} WHERE c.content_id IN ({marks})", list(ids)
+            f"{self._SELECT_HIT}{self._from_clause()} WHERE c.content_id IN ({marks})", list(ids)
         ).fetchall()
 
-    def _count(self, where: str, params: Sequence[Any]) -> int:
+    def _total_for(
+        self,
+        where: str,
+        params: Sequence[Any],
+        filters: Mapping[str, Any],
+        *,
+        driver: str | None,
+    ) -> tuple[int, str]:
+        """这一步的"一共多少条"（§5.6 M1b：**不返回精确总数**）。
+
+        三种来源，按代价从低到高：
+
+        * **标签维度**：直接用 ``tag.usage_count``（denormalized 计数器，打标切片维护）。
+          它是交集的上界，所以叫"约 N 条"。计数器还没人维护（全为 0）时退回计数——
+          与其报一个恒为 0 的数，不如老实数一遍。
+        * **其余条件**：数到 :data:`COUNT_CAP` 就停，叫"至少 N 条"。
+        * 没被截断时才是真正的精确值。
+
+        Returns:
+            ``(数量, 种类)``，种类 ∈ ``{"exact", "at_least", "estimate"}``。
+        """
+        tag_ids = [int(tag_id) for tag_id in filters.get("tag_ids") or ()]
+        if tag_ids:
+            usage = [
+                int(row[0])
+                for row in self._conn.execute(
+                    "SELECT coalesce(usage_count, 0) FROM tag WHERE tag_id IN ({})".format(
+                        ",".join("?" * len(tag_ids))
+                    ),
+                    tag_ids,
+                ).fetchall()
+            ]
+            if usage and min(usage) > 0:
+                return min(usage), "estimate"
+        total, capped = self._count_capped(where, params, driver=driver)
+        return total, "at_least" if capped else "exact"
+
+    def _count_capped(
+        self, where: str, params: Sequence[Any], *, driver: str | None = None
+    ) -> tuple[int, bool]:
+        """数到 :data:`COUNT_CAP` 就停（§5.6 M1b）。
+
+        Returns:
+            ``(数量, 是否被截断)``。被截断时数量就是上限值，调用方要如实说"至少这么多"，
+            而不是把它当成精确总数——那正是 M1b 要避免的误导。
+        """
         sql = (
-            "SELECT count(*) FROM content_item c"
-            "  JOIN message m ON m.message_id = c.message_id"
-            f" WHERE {where}"
+            "SELECT count(*) FROM (SELECT 1"
+            f"{self._from_clause(driver)} WHERE {where} LIMIT ?)"
         )
-        return int(self._conn.execute(sql, params).fetchone()[0])
+        value = int(self._conn.execute(sql, [*params, COUNT_CAP + 1]).fetchone()[0])
+        if value > COUNT_CAP:
+            return COUNT_CAP, True
+        return value, False
 
     # -- 组装（M2：主查询 + tag 批量 + 媒体批量） ---------------------------
 
