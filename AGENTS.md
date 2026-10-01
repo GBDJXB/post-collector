@@ -11,7 +11,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 
 核心能力（按实现阶段逐步交付）：多来源增量采集 / 内容规范化与去重 / 本地模型打标与角色特征归档 / 标签与关键词检索 / 人工复核与纠错 / 保留策略与滚动删除。
 
-当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**601 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
+当前状态：**骨架阶段，但「把本地内容存进库」这条链路已经端到端可用**。已有分层目录、13 个端口接口声明、设置项注册表与健康检查接口；**数据库真实可用**（SQLite 单文件，34 张 STRICT 表 + 2 个 FTS5 虚拟索引 + 6 个同步触发器，权威定义在 `migrations/sqlite/`，当前 4 个版本）；**设置层与配置层真实可用**（注册表加载与校验、`env > db > yaml > default` 四层解析、来源可解释性、首次播种、带审计与回滚的写入路径、`app.yaml` 全段严格校验、数据根与六个运行时目录可解析且带来源）；**采集与处理链路真实可用**（来源登记 + 授权三者齐备校验 → 两条入口：官方导出目录导入（`pc import`）与 root 手工上传（`pc upload`）→ L2 摄入落信封并入队 → 单进程 worker 取字节/扫描/哈希/去重/落盘 → 内容项与媒体多对多 → `pc item list` 查看）；测试套件覆盖以上全部，**653 条 + 2 条环境跳过、20 秒上下、不依赖任何外部服务**；**但检索、打标与界面仍未实现**。
 
 设计基线是 `DESIGN.md` **v3.1**：阶段 1 只启用 root 与邀请制用户（匿名提报后置到阶段 2），分发收敛在 GitHub（原生安装仍需从 PyPI 取依赖，已在文档里如实说明）。**代码与设计在存储引擎上已经一致**——不再有"迁移进行中"的偏差。
 
@@ -26,7 +26,7 @@ post-collector 是一个自托管工具：把散落在**已授权来源**里的�
 | 本地启动 | `uv run uvicorn pc.api.app:create_app --factory --port 8080` | 端点见 `/`、`/healthz`、`/api/v1/meta`、`/docs` |
 | 静态检查 | `uv run ruff check src` | ruff 随 dev 组安装；配置在 `pyproject.toml`，提交前必须为 All checks passed。改过 `tests/` 时一并跑 `uv run ruff check src tests` |
 | 语法自检 | `python -m compileall -q src` | 无需安装依赖 |
-| 运行测试 | `uv run pytest` | **601 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
+| 运行测试 | `uv run pytest` | **653 条 + 2 条跳过，全部在临时目录上跑：不依赖任何外部服务**（本机 13~21 秒，取决于磁盘与杀软——每个 CLI 测试都要建一个真库）。两条 skip 都是符号链接相关（"链接文件被跳过"与"文件根本身是符号链接"）——Windows 默认不给创建符号链接的权限，属于环境限制而不是功能缺失。`integration` marker 仍然保留，留给将来真正需要外部服务（平台接口、模型下载、对象存储）的测试。注意 starlette 会对 `httpx` 版 TestClient 报弃用告警，写新测试时按提示换 `httpx2` |
 | 建库 / 应用迁移 | `uv run pc db apply [--path PATH] [--dir DIR] [--root DIR]` | **按文件名序号应用迁移目录下全部未应用的 `.sql`，每个文件一个显式事务**（`BEGIN IMMEDIATE` … `COMMIT`）：某个文件失败只回滚它自己，已成功的版本保持已应用。迁移目录默认是 `<项目根>/migrations/sqlite`；库文件默认是 `<data_root>/pc.sqlite3`。语句用 `sqlite3.complete_statement()` 切分，**不要用 `text.split(';')`**。命令会打印它实际用了哪个迁移目录 |
 | 校验库结构 | `uv run pc db status [--path PATH] [--dir DIR] [--root DIR]` | 只读：表数（预期 34）、两个 FTS5 索引、`journal_mode`、`foreign_keys`、完整性检查、**每个版本的记账与结构指纹漂移**、有无未应用/未知版本；结构不符时退出码 2 |
 | 备份数据库 | `uv run pc db backup [--to FILE]` | `VACUUM INTO` 生成事务一致的快照，随后打开快照跑完整性检查并核对表数；**拒绝覆盖已存在的文件**。默认落到 `<data_root>/backup/pc-<UTC 时间戳>.sqlite3`。备份必须与库放在**不同物理介质**上（DESIGN §7.1） |
@@ -72,24 +72,25 @@ post-collector/
     ├── config.py                 设置层与 L2 配置段：注册表校验、四层解析、变更闸门、快照、限额与安全策略
     ├── cli.py                    doctor / config / db / source / import / upload / work / item 全部已接线
     ├── adapters/
-    │   ├── sqlite.py             库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写
+    │   ├── sqlite.py             库文件与运行时目录解析、迁移应用、结构校验、备份、FTS5 重建、setting 表读写、派生检索列重算
+    │   ├── fts_search.py         FTS5 检索适配器：双索引候选、候选内求交、键集分页、可解释性、各段耗时
     │   ├── local_storage.py      本地目录存储后端（内容寻址 ab/cd/<sha256>，原子写入、幂等）
     │   ├── magic_scan.py         魔数嗅探扫描器（白名单 + 字节上限 + fail closed）
     │   ├── local_files.py        本地文件连接器（手工上传与官方导包共用）
     │   └── registry.py           连接器工厂：source.kind → 实现，唯一解密凭证处
-    ├── services/                 业务规则：来源登记、L2 摄入、L3 单进程 worker
+    ├── services/                 业务规则：来源登记、L2 摄入、L3 单进程 worker、检索（可见性政策与过滤器解析）
     └── api/                      FastAPI 工厂与路由
 ```
 
 | 路径 | 职责 | 状态 |
 | --- | --- | --- |
-| `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定；`Connector` 的取字节与推送两条路已补齐，其余无实现 |
+| `src/pc/ports/` | 采集与提报 / 存储检索与容量 / 模型与安全 / 工作流与配置 四组接口 | 接口已定；`Connector` 的取字节与推送两条路已补齐，`SearchIndex` 已有 FTS5 实现，其余无实现 |
 | `src/pc/domain.py` | 状态取值、传输结构与跨层错误（`MediaTooLargeError` / `SourceNotAuthorizedError`）；`ObjectKey` 定义内容寻址键 `ab/cd/<sha256>` | 可运行 |
 | `src/pc/config.py` | `env > db > yaml > default` 四层解析、来源可解释性、`plan_setting_change` 闸门与不可变快照；`load_app_config` 严格校验 app.yaml 各段，`ingest_limits` / `security_policy` / `job_settings` 给类型化取值 | 可用（单元测试覆盖） |
-| `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5、setting 读写）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
-| `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账） | 可用（单元与端到端测试覆盖） |
+| `src/pc/adapters/` | 数据库（库文件与六个运行时目录的解析、PRAGMA 基线、迁移、结构校验、备份、FTS5 重建与派生列重算、setting 读写）、FTS5 检索（双索引候选、候选内求交、键集分页）、本地存储后端、魔数扫描器、本地文件连接器（两种身份策略）、连接器工厂 | 可用（单元测试覆盖） |
+| `src/pc/services/` | 来源登记（source + authorization 同生共死、手工来源的 `ensure_manual_source`）、L2 摄入（幂等落信封 + 入队 + 来源备注）、L3 单进程 worker（抢占/重试/死信/去重/隔离/落账）、检索（可见性政策、来源与标签解析、页大小与预算闸门、可解释性） | 可用（单元与端到端测试覆盖） |
 | `src/pc/cli.py` | `doctor`、`config show/seed`、`db apply/status/backup/reindex`、`source add/list`、`import`、`upload`、`work`、`item list` | 可用 |
-| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 601 条 + 2 条跳过（Windows 无符号链接权限），20 秒上下全绿 |
+| `tests/` | 适配器 + 服务层 + CLI 端到端（导入与上传各一条）+ CLI 表格排版 + 项目根解析 + 迁移器（含表重建）+ 配置段与路径 + 连接器/存储/扫描器 + 检索（分词、派生列重算、过滤/分页/可解释性/语句计数）+ schema 红线 + 出网守卫（全部在临时目录上跑，无外部依赖） | 653 条 + 2 条跳过（Windows 无符号链接权限），25 秒上下全绿 |
 
 ## 边界约束
 

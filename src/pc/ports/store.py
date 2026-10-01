@@ -46,14 +46,24 @@ class SearchIndex(Protocol):
     阶段 1 用 SQLite FTS5（trigram + 预分词 unicode61 双索引）；阶段 2 可换
     Meilisearch；数据库始终是事实源，索引只是**可重建的派生层**。
     查询构造在接口内完成，不让上层依赖某个引擎的专有语法。
+
+    实现说明（阶段 1 的 FTS5 实现）：索引行由 6 个触发器从 ``content_item`` 搬进去，
+    所以 :meth:`index` 的职责是**重算派生列**（``text_search``/``search_extra``）而不是
+    手工写倒排表；:meth:`delete` 在软删时不需要做任何事（查询侧过滤 ``deleted_at``），
+    硬删时由触发器清理索引行。
     """
 
-    def index(self, doc: dict[str, Any]) -> None:
-        """写入或更新一个检索文档。"""
+    def index(self, doc_id: int) -> None:
+        """重算一行内容的派生检索列（分词结果与检索补充字段）。
+
+        ``doc`` 的字段来自 ``content_item`` 本身 + 来源名 + 发送者名 + 标签名，
+        由实现自己去取——调用方只给 ``content_id``，避免两处对"检索文本由哪些字段组成"
+        有不同理解。
+        """
         ...
 
-    def delete(self, doc_id: str) -> None:
-        """删除一个检索文档（软删同时要调用，避免软删内容仍被搜到）。"""
+    def delete(self, doc_id: int) -> None:
+        """删除一个检索文档；FTS5 实现下是**有意为之的空操作**（见类文档）。"""
         ...
 
     def query(
@@ -62,17 +72,34 @@ class SearchIndex(Protocol):
         filters: dict[str, Any] | None = None,
         sort: str | None = None,
         page: int = 1,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """检索。
 
+        Args:
+            q: 用户输入的原始查询串（多个词用空格分开）。实现负责分词与转义，
+                **不接受**任何检索引擎的专有语法。
+            filters: 结构化过滤器。阶段 1 认识这些键（缺失即不限制）：
+                ``content_ids``（候选集，供"候选内过滤"用）、``statuses``、
+                ``nsfw_max_level``、``item_types``、``source_id``、``tag_ids``、
+                ``since``/``until``（按 ``first_seen_at``）、``fold_duplicates``。
+            sort: ``"relevance"`` 或 ``"time"``。
+            page: 相关度排序下的页码（候选集内翻页）；时间序请用 ``cursor``。
+            limit: 每页条数（上限 50，与 §5.6 的预算绑定）。
+            cursor: 上次结果里的 ``next_cursor``，用于时间序的键集分页。
+
         Returns:
-            含 ``hits`` 与 ``total`` 的结果；**每条结果必须能解释为什么出现**
-            （命中字段、命中的 tag 与置信度、命中的过滤器），见 DESIGN §5.5。
+            至少含 ``hits`` 与 ``total``；阶段 1 的实现另外返回 ``candidates``、
+            ``candidate_cap``、``has_more``、``next_cursor``、``incomplete``、
+            ``timings``（各段耗时，见 §5.6 的 M6）。**每条 hit 必须能解释为什么出现**
+            （命中词、命中字段、片段、命中的 tag 与过滤器），见 DESIGN §5.5。
         """
         ...
 
-    def rebuild(self) -> None:
-        """全量重建索引；任何索引异常的第一步都是重建，而不是修索引。"""
+    def rebuild(self, *, batch_size: int = 500) -> dict[str, Any]:
+        """全量重算派生列并重建索引；任何索引异常的第一步都是重建，而不是修索引。"""
         ...
 
 

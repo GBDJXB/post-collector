@@ -38,7 +38,7 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1281,6 +1281,7 @@ def refresh_search_derived(
     conn: sqlite3.Connection,
     *,
     batch_size: int = 500,
+    content_ids: Sequence[int] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """重算两列检索派生数据（``text_search``、``search_extra``），返回统计。
@@ -1290,33 +1291,24 @@ def refresh_search_derived(
     * 分词规则变了（本仓库从"没有分词器"变成"单字 + 双字"），老行得跟着变；
     * ``search_extra`` 含来源名、发送者名与**标签名**，改标签或改来源名之后它就过期了。
 
+    ``content_ids`` 给了就只算这几行（供单行更新用），否则全表分批。
+
     分批提交（DESIGN §2.3）：SQLite 是单写者，一次更新十万行会让写锁长时间不释放。
-    本函数幂等：算出来的值与现有值相同就不写（``WHERE`` 里带比较），重复跑只花读的时间。
+    本函数幂等：算出来的值与现有值相同就不写（比较后再决定），重复跑只花读的时间。
     """
     size = max(1, int(batch_size))
-    total = int(conn.execute("SELECT count(*) FROM content_item").fetchone()[0])
+    wanted = list(dict.fromkeys(int(item) for item in content_ids)) if content_ids else None
+    total = (
+        len(wanted)
+        if wanted is not None
+        else int(conn.execute("SELECT count(*) FROM content_item").fetchone()[0])
+    )
     updated = 0
     scanned = 0
-    last_id = 0
-    while True:
-        rows = conn.execute(
-            "SELECT c.content_id, c.text_content, c.ocr_text, c.caption, c.text_search,"
-            "       c.search_extra, s.name AS source_name, s.platform,"
-            "       m.sender_display_name,"
-            "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
-            "          JOIN tag t ON t.tag_id = ta.tag_id"
-            "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "
-            "  FROM content_item c"
-            "  JOIN message m ON m.message_id = c.message_id"
-            "  JOIN source s ON s.source_id = m.source_id"
-            " WHERE c.content_id > ? ORDER BY c.content_id LIMIT ?",
-            (last_id, size),
-        ).fetchall()
-        if not rows:
-            break
+
+    for rows in _derived_batches(conn, wanted=wanted, size=size):
         pending: list[tuple[str | None, str, int]] = []
         for row in rows:
-            last_id = int(row["content_id"])
             scanned += 1
             extra = search_extra_value(
                 row["source_name"],
@@ -1324,12 +1316,10 @@ def refresh_search_derived(
                 row["sender_display_name"],
                 row["tag_names"],
             )
-            tokens = search_tokens(
-                row["text_content"], row["ocr_text"], row["caption"], extra
-            )
+            tokens = search_tokens(row["text_content"], row["ocr_text"], row["caption"], extra)
             if tokens == row["text_search"] and extra == row["search_extra"]:
                 continue
-            pending.append((tokens, extra, last_id))
+            pending.append((tokens, extra, int(row["content_id"])))
         if pending:
             with transaction(conn):
                 for tokens, extra, content_id in pending:
@@ -1342,6 +1332,49 @@ def refresh_search_derived(
         if progress is not None:
             progress(scanned, total)
     return {"scanned": scanned, "updated": updated, "total": total}
+
+
+#: 重算派生列时要读的字段（含标签名的拼接）
+_SEARCH_DERIVED_SELECT = (
+    "SELECT c.content_id, c.text_content, c.ocr_text, c.caption, c.text_search,"
+    "       c.search_extra, s.name AS source_name, s.platform,"
+    "       m.sender_display_name,"
+    "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
+    "          JOIN tag t ON t.tag_id = ta.tag_id"
+    "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "
+    "  FROM content_item c"
+    "  JOIN message m ON m.message_id = c.message_id"
+    "  JOIN source s ON s.source_id = m.source_id"
+)
+
+
+def _derived_batches(
+    conn: sqlite3.Connection, *, wanted: Sequence[int] | None, size: int
+) -> Iterator[list[sqlite3.Row]]:
+    """按批次产出要重算的行。
+
+    给了 id 就按 id 分批（单行更新走这条）；否则按主键游标翻页扫全表——**不要**
+    用 ``LIMIT/OFFSET``，那在十万行上会越翻越慢。
+    """
+    if wanted is not None:
+        for start in range(0, len(wanted), size):
+            chunk = wanted[start : start + size]
+            marks = ",".join("?" * len(chunk))
+            yield conn.execute(
+                f"{_SEARCH_DERIVED_SELECT} WHERE c.content_id IN ({marks}) ORDER BY c.content_id",
+                chunk,
+            ).fetchall()
+        return
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            f"{_SEARCH_DERIVED_SELECT} WHERE c.content_id > ? ORDER BY c.content_id LIMIT ?",
+            (last_id, size),
+        ).fetchall()
+        if not rows:
+            return
+        last_id = int(rows[-1]["content_id"])
+        yield rows
 
 
 # ---------------------------------------------------------------------------
