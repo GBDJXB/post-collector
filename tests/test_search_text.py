@@ -18,8 +18,14 @@ from pc.domain import (
     FILE_NAME_LIMIT,
     ITEM_TYPE_LABELS,
     ITEM_TYPES,
+    POST_SIGNATURE_LIMIT,
     SEARCH_EXTRA_TEXT_LIMIT,
     filename_from_ref,
+    post_composition_label,
+    post_is_mixed,
+    post_matches_type,
+    post_signature,
+    post_type_mask,
     search_extra_value,
     search_tokens,
     tokenize_document,
@@ -131,6 +137,78 @@ class TestDerivedColumnHelpers:
         tokens = search_tokens(None, None, None, search_extra_value("mine", "local"))
         assert tokens is not None
         assert "mine" in tokens.split()
+
+
+class TestPostComposition:
+    """帖子的构成口径（DESIGN §5.1）：``--type`` 说的是"返回什么内容"。"""
+
+    def test_mask_uses_item_types_order(self) -> None:
+        assert post_type_mask(["text"]) == 1
+        assert post_type_mask(["image"]) == 2
+        assert post_type_mask(["file"]) == 64
+        assert post_type_mask(["text", "image"]) == 3
+        assert post_type_mask(["image", "image"]) == 2, "同一类型出现两次仍只有一位"
+
+    def test_mixed_needs_more_than_one_bit(self) -> None:
+        assert post_is_mixed(post_type_mask(["image", "text"]))
+        assert not post_is_mixed(post_type_mask(["image"]))
+        assert not post_is_mixed(post_type_mask(["image", "image"])), "两张图不是跨类型内容"
+
+    @pytest.mark.parametrize(
+        ("parts", "selected", "include_mixed", "expected"),
+        [
+            # 纯内容：只看该类型
+            (["image"], ["image"], False, True),
+            (["image"], ["text"], False, False),
+            # 跨类型内容：默认不算；--include-mixed 且含所选类型才算
+            (["image", "text"], ["image"], False, False),
+            (["image", "text"], ["image"], True, True),
+            (["image", "text"], ["text"], True, True),
+            (["video", "text"], ["image"], True, False),
+            # 多个 --type 是并集
+            (["image"], ["image", "text"], False, True),
+            (["image", "text"], ["image", "text"], True, True),
+        ],
+    )
+    def test_type_predicate_truth_table(
+        self, parts: list[str], selected: list[str], include_mixed: bool, expected: bool
+    ) -> None:
+        mask = post_type_mask(parts)
+        assert (
+            post_matches_type(mask, post_type_mask(selected), include_mixed=include_mixed)
+            is expected
+        )
+
+    def test_signature_is_order_insensitive_and_deduplicated(self) -> None:
+        forward = post_signature([("text", "aaa"), ("media", "bbb"), ("media", "ccc")])
+        backward = post_signature([("media", "ccc"), ("media", "bbb"), ("text", "aaa")])
+        assert forward == backward == "media:bbb|media:ccc|text:aaa"
+        assert post_signature([("media", "bbb"), ("media", "bbb")]) == "media:bbb"
+
+    def test_signature_is_none_when_it_cannot_be_computed(self) -> None:
+        assert post_signature([]) is None
+        assert post_signature([("text", None), ("media", None)]) is None
+
+    def test_signature_gives_up_when_too_long(self) -> None:
+        """超长留空 = 不折叠：宁可多显示一条，也绝不误折叠两份不同的内容。"""
+        huge = [("media", f"{index:064x}") for index in range(200)]
+        joined = "|".join(sorted(f"media:{digest}" for _kind, digest in huge))
+        assert len(joined) > POST_SIGNATURE_LIMIT
+        assert post_signature(huge) is None
+
+    @pytest.mark.parametrize(
+        ("item_types", "expected"),
+        [
+            (["text"], "文本"),
+            (["image", "image"], "图片x2"),
+            (["image", "text"], "图片+文本"),
+            (["text", "image", "image"], "文本+图片x2"),
+            (["text", "image", "text"], "文本+图片+文本"),
+            (["weird"], "weird"),
+        ],
+    )
+    def test_composition_label(self, item_types: list[str], expected: str) -> None:
+        assert post_composition_label(item_types) == expected
 
 
 class TestFilenameFromRef:

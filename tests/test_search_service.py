@@ -11,12 +11,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
 
 from pc.adapters.fts_search import MAX_PAGE_SIZE, SqliteFtsSearch
-from pc.domain import ITEM_TYPE_LABELS, search_extra_value, search_tokens
+from pc.domain import ITEM_TYPE_LABELS, normalize_text, search_extra_value, search_tokens
 from pc.services import search as svc
 from pc.services.search import SearchError, SearchQuery
 
@@ -103,6 +104,11 @@ def _seed_item(
             "INSERT INTO tag_assignment (content_id, tag_id, source) VALUES (?, ?, 'human')",
             (content_id, tag_id),
         )
+    from pc.adapters.sqlite import sync_post_rows
+
+    if text:
+        conn.execute("UPDATE content_item SET content_hash=? WHERE content_id=?", (hashlib.sha256(normalize_text(text).encode()).hexdigest(), content_id))
+    sync_post_rows(conn, message_ids=[message_id])
     return content_id
 
 
@@ -371,18 +377,16 @@ class TestTagPlanSelection:
 
     def test_small_tag_set_drives_the_query(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
         engine = SqliteFtsSearch(fresh_db)
-        driver, suffix, driver_params, suffix_params = engine._tag_driver([1, 2], limit=50)
-        assert driver is not None, "稀疏组合应当物化最小集合当驱动集"
+        driver, driver_params = engine._post_driver([1, 2], limit=50)
+        assert "CROSS JOIN" in driver, "稀疏组合应当物化最小集合当驱动集"
         assert len(driver_params) == 1
-        assert len(suffix_params) == len(suffix)
 
     def test_dense_tag_uses_the_time_index(self, fresh_db: Any, corpus: dict[str, Any]) -> None:
         """常见标签：沿时间索引扫几十行就凑满一页，不该花几万次回表。"""
         fresh_db.execute("UPDATE tag SET usage_count = 100000 WHERE tag_id = 1")
         engine = SqliteFtsSearch(fresh_db)
-        driver, suffix, driver_params, _suffix_params = engine._tag_driver([1], limit=50)
-        assert driver is None and driver_params == [], "高密度应当让时间索引驱动"
-        assert suffix
+        driver, driver_params = engine._post_driver([1], limit=50)
+        assert driver == "FROM post p" and driver_params == [], "高密度应当让时间索引驱动"
 
     def test_results_are_the_same_either_way(
         self, fresh_db: Any, corpus: dict[str, Any], monkeypatch: pytest.MonkeyPatch
@@ -714,7 +718,7 @@ class TestErrors:
 
 class TestBudgets:
     #: FTS5 内部会自己发一批 ``--`` 前缀的索引查询，PRAGMA 也是引擎自己的动作；
-    #: 语句计数只统计**应用发出的**语句（否则数出来的是 FTS5 的实现细节）。
+    #: 只统计应用发出的数据查询；事务边界单独验证，避免把读快照算作 N+1。
     @staticmethod
     def _count_own_statements(conn: Any, run: Any) -> list[str]:
         statements: list[str] = []
@@ -726,7 +730,7 @@ class TestBudgets:
         return [
             sql
             for sql in statements
-            if not sql.lstrip().startswith("--") and not sql.lstrip().upper().startswith("PRAGMA")
+            if sql.lstrip().upper().startswith(("SELECT", "WITH"))
         ]
 
     def test_assembly_is_not_n_plus_one(self, fresh_db: Any, corpus: dict[str, Any]) -> None:

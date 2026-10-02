@@ -24,7 +24,12 @@ from pc.adapters import sqlite as db
 from pc.adapters.local_storage import LocalStorageBackend
 from pc.adapters.magic_scan import MagicNumberScanner
 from pc.config import IngestLimits, JobSettings
-from pc.domain import MediaTooLargeError
+from pc.domain import (
+    MediaTooLargeError,
+    post_is_mixed,
+    post_signature,
+    post_type_mask,
+)
 from pc.services import ingest as ingest_service
 from pc.services import pipeline as pipeline_module
 from pc.services import sources as sources_service
@@ -104,6 +109,82 @@ def _seed(
         ),
     ).fetchone()[0]
     return int(message_id), int(job_id)
+
+
+class TestPostRows:
+    """帖行（派生表 ``post``，检索的结果单位）：构成摘要 + 整帖签名 + 归组。"""
+
+    def _parts(self, env: SimpleNamespace) -> dict[str, Any]:
+        return {
+            "text_hashes": [
+                row[0]
+                for row in env.conn.execute(
+                    "SELECT content_hash FROM content_item WHERE item_type = 'text'"
+                )
+            ],
+            "media_hashes": [row[0] for row in env.conn.execute("SELECT sha256 FROM media")],
+        }
+
+    def test_mixed_message_writes_one_post_row(self, env: SimpleNamespace) -> None:
+        source = _source(env.conn, env.tmp)
+        first = _write(env.tmp / "a.jpg", JPEG)
+        second = _write(env.tmp / "b.png", PNG)
+        _seed(
+            env.conn,
+            source_id=source["source_id"],
+            refs=(first, second),
+            text="两图一说明",
+            sent_at="2026-02-03T04:05:06.000Z",
+        )
+        env.worker.run_once()
+        post = dict(env.conn.execute("SELECT * FROM post").fetchone())
+        parts = self._parts(env)
+        assert post["part_count"] == 3
+        assert post["type_mask"] == post_type_mask(["text", "image"])
+        assert post_is_mixed(post["type_mask"]), "文本 + 图片 = 跨类型内容"
+        assert post["sent_at"] == "2026-02-03T04:05:06.000Z"
+        assert post["content_signature"] == post_signature(
+            [("text", parts["text_hashes"][0])]
+            + [("media", digest) for digest in parts["media_hashes"]]
+        )
+        assert post["canonical_post_id"] == post["message_id"], "第一条帖的代表就是它自己"
+
+    def test_images_only_post_is_not_mixed(self, env: SimpleNamespace) -> None:
+        source = _source(env.conn, env.tmp)
+        first = _write(env.tmp / "a.jpg", JPEG)
+        second = _write(env.tmp / "b.png", PNG)
+        _seed(env.conn, source_id=source["source_id"], refs=(first, second))
+        env.worker.run_once()
+        post = dict(env.conn.execute("SELECT * FROM post").fetchone())
+        assert post["part_count"] == 2
+        assert post["type_mask"] == post_type_mask(["image"])
+        assert not post_is_mixed(post["type_mask"]), "两张图是纯图片内容"
+
+    def test_same_signature_points_at_the_first_post(self, env: SimpleNamespace) -> None:
+        """整帖内容相同才折叠：代表是 message_id 较小的那条。"""
+        source = _source(env.conn, env.tmp)
+        _seed(env.conn, source_id=source["source_id"], text="同一段话", msg_id="m1")
+        _seed(env.conn, source_id=source["source_id"], text="同一段话", msg_id="m2")
+        env.worker.run_once()
+        rows = [
+            dict(row)
+            for row in env.conn.execute(
+                "SELECT message_id, content_signature, canonical_post_id, dup_group_id"
+                " FROM post ORDER BY message_id"
+            )
+        ]
+        assert len(rows) == 2
+        assert rows[0]["content_signature"] == rows[1]["content_signature"]
+        assert rows[0]["canonical_post_id"] == rows[0]["message_id"]
+        assert rows[1]["canonical_post_id"] == rows[0]["message_id"]
+
+    def test_message_without_parts_has_no_post_row(self, env: SimpleNamespace) -> None:
+        """空消息不产生内容项，也不该在结果里留一张空帖。"""
+        source = _source(env.conn, env.tmp)
+        _seed(env.conn, source_id=source["source_id"], text=None, refs=())
+        env.worker.run_once()
+        assert env.conn.execute("SELECT count(*) FROM content_item").fetchone()[0] == 0
+        assert env.conn.execute("SELECT count(*) FROM post").fetchone()[0] == 0
 
 
 def _write(path: Path, payload: bytes) -> str:

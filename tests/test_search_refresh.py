@@ -18,6 +18,7 @@ import uuid
 from typing import Any
 
 from pc.adapters import sqlite as db
+from pc.domain import post_signature, post_type_mask
 
 
 def _seed_source(conn: Any, name: str = "mine", platform: str = "local") -> int:
@@ -44,6 +45,7 @@ def _seed_item(
     refs: tuple[str, ...] = (),
     origin_note: str | None = None,
     sent_at: str | None = None,
+    content_hash: str | None = None,
 ) -> int:
     """直接写一条内容项；``text_search`` 默认留空，模拟升级前落库的老行。
 
@@ -70,14 +72,16 @@ def _seed_item(
     content_id = int(
         conn.execute(
             "INSERT INTO content_item "
-            "(uuid, message_id, item_type, ordinal, text_content, text_search, deleted_at) "
-            "VALUES (?, ?, ?, 0, ?, ?, ?) RETURNING content_id",
+            "(uuid, message_id, item_type, ordinal, text_content, text_search, content_hash,"
+            " deleted_at) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?) RETURNING content_id",
             (
                 str(uuid.uuid4()),
                 message_id,
                 item_type,
                 text,
                 text_search,
+                content_hash,
                 "2026-01-01T00:00:00.000Z" if deleted else None,
             ),
         ).fetchone()[0]
@@ -94,7 +98,42 @@ def _seed_item(
             "INSERT INTO tag_assignment (content_id, tag_id, source) VALUES (?, ?, 'human')",
             (content_id, tag_id),
         )
+    # 帖行：现代库（0007 之后）落库时会写，所以种子数据也写一份，否则"帖表过期"会把
+    # 这些测试里的每一项都算成待重算，掩盖它们真正要断言的列（分词/文件名/时间）。
+    _seed_post(
+        conn,
+        message_id=message_id,
+        item_types=(item_type,),
+        first_seen_at=conn.execute(
+            "SELECT first_seen_at FROM content_item WHERE content_id = ?", (content_id,)
+        ).fetchone()[0],
+        sent_at=sent_at,
+        deleted=deleted,
+    )
     return content_id
+
+
+def _seed_post(
+    conn: Any,
+    *,
+    message_id: int,
+    item_types: tuple[str, ...],
+    first_seen_at: str,
+    sent_at: str | None,
+    deleted: bool = False,
+) -> None:
+    """按落库路径的口径写一条帖行（构成摘要；签名由重算补，见 0007 的文件头）。"""
+    conn.execute(
+        "INSERT INTO post (message_id, part_count, type_mask, first_seen_at, sent_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            message_id,
+            0 if deleted else len(item_types),
+            post_type_mask(item_types),
+            first_seen_at,
+            sent_at,
+        ),
+    )
 
 
 def _match(conn: Any, table: str, term: str) -> int:
@@ -107,6 +146,108 @@ def _match(conn: Any, table: str, term: str) -> int:
 
 def _row(conn: Any, content_id: int) -> dict[str, Any]:
     return dict(conn.execute("SELECT * FROM content_item WHERE content_id = ?", (content_id,)).fetchone())
+
+
+def _post_row(conn: Any, message_id: int) -> dict[str, Any]:
+    return dict(
+        conn.execute("SELECT * FROM post WHERE message_id = ?", (message_id,)).fetchone()
+    )
+
+
+class TestPostSync:
+    """帖表（0007 的派生表）由重算对齐：构成摘要 + 签名 + 帖级归组。"""
+
+    def test_missing_post_row_is_created(self, fresh_db: Any) -> None:
+        """升级后的老库：有内容项、没有帖行 —— 重算要把它补上并算出签名。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(
+            fresh_db, source_id=source_id, text="蓝发精灵", content_hash="hash-blue"
+        )
+        fresh_db.execute("DELETE FROM post")
+        result = db.refresh_search_derived(fresh_db)
+        assert result["posts"] == 1
+        message_id = int(_row(fresh_db, content_id)["message_id"])
+        post = _post_row(fresh_db, message_id)
+        assert post["part_count"] == 1
+        assert post["type_mask"] == post_type_mask(["text"])
+        assert post["content_signature"] == post_signature([("text", "hash-blue")])
+        assert post["canonical_post_id"] == message_id
+
+    def test_drifted_composition_is_repaired(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(fresh_db, source_id=source_id, text="蓝发精灵")
+        message_id = int(_row(fresh_db, content_id)["message_id"])
+        fresh_db.execute(
+            "UPDATE post SET part_count = 9, type_mask = 0 WHERE message_id = ?", (message_id,)
+        )
+        assert db.refresh_search_derived(fresh_db)["posts"] == 1
+        post = _post_row(fresh_db, message_id)
+        assert (post["part_count"], post["type_mask"]) == (1, post_type_mask(["text"]))
+
+    def test_media_signature_comes_from_the_media_row(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(fresh_db, source_id=source_id, item_type="image", refs=("a.jpg",))
+        digest = "d" * 64
+        media_id = int(
+            fresh_db.execute(
+                "INSERT INTO media (uuid, sha256, size_bytes, object_key)"
+                " VALUES (?, ?, 10, 'aa/bb/x') RETURNING media_id",
+                (str(uuid.uuid4()), digest),
+            ).fetchone()[0]
+        )
+        fresh_db.execute(
+            "INSERT INTO content_media (content_id, media_id, role, ordinal)"
+            " VALUES (?, ?, 'primary', 0)",
+            (content_id, media_id),
+        )
+        fresh_db.execute("UPDATE post SET content_signature = NULL")
+        db.refresh_search_derived(fresh_db)
+        message_id = int(_row(fresh_db, content_id)["message_id"])
+        assert _post_row(fresh_db, message_id)["content_signature"] == post_signature(
+            [("media", digest)]
+        )
+
+    def test_same_signature_groups_to_the_smallest_message(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        first = _seed_item(
+            fresh_db, source_id=source_id, text="同一段话", msg_id="m1", content_hash="same"
+        )
+        second = _seed_item(
+            fresh_db, source_id=source_id, text="同一段话", msg_id="m2", content_hash="same"
+        )
+        first_message = int(_row(fresh_db, first)["message_id"])
+        second_message = int(_row(fresh_db, second)["message_id"])
+        assert first_message < second_message
+        db.refresh_search_derived(fresh_db)
+        assert _post_row(fresh_db, first_message)["canonical_post_id"] == first_message
+        assert _post_row(fresh_db, second_message)["canonical_post_id"] == first_message
+
+    def test_post_without_parts_is_removed(self, fresh_db: Any) -> None:
+        """部件全被软删/删掉的消息不该在帖表里留一张永远搜不到的空帖。"""
+        source_id = _seed_source(fresh_db)
+        content_id = _seed_item(fresh_db, source_id=source_id, text="蓝发精灵")
+        message_id = int(_row(fresh_db, content_id)["message_id"])
+        fresh_db.execute("DELETE FROM content_item WHERE content_id = ?", (content_id,))
+        result = db.refresh_search_derived(fresh_db)
+        assert result["posts_removed"] == 1
+        assert fresh_db.execute("SELECT count(*) FROM post").fetchone()[0] == 0
+        assert message_id > 0
+
+    def test_second_run_writes_nothing(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, text="蓝发精灵", content_hash="hash-blue")
+        first = db.refresh_search_derived(fresh_db)
+        second = db.refresh_search_derived(fresh_db)
+        assert first["posts"] == 1, "种子里签名是空的，第一次要把它算出来"
+        assert second["posts"] == 0 and second["posts_removed"] == 0
+
+    def test_stale_count_covers_a_missing_post_row(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, text="蓝发精灵")
+        db.refresh_search_derived(fresh_db)
+        assert db.stale_search_row_count(fresh_db) == 0
+        fresh_db.execute("DELETE FROM post")
+        assert db.stale_search_row_count(fresh_db) == 1, "缺帖行 = 该重算"
 
 
 class TestNameBackfill:
@@ -335,7 +476,14 @@ class TestRefresh:
 
     def test_empty_database_is_fine(self, fresh_db: Any) -> None:
         result = db.refresh_search_derived(fresh_db)
-        assert result == {"scanned": 0, "updated": 0, "named": 0, "total": 0}
+        assert result == {
+            "scanned": 0,
+            "updated": 0,
+            "named": 0,
+            "total": 0,
+            "posts": 0,
+            "posts_removed": 0,
+        }
 
     def test_soft_deleted_rows_are_refreshed_too(self, fresh_db: Any) -> None:
         """软删的行也要算——它可能被恢复，恢复后立刻可搜才不意外。"""

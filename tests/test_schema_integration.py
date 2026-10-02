@@ -12,13 +12,16 @@
 
 from __future__ import annotations
 
+import shutil
+import uuid
+from pathlib import Path
 from typing import Any
 
 from pc.adapters import sqlite as db
 
-#: 0001 建出的基础表数量。这里刻意写死数字：表清单一旦变化，必须有人来本文件
-#: 明确改一次，而不是让「多出来一张表」悄悄通过 inventory 断言。
-EXPECTED_TABLE_COUNT = 34
+#: 0001 建出的基础表数量 + 0007 的派生表 ``post``。这里刻意写死数字：表清单一旦变化，
+#: 必须有人来本文件明确改一次，而不是让「多出来一张表」悄悄通过 inventory 断言。
+EXPECTED_TABLE_COUNT = 35
 
 #: 迁移记账里记录的文件名（``Path.name``，含扩展名）。
 #: 形如 ``{version: name}``：新增迁移时在这里加一行，同时也是「有人确认过」的痕迹。
@@ -29,6 +32,9 @@ EXPECTED_MIGRATION_NAMES = {
     4: "0004_manual_source_and_origin_note.sql",
     5: "0005_search_names_and_time.sql",
     6: "0006_sent_at_on_content_item.sql",
+    7: "0007_post_table.sql",
+    8: "0008_search_visibility_indexes.sql",
+    9: "0009_message_visibility_index.sql",
 }
 
 
@@ -239,6 +245,9 @@ def test_content_hash_index_is_partial_but_not_unique(applied_schema: Any) -> No
         "content_hash 不能是唯一索引：同文本跨消息必须能共存（0002 迁移）"
     )
     assert "WHERE content_hash IS NOT NULL AND deleted_at IS NULL" in index_sql
+    indexes = _index_sqls(applied_schema, "content_item")
+    assert "(message_id, deleted_at, status, nsfw_level)" in indexes["content_item_visibility_idx"]
+    assert "(content_id, message_id, deleted_at, status, nsfw_level)" in indexes["content_item_lookup_idx"]
 
 
 def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
@@ -263,6 +272,94 @@ def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
     ), f"索引形状不符：{index_sql}"
     assert "message_sent_idx" not in _index_sqls(applied_schema, "message"), (
         "0006 之后 message_sent_idx 应当已被删除（没有查询用它，只拖慢写入）"
+    )
+    assert _index_sqls(applied_schema, "message")["message_visible_idx"] == (
+        "CREATE INDEX message_visible_idx ON message (message_id, source_id)"
+        " WHERE deleted_at IS NULL"
+    )
+
+
+def test_post_table_shape(applied_schema: Any) -> None:
+    """0007 的派生表：一帖一行，检索的结果单位（DESIGN §4.4、§5.1）。
+
+    它是**派生数据**：只放稳定的构成摘要，可见性实时判定；签名与帖级归组由重算补
+    （0007 的文件头写了为什么签名不能是 SQL 算的）。
+    """
+    sql = _object_sql(applied_schema, "post", "table")
+    assert "STRICT" in sql
+    assert "message_id INTEGER PRIMARY KEY" in sql
+    assert "CHECK (part_count >= 0)" in sql and "CHECK (type_mask >= 0)" in sql
+
+    indexes = _index_sqls(applied_schema, "post")
+    assert indexes["post_time_idx"] == (
+        "CREATE INDEX post_time_idx ON post (first_seen_at DESC, message_id DESC)"
+    )
+    assert indexes["post_sent_idx"] == (
+        "CREATE INDEX post_sent_idx ON post (sent_at DESC, message_id DESC)"
+        " WHERE sent_at IS NOT NULL"
+    )
+    assert "post_signature_idx" in indexes and "post_canonical_idx" in indexes
+
+
+def test_post_rows_are_backfilled_by_the_migration(tmp_path: Path) -> None:
+    """0007 必须在迁移里回填帖行：先建表不回填 = 升级之后**检索返回空**。
+
+    做法是先把库迁到 0006（老库的样子）、落一条"文本 + 两张图"的混合消息，再应用 0007。
+    同时钉住两件事：构成摘要当场就算对；**签名留空**（它只能在 Python 里算，缺失 = 不折叠，
+    是安全方向），等 `--recompute-derived` 补齐。
+    """
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    for version, name in EXPECTED_MIGRATION_NAMES.items():
+        if version >= 7:
+            continue
+        shutil.copyfile(db.DEFAULT_MIGRATIONS_DIR / name, migrations / name)
+
+    conn = db.connect(tmp_path / "old.sqlite3")
+    try:
+        db.apply_migration(conn, migrations)
+        message_id = int(
+            conn.execute(
+                "INSERT INTO message (uuid, source_id, platform_msg_id, message_type, text_raw,"
+                " sent_at) VALUES (?, ?, 'm-1', 'mixed', '配文', '2026-01-05T00:00:00.000Z')"
+                " RETURNING message_id",
+                (str(uuid.uuid4()), _seed_source(conn)),
+            ).fetchone()[0]
+        )
+        for ordinal, item_type in enumerate(("text", "image", "image")):
+            conn.execute(
+                "INSERT INTO content_item (uuid, message_id, item_type, ordinal, first_seen_at)"
+                " VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z')",
+                (str(uuid.uuid4()), message_id, item_type, ordinal),
+            )
+        conn.commit()
+
+        shutil.copyfile(
+            db.DEFAULT_MIGRATIONS_DIR / EXPECTED_MIGRATION_NAMES[7],
+            migrations / EXPECTED_MIGRATION_NAMES[7],
+        )
+        result = db.apply_migration(conn, migrations)
+        assert result["applied"] == [7]
+
+        row = dict(conn.execute("SELECT * FROM post").fetchone())
+        assert row["message_id"] == message_id
+        assert row["part_count"] == 3
+        assert row["type_mask"] == 1 | 2, "构成摘要要当场算好（文本 + 图片）"
+        assert row["first_seen_at"] == "2026-01-01T00:00:00.000Z"
+        assert row["sent_at"] == "2026-01-05T00:00:00.000Z"
+        assert row["content_signature"] is None, "签名只由 Python 侧的重算补"
+        assert row["canonical_post_id"] is None and row["dup_group_id"] is None
+    finally:
+        conn.close()
+
+
+def _seed_source(conn: Any) -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO source (uuid, name, platform, kind) VALUES (?, 'mine', 'local', 'export')"
+            " RETURNING source_id",
+            (str(uuid.uuid4()),),
+        ).fetchone()[0]
     )
 
 

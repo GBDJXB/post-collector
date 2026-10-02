@@ -50,6 +50,7 @@ from typing import Any
 from pc.domain import (
     ITEM_TYPE_LABELS,
     filename_from_ref,
+    post_signature,
     search_extra_value,
     search_tokens,
 )
@@ -86,9 +87,10 @@ PRAGMA_BASELINE: tuple[str, ...] = (
 #: 两个 FTS5 虚拟表（DESIGN §5.1）。它们由迁移脚本创建，索引可全量重建。
 FTS_VIRTUAL_TABLES: tuple[str, ...] = ("content_fts", "content_word")
 
-#: 0001 建出的 34 张基础表（含迁移记账表）。
-#: 与 PostgreSQL 版的 32 张相比：新增 ``content_media``（媒体与内容项的多对多）
-#: 与 ``hash_tombstone``（硬删后的哈希墓地），见 DESIGN §3.2、§3.8。
+#: 迁移建出的 35 张表（含迁移记账表）。
+#: 0001 建 34 张（与 PostgreSQL 版的 32 张相比：新增 ``content_media``（媒体与内容项
+#: 的多对多）与 ``hash_tombstone``（硬删后的哈希墓地）），0007 新增 ``post``
+#: （一帖一行的派生表，检索的结果单位，见 DESIGN §4.4/§5.1）。
 EXPECTED_TABLES: frozenset[str] = frozenset(
     {
         "account_identity",
@@ -107,6 +109,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "message",
         "model_version",
         "permission",
+        "post",
         "retention_policy",
         "retention_run",
         "review_task",
@@ -1270,9 +1273,9 @@ SEARCH_SOURCE_COLUMNS: tuple[str, ...] = ("text_content", "ocr_text", "caption",
 def stale_search_row_count(conn: sqlite3.Connection) -> int:
     """有多少行的检索派生数据是过期的（没有分词结果，或者补得出的文件名还没写）。
 
-    升级前落库的老行、改过分词规则之后的行、以及"入库时还没记文件名"的媒体行都会落在这里。
-    ``pc doctor`` 与 ``pc search``（0 结果时）用它提示"该跑一次派生列重算了"，而不是让人
-    对着空结果猜。
+    升级前落库的老行、改过分词规则之后的行、"入库时还没记文件名"的媒体行，以及
+    **构成没对齐的帖行**（0007 的派生表）都会落在这里。``pc doctor`` 与 ``pc search``
+    （0 结果时）用它提示"该跑一次派生列重算了"，而不是让人对着空结果猜。
 
     文件名那一项**只数补得出来的行**（该消息恰好一个媒体引用）：补不出来的行不该被反复
     提示"待重算"，那会变成永远为真的假告警。
@@ -1287,7 +1290,43 @@ def stale_search_row_count(conn: sqlite3.Connection) -> int:
         "   OR c.sent_at IS NOT m.sent_at"
         " )"
     ).fetchone()
-    return int(row[0]) if row else 0
+    stale_items = int(row[0]) if row else 0
+    return stale_items + _stale_post_count(conn)
+
+
+def _stale_post_count(conn: sqlite3.Connection) -> int:
+    """有多少帖的构成摘要与内容项对不上，或者干脆还没有帖行（0007 之后的老库）。
+
+    签名（``content_signature``）缺失**不算**新鲜度问题：它只能在 Python 里算（0007 的
+    文件头写了原因），而"没有签名 = 不折叠"是安全方向。所以这里只在"有摘要可算却还是
+    NULL"时才算一笔——那说明这条消息的部件确实变了或从没对齐过。
+    """
+    missing = conn.execute(
+        "SELECT count(*) FROM ("
+        "  SELECT DISTINCT c.message_id FROM content_item c"
+        "   WHERE c.deleted_at IS NULL"
+        "     AND c.message_id NOT IN (SELECT message_id FROM post))"
+    ).fetchone()
+    mismatched = conn.execute(
+        "SELECT count(*) FROM post p"
+        "  JOIN message m ON m.message_id = p.message_id"
+        "  JOIN (SELECT c.message_id, count(*) AS part_count,"
+        "               min(c.first_seen_at) AS first_seen_at,"
+        "               sum(DISTINCT CASE c.item_type"
+        "                     WHEN 'text' THEN 1 WHEN 'image' THEN 2 WHEN 'video' THEN 4"
+        "                     WHEN 'audio' THEN 8 WHEN 'link' THEN 16 WHEN 'sticker' THEN 32"
+        "                     WHEN 'file' THEN 64 ELSE 0 END) AS type_mask"
+        "          FROM content_item c WHERE c.deleted_at IS NULL"
+        "         GROUP BY c.message_id) g ON g.message_id = p.message_id"
+        " WHERE p.part_count <> g.part_count OR p.type_mask <> g.type_mask"
+        "    OR p.first_seen_at <> g.first_seen_at OR p.sent_at IS NOT m.sent_at"
+        "    OR (p.content_signature IS NULL AND EXISTS ("
+        "          SELECT 1 FROM content_item c WHERE c.message_id = p.message_id"
+        "           AND c.deleted_at IS NULL AND (c.content_hash IS NOT NULL"
+        "                OR EXISTS (SELECT 1 FROM content_media cm"
+        "                            WHERE cm.content_id = c.content_id))))"
+    ).fetchone()
+    return (int(missing[0]) if missing else 0) + (int(mismatched[0]) if mismatched else 0)
 
 
 def _backfill_original_name(row: Mapping[str, Any]) -> str | None:
@@ -1387,7 +1426,211 @@ def refresh_search_derived(
             updated += len(pending)
         if progress is not None:
             progress(scanned, total)
-    return {"scanned": scanned, "updated": updated, "named": named, "total": total}
+    posts = sync_post_rows(conn, message_ids=_message_ids_for(conn, wanted))
+    return {
+        "scanned": scanned,
+        "updated": updated,
+        "named": named,
+        "total": total,
+        "posts": posts["posts"],
+        "posts_removed": posts["removed"],
+    }
+
+
+def _message_ids_for(
+    conn: sqlite3.Connection, content_ids: Sequence[int] | None
+) -> list[int] | None:
+    """把"要重算的内容项"翻成"要重算的帖子"（单行更新走窄路径，别扫全表）。"""
+    if content_ids is None:
+        return None
+    if not content_ids:
+        return []
+    marks = ",".join("?" * len(content_ids))
+    rows = conn.execute(
+        f"SELECT DISTINCT message_id FROM content_item WHERE content_id IN ({marks})",
+        list(content_ids),
+    ).fetchall()
+    return sorted(int(row[0]) for row in rows)
+
+
+#: 帖行的构成摘要：口径必须与 ``pipeline._upsert_post`` 逐字一致，否则会来回改写。
+#: ``type_mask`` 用 ``sum(DISTINCT …)``：每个部件是一个 2 的幂，互不相同的幂相加才等于
+#: 按位或——直接 sum 会把"两张图"加成 2+2=4（撞上视频那一位），构成就错了。
+_POST_AGGREGATE_SELECT = (
+    "SELECT c.message_id,"
+    "       count(*) AS part_count,"
+    "       min(c.first_seen_at) AS first_seen_at,"
+    "       m.sent_at AS sent_at,"
+    "       sum(DISTINCT CASE c.item_type"
+    "             WHEN 'text' THEN 1 WHEN 'image' THEN 2 WHEN 'video' THEN 4"
+    "             WHEN 'audio' THEN 8 WHEN 'link' THEN 16 WHEN 'sticker' THEN 32"
+    "             WHEN 'file' THEN 64 ELSE 0 END) AS type_mask "
+    "  FROM content_item c"
+    "  JOIN message m ON m.message_id = c.message_id"
+    " WHERE c.deleted_at IS NULL"
+)
+
+#: 帖的部件摘要：文本项取 content_hash，媒体项取主媒体的 sha256（与 pipeline 同规则）
+_POST_PART_SELECT = (
+    "SELECT c.message_id, c.item_type, c.content_hash,"
+    "       (SELECT md.sha256 FROM content_media cm JOIN media md ON md.media_id = cm.media_id"
+    "         WHERE cm.content_id = c.content_id"
+    "         ORDER BY cm.ordinal, cm.media_id LIMIT 1) AS media_sha "
+    "  FROM content_item c"
+    " WHERE c.deleted_at IS NULL"
+)
+
+
+def sync_post_rows(
+    conn: sqlite3.Connection, *, message_ids: Sequence[int] | None = None
+) -> dict[str, int]:
+    """把 ``post`` 表与内容项对齐（检索的结果单位，见 migrations/0007 的文件头）。
+
+    ``message_ids=None`` 时全表对齐（``pc db reindex --recompute-derived``），给了就只对齐
+    这几帖（``SearchIndex.index()`` 的单行路径，别为一条内容项扫全表）。
+
+    幂等：算出来与现有值相同就不写；签名与帖级归组也在这里补齐——**签名只能在 Python 里算**
+    （SQLite 的 ``group_concat`` 不保证顺序，见 0007 的文件头），所以迁移只能回填构成摘要。
+
+    Returns:
+        ``{"posts": 写入或改动的帖数, "removed": 删掉的空帖数}``。
+    """
+    wanted = sorted(dict.fromkeys(int(item) for item in message_ids)) if message_ids is not None else None
+    if wanted == []:
+        return {"posts": 0, "removed": 0}
+
+    def _narrow(sql: str) -> tuple[str, list[Any]]:
+        if wanted is None:
+            return sql, []
+        marks = ",".join("?" * len(wanted))
+        return f"{sql} AND c.message_id IN ({marks})", list(wanted)
+
+    agg_sql, agg_params = _narrow(_POST_AGGREGATE_SELECT)
+    aggregates = {
+        int(row["message_id"]): row
+        for row in conn.execute(f"{agg_sql} GROUP BY c.message_id", agg_params).fetchall()
+    }
+    part_sql, part_params = _narrow(_POST_PART_SELECT)
+    digests: dict[int, list[tuple[str, str | None]]] = {}
+    for row in conn.execute(part_sql, part_params).fetchall():
+        message_id = int(row["message_id"])
+        if row["item_type"] == "text":
+            digests.setdefault(message_id, []).append(("text", row["content_hash"]))
+        else:
+            digests.setdefault(message_id, []).append(("media", row["media_sha"]))
+
+    existing = {
+        int(row["message_id"]): row
+        for row in conn.execute(
+            "SELECT message_id, part_count, type_mask, first_seen_at, sent_at,"
+            " content_signature, canonical_post_id, dup_group_id FROM post"
+            + (
+                ""
+                if wanted is None
+                else f" WHERE message_id IN ({','.join('?' * len(wanted))})"
+            ),
+            [] if wanted is None else list(wanted),
+        ).fetchall()
+    }
+
+    written: set[int] = set()
+    pending: list[tuple[Any, ...]] = []
+    touched_signatures: set[str] = set()
+    for message_id, row in aggregates.items():
+        signature = post_signature(digests.get(message_id, []))
+        values = (
+            int(row["part_count"]),
+            int(row["type_mask"]),
+            str(row["first_seen_at"]),
+            row["sent_at"],
+            signature,
+        )
+        # 代表帖要等所有签名算完才能定（同签名里 message_id 最小的那个），先记空值
+        current = existing.get(message_id)
+        if current is not None and (
+            int(current["part_count"]),
+            int(current["type_mask"]),
+            current["first_seen_at"],
+            current["sent_at"],
+            current["content_signature"],
+        ) == values:
+            if signature is not None:
+                touched_signatures.add(signature)
+            continue
+        if signature is not None:
+            touched_signatures.add(signature)
+        pending.append((message_id, *values))
+
+    written: set[int] = set()
+    if pending:
+        with transaction(conn):
+            for message_id, part_count, type_mask, first_seen_at, sent_at, signature in pending:
+                conn.execute(
+                    "INSERT INTO post (message_id, part_count, type_mask, first_seen_at, sent_at,"
+                    " content_signature, canonical_post_id, dup_group_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL) "
+                    "ON CONFLICT(message_id) DO UPDATE SET part_count = excluded.part_count,"
+                    " type_mask = excluded.type_mask, first_seen_at = excluded.first_seen_at,"
+                    " sent_at = excluded.sent_at, content_signature = excluded.content_signature,"
+                    " updated_at = ?",
+                    (message_id, part_count, type_mask, first_seen_at, sent_at, signature, now_iso()),
+                )
+                written.add(int(message_id))
+
+    # 帖级归组：同签名里 message_id 最小的当代表（自己也算在内，于是第一条帖的代表是自己）
+    regroup: list[tuple[int, int, int]] = []
+    if touched_signatures:
+        signatures = sorted(touched_signatures)
+        batch_size = min(500, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        for start in range(0, len(signatures), batch_size):
+            params = signatures[start:start + batch_size]
+            marks = ",".join("?" * len(params))
+            groups = {
+                str(row["content_signature"]): int(row["representative"])
+                for row in conn.execute(
+                    "SELECT content_signature, min(message_id) AS representative FROM post"
+                    f" WHERE content_signature IN ({marks}) GROUP BY content_signature",
+                    params,
+                ).fetchall()
+            }
+            for row in conn.execute(
+                "SELECT message_id, content_signature, canonical_post_id, dup_group_id FROM post"
+                f" WHERE content_signature IN ({marks})",
+                params,
+            ).fetchall():
+                representative = groups.get(str(row["content_signature"]))
+                if representative is None:
+                    continue
+                if (row["canonical_post_id"], row["dup_group_id"]) == (representative, representative):
+                    continue
+                regroup.append((representative, representative, int(row["message_id"])))
+        if regroup:
+            with transaction(conn):
+                for canonical, dup, message_id in regroup:
+                    conn.execute(
+                        "UPDATE post SET canonical_post_id = ?, dup_group_id = ?, updated_at = ?"
+                        " WHERE message_id = ?",
+                        (canonical, dup, now_iso(), message_id),
+                    )
+                    written.add(message_id)
+
+    # 部件全被软删（或硬删）的消息不该在结果里留一张空帖
+    with transaction(conn):
+        if wanted is None:
+            cursor = conn.execute(
+                "DELETE FROM post WHERE message_id NOT IN ("
+                "  SELECT DISTINCT message_id FROM content_item WHERE deleted_at IS NULL)"
+            )
+        else:
+            marks = ",".join("?" * len(wanted))
+            cursor = conn.execute(
+                f"DELETE FROM post WHERE message_id IN ({marks}) AND message_id NOT IN ("
+                "  SELECT DISTINCT message_id FROM content_item WHERE deleted_at IS NULL)",
+                list(wanted),
+            )
+        removed = max(0, int(cursor.rowcount or 0))
+    # 计数按**帖**去重：同一帖可能先补签名、再被归组改一次，报"改了 2 帖"会误导人
+    return {"posts": len(written), "removed": removed}
 
 
 #: 重算派生列时要读的字段（含标签名拼接、文件名回填与消息时间对齐所需的列）

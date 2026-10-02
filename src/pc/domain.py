@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
@@ -135,6 +135,101 @@ ITEM_TYPE_LABELS: Mapping[str, str] = MappingProxyType(
         "file": "文件",
     }
 )
+
+#: 检索结果单位是**帖子**（消息）时，"跨类型"这个构成取值的名字（DESIGN §5.1）。
+#: 它不是 content_item 的类型，只是 ``--type`` 的一个可选取值——所以不进
+#: ``ITEM_TYPE_LABELS``，否则按部件合成的 search_extra 里会混进一个永远不会出现的类型名。
+MIXED_TYPE = "mixed"
+
+#: ``--type`` 的允许取值：具体类型 + 跨类型。CLI 的 choices 与校验共用。
+TYPE_FILTER_CHOICES: tuple[str, ...] = (*ITEM_TYPES, MIXED_TYPE)
+
+#: 单帖最多返回多少个部件；超出时载荷里截断，``part_count`` 仍是真实值。
+POST_PARTS_LIMIT = 20
+
+#: 整帖去重签名的长度上限（字符）；超长则留空 = 不参与折叠。
+POST_SIGNATURE_LIMIT = 2000
+
+
+def post_type_mask(item_types: Iterable[str]) -> int:
+    """把类型集合翻成位图，位序就是 :data:`ITEM_TYPES` 的顺序。
+
+    帖子的构成用一个整数表达：单比特 = "纯内容"（构成全是这一种类型），多比特 = 跨类型。
+    这样"只看图片内容"就是一次等值比较，"跨类型"就是一次位运算，见 :func:`post_matches_type`。
+    """
+    wanted = set(item_types)
+    mask = 0
+    for index, name in enumerate(ITEM_TYPES):
+        if name in wanted:
+            mask |= 1 << index
+    return mask
+
+
+def post_is_mixed(mask: int) -> bool:
+    """构成是否跨类型：位图里不止一位（``mask & (mask - 1)`` 抹掉最低位后还非零）。"""
+    return mask & (mask - 1) != 0
+
+
+def post_matches_type(mask: int, bits: int, *, include_mixed: bool) -> bool:
+    """帖子的构成是否命中 ``--type`` 的选择（DESIGN §5.1 的三种口径）。
+
+    Args:
+        mask: 帖子的类型位图（:func:`post_type_mask` 的结果）。
+        bits: 所选类型的位图（多个 ``--type`` 取值取并集）。
+        include_mixed: 是否把"跨类型内容里含所选类型部件"的帖子也算进来
+            （``--include-mixed``）。注意它**不会**放进"视频 + 文本"这种不含所选类型的
+            跨类型内容——``--type`` 说的是"返回什么内容"，不是集合求并。
+
+    Examples:
+        >>> post_matches_type(post_type_mask(["image"]), post_type_mask(["image"]), include_mixed=False)
+        True
+        >>> post_matches_type(post_type_mask(["image", "text"]), post_type_mask(["image"]), include_mixed=False)
+        False
+        >>> post_matches_type(post_type_mask(["image", "text"]), post_type_mask(["image"]), include_mixed=True)
+        True
+        >>> post_matches_type(post_type_mask(["video", "text"]), post_type_mask(["image"]), include_mixed=True)
+        False
+    """
+    if post_is_mixed(mask):
+        return include_mixed and (mask & bits) != 0
+    return mask & bits != 0
+
+
+def post_signature(parts: Iterable[tuple[str, str | None]]) -> str | None:
+    """整帖去重签名：部件摘要去重、排序后拼接；没有摘要或超长则返回 ``None``。
+
+    ``parts`` 是 ``(kind, digest)`` 序列——文本项 ``("text", content_hash)``、
+    媒体项 ``("media", sha256)``。**拼接而不是哈希**：SQLite 没有 ``sha256()``，而这条
+    规则要在落库与批量重算两条路径上算出同一个串；排序让签名与部件的到达顺序无关。
+
+    ``None`` 的含义是"不参与折叠"：宁可多显示一条重复内容，也绝不误折叠两份不同的内容。
+    """
+    digests = sorted({f"{kind}:{digest}" for kind, digest in parts if digest})
+    if not digests:
+        return None
+    joined = "|".join(digests)
+    return joined if len(joined) <= POST_SIGNATURE_LIMIT else None
+
+
+def post_composition_label(item_types: Sequence[str]) -> str:
+    """把帖子的部件类型序列（按 ordinal）渲染成给人看的构成说明。
+
+    连续的同类型合并成 ``图片x2``，不同类型用 ``+`` 连接：``图片+文本``、``图片x2``；
+    单部件帖只显示一个类型名（与引入帖子概念之前的观感一致）。未知类型原样显示（不猜）。
+    """
+    labels: list[str] = []
+    counts: list[int] = []
+    for name in item_types:
+        label = ITEM_TYPE_LABELS.get(name, name)
+        if labels and labels[-1] == label:
+            counts[-1] += 1
+        else:
+            labels.append(label)
+            counts.append(1)
+    return "+".join(
+        label if count == 1 else f"{label}x{count}"
+        for label, count in zip(labels, counts, strict=True)
+    )
 
 
 class AiInvolvement(StrEnum):
@@ -324,6 +419,15 @@ class SourceNotAuthorizedError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def local_source_authorized(source: Mapping[str, Any], authorizations: Sequence[Mapping[str, Any]], moment: str) -> bool:
+    """本地采集与处理共用的授权闸门。"""
+    return bool(source.get("enabled", 1)) and not source.get("deleted_at") and any(
+        not row.get("revoked_at")
+        and (not row.get("expires_at") or str(row["expires_at"]) > moment)
+        for row in authorizations
+    )
+
+
 def normalize_text(text: str) -> str:
     """文本规范化：NFKC + 空白折叠 + 去首尾空白（DESIGN §4.2 的 normalize 步骤）。
 
@@ -507,7 +611,11 @@ __all__ = [
     "FILE_NAME_LIMIT",
     "ITEM_TYPES",
     "ITEM_TYPE_LABELS",
+    "MIXED_TYPE",
+    "POST_PARTS_LIMIT",
+    "POST_SIGNATURE_LIMIT",
     "SEARCH_EXTRA_TEXT_LIMIT",
+    "TYPE_FILTER_CHOICES",
     "AiInvolvement",
     "AuthzMode",
     "ClassificationResult",
@@ -530,7 +638,13 @@ __all__ = [
     "TagSource",
     "filename_from_ref",
     "is_cjk",
+    "local_source_authorized",
     "normalize_text",
+    "post_composition_label",
+    "post_is_mixed",
+    "post_matches_type",
+    "post_signature",
+    "post_type_mask",
     "search_extra_value",
     "search_tokens",
     "tokenize_document",

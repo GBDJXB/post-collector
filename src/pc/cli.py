@@ -431,10 +431,10 @@ def _doctor_database_section(root: Path) -> None:
 
 
 def _doctor_search_section(root: Path) -> None:
-    """doctor 的检索段：索引规模 + 有多少行的派生数据过期（没分词，或文件名还没补）。
+    """doctor 的检索段：索引规模 + 有多少行的派生数据过期。
 
-    "搜不到"最常见的两个原因就在这里：索引是空的（还没重建），或者派生列没算过
-    （升级前落库的老行）。两者都只报告，不改动任何东西，也不影响退出码。
+    "搜不到"最常见的两个原因就在这里：索引是空的（还没重建），或者派生数据没算过
+    （升级前落库的老行、没对齐的帖表）。两者都只报告，不改动任何东西，也不影响退出码。
     """
     from pc.adapters import sqlite as db
 
@@ -471,14 +471,14 @@ def _doctor_search_section(root: Path) -> None:
     print(f"  ✓ 索引 {counts_text}（有效内容 {items} 条）")
     if stale:
         print(
-            f"  · {stale} 条内容的检索派生数据过期（没分词，或文件名还没补上）："
+            f"  · {stale} 条内容的检索派生数据过期（没分词、文件名没补上，或帖表没对齐）："
             "跑 `pc db reindex --recompute-derived`"
             "（1~2 字的中文查询与按文件名的查询会搜不到它们）"
         )
     elif items and not any(counts.values()):
         print("  · 索引是空的：跑 `pc db reindex --recompute-derived` 重建")
     else:
-        print("  · 派生列已跟上，无需重算")
+        print("  · 派生数据已跟上，无需重算")
 
 
 def cmd_db_status(args: argparse.Namespace) -> int:
@@ -688,6 +688,10 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
                     f"  ✓ 派生列：扫描 {result['scanned']} 行，更新 {result['updated']} 行"
                     f"（其中补上文件名 {result['named']} 行；共 {result['total']} 行）"
                 )
+                print(
+                    f"  ✓ 帖表：对齐 {result['posts']} 帖"
+                    + (f"，清掉 {result['posts_removed']} 张空帖" if result["posts_removed"] else "")
+                )
             reindexed = db.reindex_fts(conn)
     except db.DatabaseError as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
@@ -834,7 +838,7 @@ SEARCH_HEADERS: tuple[str, ...] = (
 )
 SEARCH_MAX_WIDTHS: dict[str, int] = {
     "id": 8,
-    "类型": 8,  # item_type ∈ text/image/video/audio/link/sticker/file
+    "类型": 20,  # 可见部件的帖构成（例如 文本 + 图片）
     "来源": 16,
     "文件名": 32,  # basename；媒体项才有（文本项这一刀留空）
     "命中": 24,  # 命中的词，多个用空格隔开
@@ -980,7 +984,7 @@ def cmd_source_add(args: argparse.Namespace) -> int:
         return 2
 
     config: dict[str, Any] = {}
-    roots = [str(Path(item).expanduser()) for item in (args.roots or [])]
+    roots = [os.path.abspath(Path(item).expanduser()) for item in (args.roots or [])]
     if roots:
         config["roots"] = roots
 
@@ -1099,9 +1103,14 @@ def _ingest_loop(
     cursor: str | None = None
     scanned = 0
     while True:
+        previous = cursor
         messages, cursor = connector.list_new(cursor)
-        if not messages:
+        if cursor == previous:
+            if messages:
+                raise RuntimeError("连接器游标未推进，拒绝重复摄入")
             break
+        if not messages:
+            continue
         scanned += len(messages)
         if dry_run:
             report = report.merge(ingest_service.IngestReport(seen=len(messages)))
@@ -1130,7 +1139,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     if not _require_database(resolved):
         return 2
 
-    requested = [Path(item).expanduser() for item in args.paths]
+    requested = [Path(os.path.abspath(Path(item).expanduser())) for item in args.paths]
     missing = [str(item) for item in requested if not item.exists()]
     if missing:
         print(f"  ✗ 找不到这些路径：{'、'.join(missing)}", file=sys.stderr)
@@ -1173,6 +1182,8 @@ def cmd_import(args: argparse.Namespace) -> int:
         sources_service.SourceError,
         UnsupportedSourceKindError,
         SourceConfigError,
+        domain.SourceNotAuthorizedError,
+        RuntimeError,
     ) as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
@@ -1231,7 +1242,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
     if not _require_database(resolved):
         return 2
 
-    requested = [Path(item).expanduser() for item in args.paths]
+    requested = [Path(os.path.abspath(Path(item).expanduser())) for item in args.paths]
     missing = [str(item) for item in requested if not item.exists()]
     if missing:
         print(f"  ✗ 找不到这些路径：{'、'.join(missing)}", file=sys.stderr)
@@ -1304,6 +1315,8 @@ def cmd_upload(args: argparse.Namespace) -> int:
         sources_service.SourceError,
         UnsupportedSourceKindError,
         SourceConfigError,
+        domain.SourceNotAuthorizedError,
+        RuntimeError,
     ) as exc:
         print(f"  ✗ {exc}", file=sys.stderr)
         return 2
@@ -1535,8 +1548,8 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     table = [
         [
-            hit["content_id"],
-            hit["item_type"],
+            hit["message_id"],
+            hit["composition"],
             hit["source"],
             hit["original_name"] or "-",
             " ".join(hit["matched_terms"]) or "-",
@@ -1595,6 +1608,8 @@ def _media_summary(media: Mapping[str, Any]) -> str:
     """媒体项的描述：宽高与缩略图有无（缩略图本切片还不生成，只能如实说）。"""
     if not media or not media.get("count"):
         return "（空）"
+    if "width" not in media:
+        return f"媒体 x{media['count']}"
     size = f"{media['width']}x{media['height']}" if media.get("width") else "尺寸未知"
     thumb = "有缩略图" if media.get("thumb_key") else "无缩略图"
     return f"媒体 x{media['count']}（{size}，{thumb}）"
@@ -1804,7 +1819,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument(
         "--type",
         action="append",
-        choices=list(domain.ITEM_TYPES),
+        choices=list(domain.TYPE_FILTER_CHOICES),
         help="只看某种类型（可重复）",
     )
     p_search.add_argument(

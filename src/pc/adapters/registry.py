@@ -145,6 +145,10 @@ def _build(
             f"来源「{source.get('name')}」没有可用的目录：在 source.config 里写 "
             '{"roots": ["D:/导出/2024"]}，或在命令行把路径传给 pc import / pc upload。'
         )
+    if roots is None and any(not Path(item).expanduser().is_absolute() for item in resolved_roots):
+        raise SourceConfigError(
+            "来源保存了旧相对 roots，无法确定原始工作目录；请重新用 pc import / pc upload 指定绝对路径"
+        )
 
     options: dict[str, Any] = {}
     if batch_size is not None:

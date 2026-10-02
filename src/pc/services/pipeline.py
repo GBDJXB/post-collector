@@ -23,13 +23,14 @@ import os
 import platform as platform_module
 import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pc.adapters.magic_scan import MagicNumberScanner, declared_mime_for_name, item_type_for
 from pc.adapters.registry import SourceConfigError, UnsupportedSourceKindError, connector_for
+from pc.adapters.safe_files import UnsafeLocalPathError
 from pc.adapters.sqlite import now_iso, transaction
 from pc.config import IngestLimits, JobSettings
 from pc.domain import (
@@ -37,7 +38,10 @@ from pc.domain import (
     MediaTooLargeError,
     ObjectKey,
     filename_from_ref,
+    local_source_authorized,
     normalize_text,
+    post_signature,
+    post_type_mask,
     search_extra_value,
     search_tokens,
 )
@@ -178,15 +182,32 @@ class Worker:
     # -- 队列 ---------------------------------------------------------------
 
     def recover_stale(self) -> int:
-        """把 ``locked_at`` 超时的 ``running`` 任务重置为排队（DESIGN §2.3 崩溃恢复）。"""
+        """恢复超时 running：尚有次数则排队，耗尽则死信并审计。"""
         cutoff = _iso_minutes_ago(self._stale_minutes)
         with transaction(self._conn):
+            exhausted = self._conn.execute(
+                "SELECT * FROM job WHERE status = 'running' AND attempts >= max_attempts "
+                "AND (locked_at IS NULL OR locked_at < ?)", (cutoff,)
+            ).fetchall()
+            for row in exhausted:
+                moment = now_iso()
+                reason = "最后一次尝试时进程退出，超时恢复后次数已耗尽"
+                self._conn.execute(
+                    "UPDATE job SET status='dead', locked_by=NULL, locked_at=NULL, "
+                    "finished_at=?, updated_at=?, dead_reason=?, last_error=? WHERE job_id=?",
+                    (moment, moment, reason, reason, row["job_id"]),
+                )
+                self._conn.execute(
+                    "INSERT INTO audit_log(actor_type,action,target_type,target_id,after_state,result) "
+                    "VALUES ('system', ?, ?, ?, ?, 'dead')",
+                    (row["job_type"], row["target_type"], row["target_id"], json.dumps({"status":"dead", "note":reason})),
+                )
             cursor = self._conn.execute(
                 "UPDATE job SET status = 'queued', locked_by = NULL, locked_at = NULL, "
                 "updated_at = ? WHERE status = 'running' AND (locked_at IS NULL OR locked_at < ?)",
                 (now_iso(), cutoff),
             )
-        return int(cursor.rowcount or 0)
+        return int(cursor.rowcount or 0) + len(exhausted)
 
     def claim(self) -> dict[str, Any] | None:
         """原子抢占一条任务（``BEGIN IMMEDIATE`` + 选一条 + 标记，见 DESIGN §2.3）。
@@ -247,7 +268,7 @@ class Worker:
             # 成功也必须落账：只在异常分支写状态的话，任务会永远停在 running，
             # 而 running 不会被再次抢占——看起来"处理过了"，其实什么都没记下。
             return self._finalize(job, status, note)
-        except PermanentError as exc:
+        except (PermanentError, UnsafeLocalPathError) as exc:
             return self._finalize(job, "dead", str(exc))
         except MediaTooLargeError as exc:
             return self._finalize(job, "dead", str(exc))
@@ -328,6 +349,7 @@ class Worker:
         中途崩溃只会留下一个没人引用的对象（由对账任务处理），不会留下"有行没字节"的
         悬空引用。
         """
+        self._require_authorized(int(source["source_id"]))
         text_raw = message.get("text_raw") or ""
         text_normalized = normalize_text(text_raw) if text_raw.strip() else ""
         text_hash = (
@@ -335,6 +357,8 @@ class Worker:
         )
 
         refs = self._refs(message)
+        if text_hash and self._tombstoned(text_hash, alg="content_hash"):
+            raise PermanentError("文本命中哈希墓地，拒绝重新导入")
         blobs: list[MediaBlob] = []
         if refs:
             connector = connector_for(
@@ -400,11 +424,16 @@ class Worker:
             raise PermanentError("message.media_refs 必须是 JSON 数组")
         return tuple(str(item) for item in parsed)
 
-    def _tombstoned(self, digest: str) -> bool:
+    def _require_authorized(self, source_id: int) -> None:
+        source = self._load("source", source_id)
+        if source is None or not local_source_authorized(source, load_authorizations(self._conn, source_id), now_iso()):
+            raise PermanentError("来源停用、已删除或授权失效，拒绝处理")
+
+    def _tombstoned(self, digest: str, *, alg: str = "sha256") -> bool:
         row = self._conn.execute(
-            "SELECT 1 FROM hash_tombstone WHERE hash = ? AND alg = 'sha256' "
+            "SELECT 1 FROM hash_tombstone WHERE hash = ? AND alg = ? "
             "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
-            (digest, now_iso()),
+            (digest, alg, now_iso()),
         ).fetchone()
         return row is not None
 
@@ -438,6 +467,11 @@ class Worker:
             )
 
         with transaction(self._conn):
+            self._require_authorized(int(source["source_id"]))
+            if collected.text_hash and self._tombstoned(collected.text_hash, alg="content_hash"):
+                raise PermanentError("文本命中哈希墓地，拒绝重新导入")
+            if any(self._tombstoned(blob.sha256) for blob in collected.blobs):
+                raise PermanentError("媒体命中哈希墓地，拒绝重新导入")
             existing = self._conn.execute(
                 "SELECT count(*) FROM content_item WHERE message_id = ? AND deleted_at IS NULL",
                 (message_id,),
@@ -447,24 +481,88 @@ class Worker:
                 return "succeeded", f"已处理过（已有 {existing} 个内容项，跳过）"
 
             ordinal = 0
+            part_types: list[str] = []
+            part_digests: list[tuple[str, str | None]] = []
             if collected.text_raw is not None and collected.text_normalized is not None:
                 self._insert_text_item(
                     message_id, collected, shared_parts, origin_note, sent_at, ordinal, source
                 )
+                part_types.append("text")
+                part_digests.append(("text", collected.text_hash))
                 ordinal += 1
 
             for blob in collected.blobs:
                 _, is_quarantined = self._insert_media_item(
                     message_id, blob, shared_parts, origin_note, sent_at, ordinal, source
                 )
+                part_types.append(item_type_for(blob.mime_detected))
+                part_digests.append(("media", blob.sha256))
                 ordinal += 1
                 linked += 1
                 if is_quarantined:
                     quarantined += 1
 
+            # 帖行是检索的结果单位（migrations/0007 的文件头），与内容项同一个事务写：
+            # 两者不一致时，检索会给出"有帖无部件"或"有部件无帖"的错页。
+            self._upsert_post(
+                message_id, part_types=part_types, part_digests=part_digests, sent_at=sent_at
+            )
+
         return (
             "succeeded",
             f"内容项 {ordinal} 个（隔离 {quarantined} 个，媒体引用 {linked} 个）",
+        )
+
+    def _upsert_post(
+        self,
+        message_id: int,
+        *,
+        part_types: Sequence[str],
+        part_digests: Sequence[tuple[str, str | None]],
+        sent_at: str | None,
+    ) -> None:
+        """写这条消息的帖子行：构成摘要 + 整帖签名 + 帖级归组。
+
+        ``part_count``/``type_mask``/``first_seen_at`` 的口径必须与
+        ``adapters.sqlite.sync_post_rows``（批量重算）逐字一致，否则重算会把它们反复改写：
+        因此 ``first_seen_at`` 取的是**部件里最早的**那个，而不是"这次插入的时刻"。
+        """
+        if not part_types:
+            return  # 没有部件就没有帖子行（空消息不该在结果里出现）
+        signature = post_signature(part_digests)
+        first_seen_at = self._conn.execute(
+            "SELECT min(first_seen_at) FROM content_item WHERE message_id = ? AND deleted_at IS NULL",
+            (message_id,),
+        ).fetchone()[0]
+        # 帖级归组：同签名里 message_id 最小的当代表（把"自己"也算进去，这样第一条帖的
+        # 代表就是它自己，重算两次不会来回改）。签名缺失 = 不折叠（NULL）。
+        canonical: int | None = None
+        if signature is not None:
+            row = self._conn.execute(
+                "SELECT min(message_id) FROM post WHERE content_signature = ?", (signature,)
+            ).fetchone()
+            existing = int(row[0]) if row and row[0] is not None else message_id
+            canonical = min(message_id, existing)
+        self._conn.execute(
+            "INSERT INTO post (message_id, part_count, type_mask, first_seen_at, sent_at,"
+            " content_signature, canonical_post_id, dup_group_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(message_id) DO UPDATE SET part_count = excluded.part_count,"
+            " type_mask = excluded.type_mask, first_seen_at = excluded.first_seen_at,"
+            " sent_at = excluded.sent_at, content_signature = excluded.content_signature,"
+            " canonical_post_id = excluded.canonical_post_id,"
+            " dup_group_id = excluded.dup_group_id, updated_at = ?",
+            (
+                message_id,
+                len(part_types),
+                post_type_mask(part_types),
+                first_seen_at,
+                sent_at,
+                signature,
+                canonical,
+                canonical,
+                now_iso(),
+            ),
         )
 
     def _insert_text_item(

@@ -45,14 +45,21 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pc.adapters.safe_files import (
+    UnsafeLocalPathError,
+    _check_redirects,
+    absolute_path,
+    open_scoped,
+)
 from pc.adapters.sqlite import now_iso
-from pc.domain import MediaTooLargeError, SourceMessage, normalize_text
+from pc.domain import MediaTooLargeError, SourceMessage, local_source_authorized, normalize_text
 
 #: 视为"纯文本内容"的扩展名
 TEXT_SUFFIXES: frozenset[str] = frozenset({".txt", ".md", ".markdown"})
@@ -127,7 +134,9 @@ class LocalFilesConnector:
             )
         self._source = source
         self._authorizations = tuple(authorizations)
-        self._roots = tuple(Path(root).expanduser() for root in roots)
+        if any(not Path(root).expanduser().is_absolute() for root in roots):
+            raise UnsafeLocalPathError("旧相对来源目录无法确定原始位置；请将 roots 改为绝对路径后重新导入")
+        self._roots = tuple(absolute_path(root) for root in roots)
         self._batch_size = max(1, int(batch_size))
         self._max_media_bytes = int(max_media_bytes)
         self._max_text_chars = int(max_text_chars)
@@ -167,6 +176,11 @@ class LocalFilesConnector:
         for label, root in zip(self._root_labels, self._roots, strict=True):
             if not root.exists() or root.is_symlink():
                 continue
+            try:
+                _check_redirects(root)
+            except UnsafeLocalPathError as exc:
+                self._skipped.append((str(root), str(exc)))
+                continue
             if root.is_file():
                 candidates = [(root, Path(root.name))]
             else:
@@ -179,7 +193,11 @@ class LocalFilesConnector:
                 if path.is_symlink() or not path.is_file():
                     continue
                 try:
+                    _check_redirects(path)
                     stat = path.stat()
+                except UnsafeLocalPathError as exc:
+                    self._skipped.append((str(path), str(exc)))
+                    continue
                 except OSError:
                     # 扫描期间文件消失（正在被移动/删除）：跳过，不打断整批导入
                     continue
@@ -215,7 +233,15 @@ class LocalFilesConnector:
         if start >= len(files):
             return (), str(len(files))
         batch = files[start : start + self._batch_size]
-        messages = [message for item in batch if (message := self._to_message(item)) is not None]
+        messages = []
+        for item in batch:
+            try:
+                message = self._to_message(item)
+            except UnsafeLocalPathError as exc:
+                self._skipped.append((str(item.path), str(exc)))
+                continue
+            if message is not None:
+                messages.append(message)
         return tuple(messages), str(start + len(batch))
 
     @property
@@ -256,19 +282,7 @@ class LocalFilesConnector:
         判据来自**真实记录**（``source_authorization`` 行），不是"本地目录应该没问题吧"。
         凭证明细（``evidence_ref``）只作留档，不参与判断。
         """
-        if not self._source.get("enabled", 1):
-            return False
-        if self._source.get("deleted_at"):
-            return False
-        moment = now_iso()
-        for authorization in self._authorizations:
-            if authorization.get("revoked_at"):
-                continue
-            expires_at = authorization.get("expires_at")
-            if expires_at and str(expires_at) <= moment:
-                continue
-            return True
-        return False
+        return local_source_authorized(self._source, self._authorizations, now_iso())
 
     def rate_limit_hint(self) -> dict[str, Any]:
         return {
@@ -284,16 +298,16 @@ class LocalFilesConnector:
         先 ``stat`` 比对上限再读：把一个 2 GB 文件整个读进内存再判断"太大了"，
         等于让上限形同虚设（DESIGN §6.5 要求流式与字节上限）。
         """
-        path = Path(ref)
+        if not Path(ref).expanduser().is_absolute():
+            raise UnsafeLocalPathError("旧相对媒体引用无法确定原始目录；请重新用绝对路径导入")
+        path = absolute_path(ref)
         try:
-            size = path.stat().st_size
+            with open_scoped(path, self._roots) as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > self._max_media_bytes:
+                    raise MediaTooLargeError(ref, size, self._max_media_bytes)
+                data = handle.read(self._max_media_bytes + 1)
         except FileNotFoundError as exc:
-            raise KeyError(f"媒体文件不存在：{ref}") from exc
-        if size > self._max_media_bytes:
-            raise MediaTooLargeError(ref, size, self._max_media_bytes)
-        try:
-            data = path.read_bytes()
-        except FileNotFoundError as exc:  # pragma: no cover - stat 与 read 之间的竞态
             raise KeyError(f"媒体文件不存在：{ref}") from exc
         if len(data) > self._max_media_bytes:  # pragma: no cover - 读取期间被写大
             raise MediaTooLargeError(ref, len(data), self._max_media_bytes)
@@ -387,13 +401,13 @@ class LocalFilesConnector:
 
     def _hash_file(self, path: Path) -> str:
         """流式算文件字节的 sha256（带缓存，见 ``__init__`` 里的说明）。"""
-        stat = path.stat()
-        key = (str(path), stat.st_size, int(stat.st_mtime_ns))
-        cached = self._hash_cache.get(key)
-        if cached is not None:
-            return cached
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
+        with open_scoped(path, self._roots) as handle:
+            stat = os.fstat(handle.fileno())
+            key = (str(path), stat.st_size, int(stat.st_mtime_ns))
+            cached = self._hash_cache.get(key)
+            if cached is not None:
+                return cached
+            digest = hashlib.sha256()
             while chunk := handle.read(HASH_CHUNK_BYTES):
                 digest.update(chunk)
         value = digest.hexdigest()
@@ -414,8 +428,11 @@ class LocalFilesConnector:
         """读文本并截断到 ``ingest.max_text_chars``（按字节多读一点以容纳多字节字符）。"""
         limit_bytes = self._max_text_chars * 4
         try:
-            with path.open("rb") as handle:
+            with open_scoped(path, self._roots, sidecar=True) as handle:
                 raw = handle.read(limit_bytes)
+        except UnsafeLocalPathError as exc:
+            self._skipped.append((str(path), str(exc)))
+            return None
         except OSError:
             return None
         text = raw.decode("utf-8", errors="replace")

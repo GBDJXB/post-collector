@@ -82,15 +82,18 @@ class SearchIndex(Protocol):
             q: 用户输入的原始查询串（多个词用空格分开）。实现负责分词与转义，
                 **不接受**任何检索引擎的专有语法。
             filters: 结构化过滤器。阶段 1 认识这些键（缺失即不限制）：
-                ``content_ids``（候选集，供"候选内过滤"用）、``statuses``、
+                ``statuses``、
                 ``nsfw_max_level``、``item_types``、``source_id``、``tag_ids``、
-                ``since``/``until``（按 ``first_seen_at``）、``fold_duplicates``。
+                ``since``/``until``（按 ``time_field=ingest|sent``）、``fold_duplicates``。
+                类型过滤按可见部件构成：image 等是纯类型，mixed 是至少两种类型。
             sort: ``"relevance"`` 或 ``"time"``。
             page: 相关度排序下的页码（候选集内翻页）；时间序请用 ``cursor``。
             limit: 每页条数（上限 50，与 §5.6 的预算绑定）。
             cursor: 上次结果里的 ``next_cursor``，用于时间序的键集分页。
 
         Returns:
+            ``hits`` 每条代表一帖，带 ``message_id`` 与全部可见 ``parts``；
+            关键词和标签可以分别命中同帖的不同部件，整帖按签名折叠。
             至少含 ``hits`` 与 ``total``；阶段 1 的实现另外返回 ``candidates``、
             ``candidate_cap``、``has_more``、``next_cursor``、``incomplete``、
             ``timings``（各段耗时，见 §5.6 的 M6）。**每条 hit 必须能解释为什么出现**

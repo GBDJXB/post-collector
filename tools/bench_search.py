@@ -59,9 +59,28 @@ CJK_WORDS = (
 KANA_WORDS = "ミク カガミネ リン レン サクラ ユキ ツキ ホシ カゼ ハナ"
 LATIN_WORDS = "sunset portrait original fanart sketch commission oc digital watercolor"
 TAG_NAMES = [
-    "blue_hair", "silver_hair", "twintails", "long_hair", "short_hair", "cat_ears",
-    "glasses", "school_uniform", "kimono", "armor", "sword", "magic", "rain", "night",
-    "sunset", "city", "sky", "flower", "winter", "summer", "smile", "crying",
+    "blue_hair",
+    "silver_hair",
+    "twintails",
+    "long_hair",
+    "short_hair",
+    "cat_ears",
+    "glasses",
+    "school_uniform",
+    "kimono",
+    "armor",
+    "sword",
+    "magic",
+    "rain",
+    "night",
+    "sunset",
+    "city",
+    "sky",
+    "flower",
+    "winter",
+    "summer",
+    "smile",
+    "crying",
 ]
 SOURCE_NAMES = ["telegram-channel-a", "telegram-channel-b", "rss-feed", "local-export"]
 
@@ -235,6 +254,7 @@ def build_database(path: Path, scale: int, *, batch: int = 5000) -> dict[str, An
     for tag_id, count in tag_usage.items():
         conn.execute("UPDATE tag SET usage_count = ? WHERE tag_id = ?", (count, tag_id))
 
+    db.sync_post_rows(conn)
     finished = time.perf_counter()
     # 造完数据先把 WAL 合并回主库：不这么做，首轮读取要跨着一个几百 MB 的 WAL 找页，
     # 量出来的就不是"热缓存的查询耗时"而是"刚写完十万行的 WAL 有多厚"。
@@ -433,7 +453,9 @@ def measure_cold(path: Path, func: Callable[[sqlite3.Connection], int]) -> float
         conn.close()
 
 
-def measure_concurrent(path: Path, func: Callable[[sqlite3.Connection], int], readers: int) -> dict[str, Any]:
+def measure_concurrent(
+    path: Path, func: Callable[[sqlite3.Connection], int], readers: int
+) -> dict[str, Any]:
     """4 个并发读者各自持一条连接，重复查询。"""
     samples: list[float] = []
     lock = threading.Lock()
@@ -462,13 +484,18 @@ def measure_concurrent(path: Path, func: Callable[[sqlite3.Connection], int], re
         thread.join()
     if errors:
         return {"error": errors[0]}
-    return {"p50": statistics.median(samples), "p99": _percentile(samples, 99), "samples": len(samples)}
+    return {
+        "p50": statistics.median(samples),
+        "p99": _percentile(samples, 99),
+        "samples": len(samples),
+    }
 
 
 def measure_under_write(path: Path, func: Callable[[sqlite3.Connection], int]) -> dict[str, Any]:
     """后台写入同时发生：验证 WAL 下读不被写阻塞（§5.6 场景 8）。"""
     stop = threading.Event()
     writer_errors: list[str] = []
+    created_messages: list[int] = []
 
     def writer() -> None:
         try:
@@ -500,6 +527,7 @@ def measure_under_write(path: Path, func: Callable[[sqlite3.Connection], int]) -
                             (tag_id, message_id, offset),
                         )
                     conn.execute("COMMIT")
+                    created_messages.append(message_id)
             finally:
                 conn.close()
         except Exception as exc:
@@ -519,6 +547,24 @@ def measure_under_write(path: Path, func: Callable[[sqlite3.Connection], int]) -
         reader.close()
         stop.set()
         thread.join(timeout=5)
+        if thread.is_alive():
+            writer_errors.append("后台写者未按时停止")
+        elif created_messages:
+            # 只清理本次写者成功提交的消息，复测不能改变合成库规模。
+            with db.open_db(path, expect_exists=True) as cleanup, db.transaction(cleanup):
+                # canonical_id 自引用外键没有索引；临时覆盖避免删除时逐条扫描全库。
+                cleanup.execute("CREATE INDEX _pc_bench_cleanup_idx ON content_item(canonical_id)")
+                for start in range(0, len(created_messages), 500):
+                    ids = created_messages[start : start + 500]
+                    marks = ",".join("?" for _ in ids)
+                    cleanup.execute(
+                        "DELETE FROM tag_assignment WHERE content_id IN (SELECT content_id "
+                        f"FROM content_item WHERE message_id IN ({marks}))",
+                        ids,
+                    )
+                    cleanup.execute(f"DELETE FROM content_item WHERE message_id IN ({marks})", ids)
+                    cleanup.execute(f"DELETE FROM message WHERE message_id IN ({marks})", ids)
+                cleanup.execute("DROP INDEX _pc_bench_cleanup_idx")
     result = {
         "p50": statistics.median(samples),
         "p99": _percentile(samples, 99),
@@ -540,22 +586,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs", type=int, default=200, help="每个场景的采样次数（默认 200）")
     parser.add_argument("--readers", type=int, default=4, help="并发读者数（默认 4）")
     parser.add_argument("--path", help="合成库路径（默认临时目录，跑完删除）")
+    parser.add_argument("--reuse", action="store_true", help="复用 --path 指定的既有合成库，不重建")
     parser.add_argument("--keep", action="store_true", help="保留合成库以便排查")
     parser.add_argument("--assert", dest="check", action="store_true", help="超预算则退出码 1")
     args = parser.parse_args(argv)
 
     directory = Path(tempfile.mkdtemp(prefix="pc_bench_")) if not args.path else None
     path = Path(args.path) if args.path else directory / "pc_bench.sqlite3"  # type: ignore[operator]
-    if path.exists():
-        path.unlink()
-
-    print(f"[1/4] 造数据：{args.scale:,} 条内容 → {path}")
-    stats = build_database(path, args.scale)
-    print(
-        f"      迁移 {stats['migration_seconds']:.2f}s，写入 {stats['insert_seconds']:.2f}s"
-        f"（{args.scale / max(stats['insert_seconds'], 1e-6):,.0f} 条/秒），"
-        f"库 {stats['size_bytes'] / 1024 / 1024:.1f} MB"
-    )
+    if args.reuse:
+        if not args.path or not path.is_file():
+            parser.error("--reuse 必须配合 --path 指定已存在的合成库")
+        with db.open_db(path, expect_exists=True) as reused:
+            counts = {
+                name: reused.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+                for name in ("content_item", "tag_assignment", "content_media")
+            }
+            if counts["content_item"] != args.scale:
+                parser.error("合成库内容数量与 --scale 不符，拒绝复用")
+        stats = {"counts": counts}
+        print(f"[1/4] 复用合成库：{args.scale:,} 条内容，{path}")
+    else:
+        if path.exists():
+            path.unlink()
+        print(f"[1/4] 造数据：{args.scale:,} 条内容 → {path}")
+        stats = build_database(path, args.scale)
+        print(
+            f"      迁移 {stats['migration_seconds']:.2f}s，写入 {stats['insert_seconds']:.2f}s"
+            f"（{args.scale / max(stats['insert_seconds'], 1e-6):,.0f} 条/秒），"
+            f"库 {stats['size_bytes'] / 1024 / 1024:.1f} MB"
+        )
     print(
         f"      行数：content_item={stats['counts']['content_item']:,} "
         f"tag_assignment={stats['counts']['tag_assignment']:,} "
@@ -587,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         print("\n      耗时分解（关键词一页，M6：慢查询一眼看出是哪一段）")
-        for name in (SCENARIOS[1][0], SCENARIOS[2][0]):
+        for name, _func in SCENARIOS[1:3]:
             print(f"      {name:<34} {_breakdown(conn, name)}")
 
         print("\n[3/4] 冷启动首查（第 7 项，预热前，仅供对照 M4 是否值得做）")
@@ -605,6 +664,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"      {args.readers} 个并发读者（{concurrent['samples']} 次采样）"
                 f"：P50 {concurrent['p50']:.1f}ms，P99 {concurrent['p99']:.1f}ms"
             )
+            if concurrent["p50"] >= BUDGET_P50_MS or concurrent["p99"] >= BUDGET_P99_MS:
+                failures.append("并发读者超预算")
         under_write = measure_under_write(path, _query_plain_list)
         if "error" in under_write:
             print(f"      写入并发下读：失败（{under_write['error']}）")
@@ -616,6 +677,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             if "writer_error" in under_write:
                 print(f"      写者报错：{under_write['writer_error']}")
+                failures.append("后台写者失败")
+            if under_write["p50"] >= BUDGET_P50_MS or under_write["p99"] >= BUDGET_P99_MS:
+                failures.append("后台写入同时读超预算")
     finally:
         conn.close()
 

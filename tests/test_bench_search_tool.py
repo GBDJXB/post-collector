@@ -53,9 +53,7 @@ def test_synthetic_data_uses_the_production_tokenizer(bench: ModuleType) -> None
     assert "search_extra_value(" in source
 
 
-def test_synthetic_data_carries_names_and_message_times(
-    bench: ModuleType, tmp_path: Path
-) -> None:
+def test_synthetic_data_carries_names_and_message_times(bench: ModuleType, tmp_path: Path) -> None:
     """两个检索维度都要在合成数据里真实存在，否则新场景量的是一条退化路径。
 
     没有 ``message.sent_at`` 时"按消息时间排序"量的是全 NULL；没有 ``original_name``
@@ -82,3 +80,48 @@ def test_synthetic_data_carries_names_and_message_times(
     assert rows["with_sent_at"] > 0, "合成数据里必须有消息时间"
     assert rows["with_sent_at"] < rows["messages"], "也要留一部分空值（手工上传那种）"
     assert rows["named"] == rows["names_in_index"] == rows["messages"] > 0
+
+
+def test_reuse_preserves_existing_corpus(
+    bench: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "reuse.sqlite3"
+    bench.build_database(path, 30)
+
+    def refuse_rebuild(*args: object, **kwargs: object) -> None:
+        raise AssertionError("复用不能重建合成库")
+
+    monkeypatch.setattr(bench, "build_database", refuse_rebuild)
+    assert (
+        bench.main(["--reuse", "--path", str(path), "--scale", "30", "--runs", "1", "--assert"])
+        == 0
+    )
+    with bench.db.open_db(path, expect_exists=True) as conn:
+        assert conn.execute("SELECT count(*) FROM content_item").fetchone()[0] == 30
+
+
+def test_reuse_wrong_scale_does_not_replace_file(bench: ModuleType, tmp_path: Path) -> None:
+    path = tmp_path / "wrong-scale.sqlite3"
+    bench.build_database(path, 30)
+    original = path.read_bytes()
+    with pytest.raises(SystemExit) as error:
+        bench.main(["--reuse", "--path", str(path), "--scale", "31"])
+    assert error.value.code == 2
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("failed", ["readers", "writer_delay", "writer_error"])
+def test_concurrency_failure_fails_assertion(
+    bench: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: str
+) -> None:
+    path = tmp_path / "budget.sqlite3"
+    bench.build_database(path, 10)
+    monkeypatch.setattr(bench, "SCENARIOS", ())
+    healthy = {"p50": 1, "p99": 1, "samples": 1}
+    readers = {**healthy, "p50": 151} if failed == "readers" else healthy
+    writer = {**healthy, "p99": 501} if failed == "writer_delay" else dict(healthy)
+    if failed == "writer_error":
+        writer["writer_error"] = "write failed"
+    monkeypatch.setattr(bench, "measure_concurrent", lambda *_args: readers)
+    monkeypatch.setattr(bench, "measure_under_write", lambda *_args: writer)
+    assert bench.main(["--reuse", "--path", str(path), "--scale", "10", "--assert"]) == 1

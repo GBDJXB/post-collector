@@ -8,11 +8,20 @@ migrations/
 │   ├── 0001_init.sql                      ← 基线：34 张表 + 2 个 FTS5 虚拟表 + 6 个触发器
 │   ├── 0002_content_hash_not_unique.sql   ← 文本的精确重复改为"归组"语义（见下）
 │   ├── 0003_message_media_refs.sql        ← 媒体引用落进信封，消息才可重放
-│   └── 0004_manual_source_and_origin_note.sql  ← 重建两张表放宽 kind/mode 枚举 + 备注列
+│   ├── 0004_manual_source_and_origin_note.sql  ← 重建两张表放宽 kind/mode 枚举 + 备注列
+│   ├── 0005_search_names_and_time.sql     ← 文件名列 + 消息时间索引
+│   ├── 0006_sent_at_on_content_item.sql   ← 消息时间落到内容项，改单表索引（跨表 ORDER BY 用不上索引）
+│   ├── 0007_post_table.sql                ← post 派生表：一帖一行，检索的结果单位（第 35 张表）
+│   ├── 0008_search_visibility_indexes.sql ← 帖可见性与候选映射的覆盖索引，不改表结构
+│   ├── 0009_message_visibility_index.sql  ← 消息可见性与来源的部分索引，减少信封回读
 └── README.md                              本文件
 ```
 
 **整个目录按文件名序号顺序应用**，不是只应用某一个文件。
+
+**迁移里可以带数据语句**：0007 就是"建派生表 + 立刻回填"的例子。派生数据（帖行）不回填的话，
+升级之后检索会返回空——那是最糟的失败模式；而回填是确定性的纯计算，与建表在同一个事务里，
+失败整体回滚。业务数据的搬迁不在此列（那要单独设计）。
 
 ## 历史：PostgreSQL 版去哪了
 

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pc.adapters.sqlite import now_iso, transaction
-from pc.domain import SourceMessage
+from pc.domain import SourceMessage, SourceNotAuthorizedError, local_source_authorized
 
 #: 本层排的任务类型：一条消息一次处理（内部的取字节/扫描/哈希等步骤在同一任务里串行）
 JOB_TYPE_PROCESS = "ingest.process"
@@ -103,6 +103,10 @@ def ingest_messages(
     for start in range(0, len(messages), size):
         chunk = messages[start : start + size]
         with transaction(conn):
+            live = conn.execute("SELECT * FROM source WHERE source_id = ?", (source_id,)).fetchone()
+            authz = [dict(row) for row in conn.execute("SELECT * FROM source_authorization WHERE source_id = ?", (source_id,))]
+            if live is None or not local_source_authorized(dict(live), authz, now_iso()):
+                raise SourceNotAuthorizedError("来源停用、已删除或授权失效，拒绝摄入")
             for message in chunk:
                 report = report.merge(
                     _ingest_one(conn, source_id, trust_value, message, note)
