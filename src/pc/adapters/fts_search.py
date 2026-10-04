@@ -34,6 +34,7 @@ from typing import Any
 
 from pc.adapters import sqlite as db
 from pc.adapters.post_search import PostSearch
+from pc.adapters.tag_normalizer import effective_assignment
 from pc.domain import is_cjk, normalize_text, tokenize_document, tokenize_query
 
 __all__ = [
@@ -172,6 +173,16 @@ class SqliteFtsSearch(PostSearch):
         """
         db.refresh_search_derived(self._conn, content_ids=[int(doc_id)])
 
+    def index_many(self, doc_ids: Sequence[int]) -> None:
+        """批量刷新标签索引，参与调用方事务；独立调用时自建事务。"""
+        if not doc_ids:
+            return
+        if self._conn.in_transaction:
+            db.refresh_tag_search(self._conn, doc_ids)
+        else:
+            with db.transaction(self._conn):
+                db.refresh_tag_search(self._conn, doc_ids)
+
     def delete(self, doc_id: int) -> None:
         """有意为之的空操作。
 
@@ -207,7 +218,7 @@ class SqliteFtsSearch(PostSearch):
         for row in self._conn.execute(
             "SELECT ta.content_id, t.name, t.namespace, ta.confidence, ta.source"
             "  FROM tag_assignment ta JOIN tag t ON t.tag_id = ta.tag_id"
-            f" WHERE ta.content_id IN ({marks}) AND ta.revoked_at IS NULL"
+            f" WHERE ta.content_id IN ({marks}) AND {effective_assignment()}"
             " ORDER BY t.namespace, t.name",
             list(ids),
         ).fetchall():

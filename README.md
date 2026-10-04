@@ -5,7 +5,7 @@ description: "post-collector 使用手册：安装、文件导入、检索、配
 
 # post-collector
 
-自托管的内容采集与检索工具，用于归档自己拥有或已获授权的图文内容。当前通过命令行完成本地文件导入、扫描、去重、存储和检索，数据保存为 SQLite 文件与本地媒体文件。
+自托管的内容采集与检索工具，用于归档自己拥有或已获授权的图文内容。当前通过命令行完成本地文件导入、扫描、去重、存储、人工打标、检索和内容查看，数据保存为 SQLite 文件与本地媒体文件。
 
 ## 当前能力
 
@@ -14,11 +14,13 @@ description: "post-collector 使用手册：安装、文件导入、检索、配
 | 官方导出目录导入、手工上传、来源授权校验 | 可用 |
 | 魔数扫描、字节限额、隔离存储、SHA-256 去重 | 可用 |
 | 关键词与来源、标签、类型、时间过滤，整帖展示与翻页 | 可用 |
+| root 人工标签、别名、建议确认与 JSON 表格管道 | 可用 |
+| 正文与详情 JSON、Windows 默认程序打开、文件定位与复制 | 可用 |
 | 数据库迁移、结构校验、备份、索引重建 | 可用 |
 | 配置校验、设置项播种、生效值与来源查询 | 可用 |
 | 健康检查与运行模式接口 | 可用 |
 
-当前操作入口为 CLI。打标、Web 界面、平台连接器、缩略图、内容删除与自动容量管理按 [DESIGN.md §9](DESIGN.md#9-实施路线图) 交付。
+当前操作入口为 CLI。模型打标、敏感度分类、Web 界面、平台连接器、缩略图、内容删除与自动容量管理按 [DESIGN.md §9](DESIGN.md#9-实施路线图) 交付。
 
 ## 准备环境
 
@@ -139,6 +141,71 @@ JSON 的每条 `hits` 使用 `message_id` 标识帖，`parts` 保存部件的 `c
 
 关键词查询返回候选数，候选预算为 500/2000 帖；带标签时预算为 2000，相关度页凑齐后可提前结束读取。`incomplete` 表示候选被截断。纯过滤列表的总数口径为 `exact`、`at_least`（上限 5000）或标签用量 `estimate`。`has_more` 表示下一页是否还有结果。
 
+## 人工标签与结果展示
+
+本地 CLI 由操作系统权限保护，按 root 操作入口使用。先用 `pc search` 查看帖 ID，或用 `pc item list --json` 查看 `message_id` 和部件 `content_id`。
+
+```powershell
+# 给整帖的未删除部件打标；名称由自己定义
+uv run pc tag add --message 123 --tag "旅行记录" --tag "待整理"
+# 精确标注一个部件；namespace 默认 general
+uv run pc tag add --content 456 --tag "自选角色名称" --namespace character
+uv run pc tag show --message 123
+uv run pc tag list
+uv run pc tag remove --message 123 --tag "待整理"
+
+uv run pc tag alias add --tag "旅行记录" --alias "旅记"
+uv run pc tag alias list --tag "旅行记录"
+uv run pc search --tag "旅记"
+uv run pc tag alias remove --alias "旅记"
+```
+
+`--message` 与 `--content` 互斥，均可重复；`--tag` 可重复。人工输入立即生效，撤销操作只撤销人工关联，重新添加复用关联 ID。标签目录的 `usage_count` 按具有有效关联的不同内容项计数，作为检索估计值；它与可见帖数可能不同。标签名称经过 NFKC、大小写与空白/下划线统一，规范名与别名共享唯一解析规则。
+
+`tag list` 返回标签目录；`tag show` 返回目标内容上的关联，包括来源、置信度、证据和撤销时间。建议关联先保存，root 用 `pc tag confirm <assign_id> ...` 确认或用 `pc tag reject <assign_id> ...` 拒绝；确认后进入检索和统计。当前人工组件支持普通标签，敏感度分类和模型 API 接入见 DESIGN §4.7。
+
+常用查询直接显示表格，也可将完整 JSON 交给独立渲染命令：
+
+```powershell
+uv run pc search "旅记"
+uv run pc search "旅记" --json | uv run pc render table
+uv run pc tag list --json | uv run pc render table
+uv run pc tag show --message 123 --json | uv run pc render table
+```
+
+两种表格入口复用相同渲染函数，按中文显示宽度省略长字段，窄终端优先显示 ID 和主要内容。重定向使用 120 格宽度；JSON 保留完整值。JSON 模式的 stdout 只输出数据，诊断进入 stderr。CLI JSON 将非 ASCII 字符写为 Unicode 转义，解析后保留完整中文与 emoji；Windows PowerShell 5.1 默认管道可直接使用上述命令。
+
+查询结果带 `result_version: 1` 与 `result_type`：检索为 `search`/`hits`，标签目录为 `tags`/`tags`，关联为 `assignments`/`assignments`，别名为 `aliases`/`aliases`。渲染命令读取一个 JSON 对象，支持上述类型；无效输入返回非零状态。前端按这些业务字段渲染，跨页排序通过查询参数执行。
+
+## 查看与复制内容
+
+先用 `pc search` 或 `pc item list` 获取消息 ID；查看单个部件时使用其 `content_id`。`--message` 与 `--content` 互斥，每次选择一个目标。
+
+```powershell
+uv run pc show --message 123
+uv run pc show --content 456 --json
+uv run pc show --message 123 --copy
+uv run pc open --message 123
+uv run pc open --content 456 --copy
+uv run pc reveal --message 123
+```
+
+| 内容 | `show` | `open` | `reveal` | `--copy` |
+| --- | --- | --- | --- | --- |
+| 纯文本 | 正文 | 默认程序打开 TXT | 文件管理器选中 TXT | 复制正文 |
+| 图片 | 当前返回能力不可用错误 | 默认程序打开各图片 | 选中全部图片文件 | 复制文件列表 |
+| 图文混合 | 当前返回能力不可用错误 | 默认浏览器打开本地 HTML | 选中 HTML，目录内包含正文与图片 | 返回错误，保持无副作用 |
+
+`open`、`reveal` 与 `--copy` 当前支持 Windows；纯文本 `show` 和详情 JSON 使用 Python 核心。终端图片的验证记录见 [DESIGN.md §5.1](DESIGN.md#51-阶段-1bm25--倒排--过滤sqlite-fts5)。
+
+查看范围为消息与部件未软删、部件 active 且 NSFW 等级为 0 的内容，按部件顺序处理。图片部件带说明正文时按混合内容处理。文本和图片以外的类型返回错误。`show --json` 支持完整详情查询，返回 `result_type: content`、`result_version: 1`、`message_id` 与有序 `parts`；它与 `--copy` 互斥，保持只读。`pc render table` 继续用于检索与标签结果。
+
+图片复制采用文件管理器复制文件的格式。多张图片一次复制为文件列表；实际粘贴方式由接收应用决定。复制在打开或定位前完成；后续系统操作失败时，错误信息会注明复制已完成。纯文本多部件以空行连接；终端过滤控制字符，TXT、JSON 与剪贴板保留正文。
+
+查看副本位于 `<data_root>/view-cache/<message_id>/<内容指纹>/`，命令输出其目录。图片按已确认的 MIME 补充扩展名，支持 JPEG、PNG、GIF、WebP、AVIF 与 HEIC；混合 HTML 支持其中的前五种格式。HTML 按部件顺序展示正文与本地图片，正文保留换行。
+
+查看副本独立于归档原件，编辑副本后再次查看会重新校验并修复。每次操作重新检查目标可见性及媒体字节；单文件使用现有媒体限额，本次媒体总量上限为 256 MiB。缓存供命令退出后粘贴使用，当前手动清理：完成粘贴并关闭查看程序后，可在文件管理器删除 `view-cache` 下对应消息目录，后续查看会重新生成。删除归档或处理隐私清理时，也应清除对应查看副本；缓存属于可重建数据。
+
 ## 数据与配置
 
 库文件为 `<data_root>/pc.sqlite3`。默认数据根目录：
@@ -149,7 +216,7 @@ JSON 的每条 `hits` 使用 `message_id` 标识帖，`parts` 保存部件的 `c
 | Linux | `$XDG_DATA_HOME/post-collector`，缺省 `~/.local/share/post-collector` |
 | macOS | `~/Library/Application Support/post-collector` |
 
-数据根包含 `media/`、`thumbs/`、`cold/`、`quarantine/`、`backup/` 和 `models/`；当前实际内容主要在库文件、媒体与隔离目录中。
+数据根包含 `media/`、`thumbs/`、`cold/`、`quarantine/`、`backup/`、`models/` 和 `view-cache/`；当前实际内容主要在库文件、媒体与隔离目录中。
 
 | 配置 | 作用 |
 | --- | --- |

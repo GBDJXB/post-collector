@@ -62,6 +62,10 @@ class SearchIndex(Protocol):
         """
         ...
 
+    def index_many(self, doc_ids: Sequence[int]) -> None:
+        """批量刷新标签派生列，参与调用方事务；空集合保持只读。"""
+        ...
+
     def delete(self, doc_id: int) -> None:
         """删除一个检索文档；FTS5 实现下是**有意为之的空操作**（见类文档）。"""
         ...

@@ -150,7 +150,7 @@ class TestPrintTable:
     def test_total_width_is_bounded(self, capsys: pytest.CaptureFixture[str]) -> None:
         cli._print_table(
             cli.ITEM_LIST_HEADERS,
-            [(1, "image", "quarantined", "中" * 50, "中" * 200, "suspicious", 3, "中" * 50, "2026-01-01T00:00:00.000Z")],
+            [(1, 1, "image", "quarantined", "中" * 50, "中" * 200, "suspicious", 3, "中" * 50, "2026-01-01T00:00:00.000Z")],
             max_widths=cli.ITEM_LIST_MAX_WIDTHS,
         )
         bound = 2 + sum(cli.ITEM_LIST_MAX_WIDTHS.values()) + 2 * (len(cli.ITEM_LIST_HEADERS) - 1)
@@ -225,7 +225,7 @@ class TestDeclarations:
         stamp = "2026-09-30T23:49:54.845Z"
         cli._print_table(
             cli.ITEM_LIST_HEADERS,
-            [(1, "image", "quarantined", "manual", "媒体 dfbc8a7da8c6…（8.8 MB）", "suspicious", 1, "某个群里的", stamp)],
+            [(1, 1, "image", "quarantined", "manual", "媒体 dfbc8a7da8c6…（8.8 MB）", "suspicious", 1, "某个群里的", stamp)],
             max_widths=cli.ITEM_LIST_MAX_WIDTHS,
         )
         out = capsys.readouterr().out

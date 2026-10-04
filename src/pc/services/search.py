@@ -34,6 +34,8 @@ from pc.adapters.fts_search import (
     SqliteFtsSearch,
 )
 from pc.adapters.sqlite import read_settings, stale_search_row_count
+from pc.adapters.tag_normalizer import SqliteTagNormalizer
+from pc.domain import TagNamespace
 from pc.services.sources import get_source, list_sources
 
 __all__ = [
@@ -194,6 +196,7 @@ def run_search(
         key: value for key, value in filters.items() if value not in (None, (), False)
     }
     result["filters_applied"]["fold_duplicates"] = filters["fold_duplicates"]
+    result.update(result_type="search", result_version=1)
     return result
 
 
@@ -210,12 +213,14 @@ def _resolve_tags(conn: Any, refs: Sequence[str]) -> list[int]:
     """把 ``name`` 或 ``namespace:name`` 解析成 tag_id；查不到时给近似建议。"""
     ids: list[int] = []
     for ref in refs:
-        namespace, _, name = ref.rpartition(":")
-        rows = conn.execute(
-            "SELECT tag_id, name, namespace FROM tag WHERE name_norm = ?"
-            + (" AND namespace = ?" if namespace else ""),
-            (name if namespace else ref, namespace) if namespace else (ref,),
-        ).fetchall()
+        namespace, separator, name = ref.partition(":")
+        if not separator or namespace not in {n.value for n in TagNamespace}:
+            namespace, name = "", ref
+        try:
+            row = SqliteTagNormalizer(conn).resolve(name if namespace else ref, namespace or None)
+        except ValueError as exc:
+            raise SearchError(str(exc)) from exc
+        rows = [row] if row is not None else []
         if not rows:
             known = [row[0] for row in conn.execute("SELECT name FROM tag ORDER BY name")]
             near = get_close_matches(name or ref, known, n=3, cutoff=0.6)

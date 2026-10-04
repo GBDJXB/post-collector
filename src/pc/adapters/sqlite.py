@@ -47,6 +47,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from pc.adapters.tag_normalizer import effective_assignment
 from pc.domain import (
     ITEM_TYPE_LABELS,
     filename_from_ref,
@@ -1378,7 +1379,7 @@ def refresh_search_derived(
     本函数幂等：算出来的值与现有值相同就不写（比较后再决定），重复跑只花读的时间。
     """
     size = max(1, int(batch_size))
-    wanted = list(dict.fromkeys(int(item) for item in content_ids)) if content_ids else None
+    wanted = list(dict.fromkeys(int(item) for item in content_ids)) if content_ids is not None else None
     total = (
         len(wanted)
         if wanted is not None
@@ -1394,17 +1395,7 @@ def refresh_search_derived(
             scanned += 1
             name = _backfill_original_name(row)
             sent_at = row["message_sent_at"]
-            extra = search_extra_value(
-                row["source_name"],
-                row["platform"],
-                row["sender_display_name"],
-                row["item_type"],
-                ITEM_TYPE_LABELS.get(str(row["item_type"])),
-                name,
-                row["tag_names"],
-                row["origin_note"],
-            )
-            tokens = search_tokens(row["text_content"], row["ocr_text"], row["caption"], extra)
+            tokens, extra = _derived_search_values(row)
             if (
                 tokens == row["text_search"]
                 and extra == row["search_extra"]
@@ -1639,13 +1630,39 @@ _SEARCH_DERIVED_SELECT = (
     "       c.search_extra, c.original_name, c.sent_at, c.item_type, s.name AS source_name,"
     "       s.platform, m.sender_display_name, m.origin_note, m.media_refs,"
     "       m.sent_at AS message_sent_at,"
-    "       (SELECT group_concat(t.name, ' ') FROM tag_assignment ta"
-    "          JOIN tag t ON t.tag_id = ta.tag_id"
-    "         WHERE ta.content_id = c.content_id AND ta.revoked_at IS NULL) AS tag_names "
+    "       (SELECT group_concat(label, ' ') FROM ("
+    "          SELECT t.name AS label FROM tag_assignment ta JOIN tag t USING(tag_id)"
+    f"          WHERE ta.content_id=c.content_id AND {effective_assignment()}"
+    "          UNION SELECT ts.alias FROM tag_assignment ta JOIN tag t USING(tag_id)"
+    "          JOIN tag_synonym ts USING(tag_id) WHERE ta.content_id=c.content_id"
+    f"          AND {effective_assignment()} ORDER BY label)) AS tag_names "
     "  FROM content_item c"
     "  JOIN message m ON m.message_id = c.message_id"
     "  JOIN source s ON s.source_id = m.source_id"
 )
+
+
+def refresh_tag_search(conn: sqlite3.Connection, content_ids: Sequence[int]) -> None:
+    """在调用方事务内批量更新标签派生列；帖构成与签名保持原值。"""
+    if not conn.in_transaction:
+        raise DatabaseError("标签索引更新需要调用方写事务")
+    wanted = sorted(set(content_ids))
+    for rows in _derived_batches(conn, wanted=wanted, size=500):
+        for row in rows:
+            tokens, extra = _derived_search_values(row)
+            if tokens != row["text_search"] or extra != row["search_extra"]:
+                conn.execute("UPDATE content_item SET text_search=?,search_extra=?,updated_at=? "
+                             "WHERE content_id=?", (tokens, extra, now_iso(), row["content_id"]))
+
+
+def _derived_search_values(row: sqlite3.Row) -> tuple[str | None, str]:
+    """维护重算与标签刷新共用的派生字段规则。"""
+    extra = search_extra_value(
+        row["source_name"], row["platform"], row["sender_display_name"], row["item_type"],
+        ITEM_TYPE_LABELS.get(str(row["item_type"])), _backfill_original_name(row),
+        row["tag_names"], row["origin_note"],
+    )
+    return search_tokens(row["text_content"], row["ocr_text"], row["caption"], extra), extra
 
 
 def _derived_batches(

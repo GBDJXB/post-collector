@@ -1,8 +1,7 @@
 """命令行入口（``pc``）。
 
-设计目标（DESIGN §6.2.3、§6.2.4）：让不懂技术的人**不需要碰 docker 命令、不需要读
-堆栈**就能知道「现在是什么状态、下一步该做什么」；同时让开发者能回答
-「这个值为什么是这样」。
+设计目标（DESIGN §6.2.3、§6.2.4）：报告当前状态与可执行的下一步，
+提供配置来源解释；查询可输出完整 JSON 或终端表格。
 
 本模块**只依赖标准库**：在还没执行 ``uv sync`` 的环境里，``pc doctor``
 也应当能跑起来并告诉你缺了什么。数据库相关子命令才按需 import adapters 层。
@@ -25,13 +24,51 @@ import os
 import platform
 import sys
 import time
-import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from pc import __version__, domain
 from pc.adapters.fts_search import TIME_FIELD_INGEST, TIME_FIELDS
+from pc.presentation import (
+    ELLIPSIS as ELLIPSIS,
+)
+from pc.presentation import (
+    ITEM_LIST_HEADERS as ITEM_LIST_HEADERS,
+)
+from pc.presentation import (
+    ITEM_LIST_MAX_WIDTHS as ITEM_LIST_MAX_WIDTHS,
+)
+from pc.presentation import (
+    SEARCH_HEADERS as SEARCH_HEADERS,
+)
+from pc.presentation import (
+    SEARCH_MAX_WIDTHS as SEARCH_MAX_WIDTHS,
+)
+from pc.presentation import (
+    SOURCE_LIST_HEADERS as SOURCE_LIST_HEADERS,
+)
+from pc.presentation import (
+    SOURCE_LIST_MAX_WIDTHS as SOURCE_LIST_MAX_WIDTHS,
+)
+from pc.presentation import (
+    _display_width as _display_width,
+)
+from pc.presentation import (
+    _pad_display as _pad_display,
+)
+from pc.presentation import (
+    _prepare_row as _prepare_row,
+)
+from pc.presentation import (
+    _print_table as _print_table,
+)
+from pc.presentation import (
+    _truncate_display as _truncate_display,
+)
+from pc.presentation import (
+    render_result,
+)
 
 #: 关键文件清单：doctor 逐项检查存在性
 _EXPECTED_FILES: tuple[str, ...] = (
@@ -194,7 +231,7 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     if args.json:
         payload = snap.as_dict()
         payload["settings"] = {key: payload["settings"][key] for key in keys}
-        print(config_mod.dump_json(payload))
+        print(cfg_dump_json(payload))
         return 0
 
     print(f"设置项生效值（优先级 env > db > yaml > default），共 {len(keys)} 项")
@@ -794,183 +831,6 @@ def _build_worker(conn: Any, paths: Any, root: Path, *, worker_id: str | None = 
 
 #: 截断标记。刻意只用一个字符；如果哪个终端把 `…` 渲染成 2 格（歧义宽度按 CJK 习惯
 #: 渲染），把它换成 "..." 即可——其余代码不用动。
-ELLIPSIS = "…"
-
-#: 不占格的 Unicode 类别：Mn/Me 是组合记号与变体选择符，Cf 是零宽连接符与零宽空格
-_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
-
-#: `pc item list` 的表头与列宽上限（显示格）。**每一列都必须有上限**：
-#: tests/test_cli_table.py 有一条断言盯着，新增列却忘了给上限会直接红。
-ITEM_LIST_HEADERS: tuple[str, ...] = (
-    "id",
-    "类型",
-    "状态",
-    "来源",
-    "内容",
-    "扫描",
-    "媒体",
-    "备注",
-    "建库时间",
-)
-ITEM_LIST_MAX_WIDTHS: dict[str, int] = {
-    "id": 8,  # content_id 增长很慢
-    "类型": 8,  # item_type ∈ text/image/video/audio/file
-    "状态": 12,  # content_item.status 最长 quarantined（11）
-    "来源": 16,  # 用户命名；默认来源 manual 只有 6
-    "内容": 36,  # 文本摘要或媒体摘要；中文下 36 格＝18 个字
-    "扫描": 12,  # media.scan_status ∈ clean/suspicious
-    "媒体": 6,  # 媒体引用计数
-    "备注": 24,  # 来源备注（人写的自由文本）
-    "建库时间": 24,  # ISO-8601 UTC 毫秒固定 24 格，永不截断
-}
-
-#: `pc search` 的表头与列宽上限
-SEARCH_HEADERS: tuple[str, ...] = (
-    "id",
-    "类型",
-    "来源",
-    "文件名",
-    "命中",
-    "内容",
-    "标签",
-    "备注",
-    "时间",
-)
-SEARCH_MAX_WIDTHS: dict[str, int] = {
-    "id": 8,
-    "类型": 20,  # 可见部件的帖构成（例如 文本 + 图片）
-    "来源": 16,
-    "文件名": 32,  # basename；媒体项才有（文本项这一刀留空）
-    "命中": 24,  # 命中的词，多个用空格隔开
-    "内容": 40,  # 命中片段（带 [] 标记）或正文摘要
-    "标签": 20,  # 标签名列表（置信度与来源在 --json 里）
-    "备注": 20,  # 来源备注（人写的自由文本）
-    "时间": 24,  # ISO-8601 UTC 毫秒固定 24 格
-}
-
-#: `pc source list` 的表头与列宽上限
-SOURCE_LIST_HEADERS: tuple[str, ...] = (
-    "id",
-    "名称",
-    "平台",
-    "kind",
-    "信任",
-    "状态",
-    "授权",
-    "方式",
-    "软删",
-)
-SOURCE_LIST_MAX_WIDTHS: dict[str, int] = {
-    "id": 8,
-    "名称": 20,
-    "平台": 12,
-    "kind": 10,  # bot_api/webhook/rss/export/user_api/manual
-    "信任": 4,
-    "状态": 6,  # 启用 / 停用
-    "授权": 20,  # 最长"授权已撤销或已过期"（18 格）
-    "方式": 24,  # 两个授权方式拼接：manual_export、root_self 恰好 24 格
-    "软删": 24,  # ISO-8601 UTC 毫秒，或 "-"
-}
-
-
-def _display_width(text: str) -> int:
-    """这个字符串在终端里占几格。
-
-    - East Asian **W**（汉字、假名、谚文）与 **F**（全角）算 2 格；
-    - **Mn / Me**（组合记号、变体选择符）与 **Cf**（零宽连接符、零宽空格）算 0 格；
-      注意 ``unicodedata.combining()`` 靠不住——U+FE0F 这类变体选择符的规范组合类是 0，
-      但仍然不占格，所以按**类别**判断；
-    - 其余算 1 格，**包括歧义宽度 ``A``**（``…``、``·``、``—``、``“``）。
-
-    歧义宽度按 1 处理是唯一一处主观判断，选择与 ``wcwidth`` / ``rich`` 的默认一致：
-    如果某个终端把 `…` 渲染成 2 格，那么所有 Python 表格工具都会同样错位，所以更可能
-    是 1 格。中文正文是 ``W``（无歧义），不受这个判断影响。
-    """
-    total = 0
-    for char in text:
-        if unicodedata.category(char) in _ZERO_WIDTH_CATEGORIES:
-            continue
-        total += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-    return total
-
-
-def _truncate_display(text: str, limit: int) -> str:
-    """按**显示宽度**截断到 ``limit`` 格，超出的部分换成 ``ELLIPSIS``。
-
-    宽度是逐字符累加的，所以宽字符**不会被切成两半**（放不下就整字符停下）。
-    代价是截断点可能落在一个组合序列中间（``e`` + 组合重音会只剩 ``e``），这是可接受
-    的显示瑕疵，不值得为此引入字素簇库。
-    """
-    if limit < 2:
-        raise ValueError(f"列宽上限至少要有 2 格，收到 {limit}")
-    if _display_width(text) <= limit:
-        return text
-    budget = limit - _display_width(ELLIPSIS)
-    kept: list[str] = []
-    used = 0
-    for char in text:
-        width = _display_width(char)
-        if used + width > budget:
-            break
-        kept.append(char)
-        used += width
-    return "".join(kept) + ELLIPSIS
-
-
-def _pad_display(text: str, width: int) -> str:
-    """按显示宽度右侧补空格到 ``width`` 格（已经超宽时原样返回，不截断）。"""
-    return text + " " * max(0, width - _display_width(text))
-
-
-def _flatten_cell(cell: Any) -> str:
-    """单元格 → 单行字符串：``None`` 当空串，控制字符（换行、制表符）换成空格。
-
-    换行必须在排版前处理掉，否则一个多行备注会把整张表撕成两半。
-    """
-    if cell is None:
-        return ""
-    text = str(cell)
-    return "".join(" " if unicodedata.category(char) == "Cc" else char for char in text)
-
-
-def _prepare_row(row: Sequence[Any], headers: Sequence[str], limits: Mapping[str, int]) -> list[str]:
-    """按表头取单元格、拍平成单行、按列上限截断。行比表头短则补空，长则忽略多余的。"""
-    prepared: list[str] = []
-    for index, header in enumerate(headers):
-        text = _flatten_cell(row[index] if index < len(row) else None)
-        limit = limits.get(header)
-        prepared.append(_truncate_display(text, limit) if limit else text)
-    return prepared
-
-
-def _print_table(
-    headers: Sequence[str],
-    rows: Sequence[Sequence[Any]],
-    *,
-    max_widths: Mapping[str, int] | None = None,
-) -> None:
-    """等宽列打印；不用第三方表格库，免得为了排版多一个依赖。
-
-    ``max_widths`` 按**列名**给每列的上限（显示格）：列顺序调整了也不会错配，漏给某列
-    则那一列无上限。单元格先按上限截断、再算列宽，因此无论内容多长，行宽都有确定上界。
-
-    **保留行尾填充**（不做 rstrip）：补到定宽之后，"每行显示宽度严格相等"就是列对齐的
-    等价判据，测试可以直接断言整行宽度，而不必按列切分字符串。
-    """
-    limits = dict(max_widths or {})
-    cells = [_prepare_row(row, headers, limits) for row in rows]
-
-    widths: list[int] = []
-    for index, header in enumerate(headers):
-        column = [cells[row][index] for row in range(len(cells))] or [header]
-        natural = max(_display_width(item) for item in [header, *column])
-        limit = limits.get(header)
-        widths.append(min(limit, natural) if limit else natural)
-
-    print("  " + "  ".join(_pad_display(header, widths[i]) for i, header in enumerate(headers)))
-    print("  " + "  ".join("-" * width for width in widths))
-    for row in cells:
-        print("  " + "  ".join(_pad_display(cell, widths[i]) for i, cell in enumerate(row)))
 
 
 def cmd_source_add(args: argparse.Namespace) -> int:
@@ -1404,7 +1264,7 @@ def cmd_item_list(args: argparse.Namespace) -> int:
         return 0
 
     sql = [
-        "SELECT c.content_id, c.item_type, c.status, s.name AS source, c.ordinal,",
+        "SELECT c.content_id, c.message_id, c.item_type, c.status, s.name AS source, c.ordinal,",
         "       c.byte_size, c.char_count, c.text_content, m.origin_note,",
         "       (SELECT count(*) FROM content_media cm WHERE cm.content_id = c.content_id) AS media_count,",
         "       (SELECT m.sha256 FROM content_media cm JOIN media m ON m.media_id = cm.media_id",
@@ -1451,6 +1311,7 @@ def cmd_item_list(args: argparse.Namespace) -> int:
         table.append(
             [
                 row["content_id"],
+                row["message_id"],
                 row["item_type"],
                 row["status"],
                 row["source"],
@@ -1480,6 +1341,9 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     resolved, _ = _db_and_paths(args)
     if not resolved.path.is_file():
+        if args.json:
+            print("数据库尚未建立，请先运行 pc db apply", file=sys.stderr)
+            return 2
         print(f"  · 还没有数据库文件（{resolved.path}）；建库并导入之后这里就能搜到东西。")
         return 0
 
@@ -1530,109 +1394,13 @@ def cmd_search(args: argparse.Namespace) -> int:
         stale = search_svc.stale_derived_count(conn) if not result["hits"] else 0
 
     if registry_note:
-        print(f"  · 设置项注册表不可用（{registry_note}），每页条数按默认值兜底。")
+        print(f"  · 设置项注册表不可用（{registry_note}），每页条数按默认值兜底。", file=sys.stderr)
     if args.json:
         print(cfg_dump_json(result))
         return 0
-    if not result["hits"]:
-        print("  · 没有匹配的内容。")
-        if stale:
-            print(
-                f"    注意：{stale} 条内容有可检索文本却还没有分词结果（老数据），"
-                "跑 `pc db reindex --recompute-derived` 之后再来搜。"
-            )
-        print("    小提示：1~2 字的中文查询走词级索引，3 字以上走子串索引；换个数试试。")
-        print("    也可以试试文件名或它的扩展名（壁纸、jpg）、类型（图片/image），")
-        print("    或者你上传时用 --note 写的备注（见 `pc item list` 的备注列）。")
-        return 0
-
-    table = [
-        [
-            hit["message_id"],
-            hit["composition"],
-            hit["source"],
-            hit["original_name"] or "-",
-            " ".join(hit["matched_terms"]) or "-",
-            hit["snippet"] or _short_text(hit["text"]) or _media_summary(hit["media"]),
-            " ".join(tag["name"] for tag in hit["tags"]) or "-",
-            hit["origin_note"] or "-",
-            # 「时间」列显示**当前所选字段**的值：按消息时间搜时，显示入库时间会让人对不上
-            (hit["sent_at"] if result.get("time_field") == "sent" else hit["first_seen_at"]) or "-",
-        ]
-        for hit in result["hits"]
-    ]
-    _print_table(SEARCH_HEADERS, table, max_widths=SEARCH_MAX_WIDTHS)
-    if result["total"] is not None:
-        shown = len(result["hits"])
-        kind = result.get("total_kind") or "exact"
-        if kind == "exact":
-            head = f"  共 {result['total']} 条命中"
-        elif kind == "at_least":
-            head = (
-                f"  至少 {result['total']} 条命中（超过 {result['total']} 条就不再数下去，"
-                "精确总数对翻页没有用；§5.6 M1b）"
-            )
-        else:
-            head = f"  约 {result['total']} 条命中（按标签用量估算，不是精确计数）"
-        print(f"{head}，上面显示 {shown} 条（每页上限 {search_svc.MAX_PAGE_SIZE}）")
-    else:
-        order_text = "时间倒序" if result["sort"] == "time" else "相关度排序"
-        print(
-            f"  候选 {result['candidates']} 条（{order_text}；关键词检索不统计精确总数，"
-            f"这是第 {result.get('page', 1)} 页）"
-        )
-        if result["incomplete"]:
-            print("  注意：候选已扫完仍未凑满一页，结果可能不完整（放宽条件或换更常见的词）。")
-    if result["next_cursor"]:
-        print(f"  下一页：pc search … --cursor {result['next_cursor']}")
-    elif result["has_more"] and result["total"] is None:
-        print(f"  下一页：pc search … --page {int(result.get('page', 1)) + 1}")
-    if result.get("time_field") == "sent":
-        print(
-            "  时间用的是「收到消息时间」（sent_at；「时间」列与排序都按它）。"
-            "手工上传的内容 sent_at 为空，会被时间范围排除、排在最后。"
-        )
-    _print_search_timings(result["timings"], show=args.timings)
-    return 0
-
-
-def _short_text(text: Any, limit: int = 60) -> str:
-    """没有命中片段时给一行正文摘要（表格自己还会按显示宽度截断）。"""
-    if not text:
-        return ""
-    flat = " ".join(str(text).split())
-    return flat[:limit] + ("…" if len(flat) > limit else "")
-
-
-def _media_summary(media: Mapping[str, Any]) -> str:
-    """媒体项的描述：宽高与缩略图有无（缩略图本切片还不生成，只能如实说）。"""
-    if not media or not media.get("count"):
-        return "（空）"
-    if "width" not in media:
-        return f"媒体 x{media['count']}"
-    size = f"{media['width']}x{media['height']}" if media.get("width") else "尺寸未知"
-    thumb = "有缩略图" if media.get("thumb_key") else "无缩略图"
-    return f"媒体 x{media['count']}（{size}，{thumb}）"
-
-
-def _print_search_timings(timings: Mapping[str, float], *, show: bool) -> None:
-    """打印各段耗时（DESIGN §5.6 M6）。
-
-    ``--timings`` 时逐段列出；总耗时超过 200 ms 时无论有没有这个开关都提示一行——
-    慢查询不该只在"你恰好加了参数"的时候才被发现。
-    """
-    if show:
-        parts = "  ".join(
-            f"{stage}={timings[stage]:.1f}ms"
-            for stage in ("candidates", "filter", "count", "main", "tags", "media", "total")
-            if stage in timings
-        )
-        print(f"  耗时：{parts}")
-    if timings.get("total", 0) > 200:
-        print(
-            f"  · 慢查询：这一段用了 {timings['total']:.0f} ms"
-            "（预算 P99 < 500 ms，见 DESIGN §5.6）"
-        )
+    if stale:
+        print(f"  {stale} 条内容还没有分词结果，请重算：pc db reindex --recompute-derived", file=sys.stderr)
+    return render_result(result, timings=args.timings)
 
 
 def _human_size(size: Any) -> str:
@@ -1647,16 +1415,145 @@ def _human_size(size: Any) -> str:
     return f"{value:.1f} GB"  # pragma: no cover - 上一步已覆盖
 
 
-def cfg_dump_json(payload: Any) -> str:
-    from pc import config as cfg
+def cfg_dump_json(payload: Any, *, ensure_ascii: bool = True) -> str:
+    """CLI JSON 用 Unicode 转义保留完整值，兼容 ASCII 原生命令管道。"""
+    import json
 
-    return cfg.dump_json(payload)
+    return json.dumps(payload, ensure_ascii=ensure_ascii, indent=2, default=str)
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    """从 stdin 读取查询结果，复用直接输出的表格渲染。"""
+    import json
+
+    try:
+        raw = (sys.stdin.buffer.read().decode("utf-8-sig")
+               if hasattr(sys.stdin, "buffer") else sys.stdin.read().lstrip("\ufeff"))
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("输入须为结果对象")
+        return render_result(payload)
+    except (ValueError, TypeError, KeyError) as exc:
+        print(f"渲染失败：{exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_tag(args: argparse.Namespace) -> int:
+    """CLI 负责人工候选输入和输出；标签写入由共用服务执行。"""
+    import sqlite3
+
+    from pc.adapters import sqlite as db
+    from pc.services import tagging
+
+    resolved, _ = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            operation = args.tag_command
+            targets = {"message_ids": getattr(args, "message", None) or (),
+                       "content_ids": getattr(args, "content", None) or ()}
+            if operation == "add":
+                output = tagging.apply_classification(
+                    conn, tagging.manual_result(args.tag, args.namespace), **targets)
+            elif operation == "remove":
+                output = tagging.remove_tags(conn, args.tag, **targets)
+            elif operation == "show":
+                output = tagging.show_tags(conn, **targets)
+            elif operation == "list":
+                output = tagging.list_tags(conn)
+            elif operation in {"confirm", "reject"}:
+                output = tagging.review_suggestions(conn, args.ids, confirm=operation == "confirm")
+            elif args.alias_command == "list":
+                output = tagging.list_aliases(conn, args.tag)
+            else:
+                output = tagging.change_alias(conn, args.alias, name=getattr(args, "tag", None))
+        if args.json:
+            print(cfg_dump_json(output))
+        elif "result_type" in output:
+            render_result(output)
+        else:
+            print(f"  标签操作完成：{cfg_dump_json(output, ensure_ascii=False)}")
+        return 0
+    except (ValueError, sqlite3.Error, db.DatabaseError) as exc:
+        print(f"标签操作失败：{exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    """内容详情、默认程序与文件管理器入口。"""
+    import sqlite3
+
+    from pc.adapters import sqlite as db
+    from pc.adapters import view_files, windows_view
+    from pc.services import viewing
+
+    copied = False
+    try:
+        if getattr(args, "json", False) and args.copy:
+            raise viewing.ViewError("--json 与 --copy 不能同时使用")
+        resolved, paths = _db_and_paths(args)
+        if not _require_database(resolved):
+            return 2
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            result = viewing.detail(conn, message_id=args.message, content_id=args.content)
+            if getattr(args, "json", False):
+                print(cfg_dump_json(result))
+                return 0
+            kind = viewing.preflight(result, copy=args.copy)
+            if args.command == "show" and kind != "text":
+                raise viewing.ViewError(
+                    "终端图片展示尚未通过 DST 集成验收；show 当前支持纯文本与 --json。"
+                )
+            if args.command != "show" or args.copy:
+                windows_view.require_windows()
+            body = viewing.text_body(result)
+            if args.copy and kind == "text" and "\0" in body:
+                raise viewing.ViewError("正文含 NUL，无法完整复制到剪贴板")
+            images = []
+            files = None
+            if args.command != "show":
+                from pc.config import ingest_limits
+
+                limits = ingest_limits(_load_app_config(_project_root(args)))
+                images = view_files.read_images(conn, result, limit=limits.max_media_bytes)
+                files = view_files.materialize(
+                    result, images, cache_root=paths.data_root / "view-cache", kind=kind
+                )
+            # 系统操作前再读一次目标，缓存不替代可见性检查。
+            current = viewing.detail(conn, message_id=args.message, content_id=args.content)
+            if current != result:
+                raise viewing.ViewError("目标在准备期间发生变化，请重新执行")
+        if args.copy:
+            if kind == "text":
+                windows_view.copy_text(body)
+            else:
+                assert files is not None
+                windows_view.copy_files(files.files)
+            copied = True
+        if args.command == "show":
+            # 终端正文去除 C0/C1 控制字符，JSON/TXT/剪贴板保留原始正文。
+            from pc.view_presentation import terminal_text
+
+            print(terminal_text(body))
+        else:
+            assert files is not None
+            if args.command == "open":
+                windows_view.open_files(files.open_files)
+            else:
+                windows_view.reveal_files(files.open_files)
+            print(str(files.directory))
+        return 0
+    except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+        suffix = "；剪贴板复制已完成" if copied else ""
+        print(f"展示失败：{exc}{suffix}", file=sys.stderr)
+        return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc",
-        description="post-collector 命令行（doctor / config / db / source / import / work / item）",
+        description="post-collector 命令行（导入、处理、检索、标签与内容查看）",
     )
     parser.add_argument("--version", action="version", version=f"post-collector {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1871,6 +1768,54 @@ def build_parser() -> argparse.ArgumentParser:
     p_item_list.add_argument("--path", help=db_path_help)
     p_item_list.set_defaults(func=cmd_item_list)
 
+    for operation in ("show", "open", "reveal"):
+        p_view = sub.add_parser(operation, help="展示内容正文、打开查看文件或定位文件")
+        p_view.add_argument("--path", help="数据库路径")
+        p_view.add_argument("--root", help="项目根目录")
+        target = p_view.add_mutually_exclusive_group(required=True)
+        target.add_argument("--message", type=int, help="消息 ID，展示全部可见部件")
+        target.add_argument("--content", type=int, help="内容项 ID")
+        p_view.add_argument("--copy", action="store_true", help="同时复制纯文本或图片文件")
+        if operation == "show":
+            p_view.add_argument("--json", action="store_true", help="完整详情 JSON")
+        p_view.set_defaults(func=cmd_view)
+
+    p_render = sub.add_parser("render", help="从标准输入渲染 JSON 查询结果")
+    p_render_sub = p_render.add_subparsers(dest="render_command", required=True)
+    p_render_sub.add_parser("table", help="输出终端表格").set_defaults(func=cmd_render)
+
+    p_tag = sub.add_parser("tag", help="root 标签管理：人工标注、别名与建议确认")
+    p_tag_sub = p_tag.add_subparsers(dest="tag_command", required=True)
+    for operation in ("add", "remove", "show", "list", "confirm", "reject"):
+        p = p_tag_sub.add_parser(operation)
+        p.add_argument("--path", help=db_path_help)
+        p.add_argument("--root", help=root_help)
+        p.add_argument("--json", action="store_true", help="输出完整 JSON")
+        if operation in {"add", "remove", "show"}:
+            targets = p.add_mutually_exclusive_group(required=True)
+            targets.add_argument("--message", type=int, action="append", help="整帖 ID，可重复")
+            targets.add_argument("--content", type=int, action="append", help="部件 ID，可重复")
+        if operation in {"add", "remove"}:
+            p.add_argument("--tag", action="append", required=True, help="自定义名称或别名，可重复")
+        if operation == "add":
+            from pc.services.tagging import MANUAL_NAMESPACES
+
+            p.add_argument("--namespace", default="general", choices=MANUAL_NAMESPACES)
+        if operation in {"confirm", "reject"}:
+            p.add_argument("ids", type=int, nargs="+", help="建议关联 ID")
+        p.set_defaults(func=cmd_tag)
+    p_alias = p_tag_sub.add_parser("alias", help="标签别名")
+    p_alias_sub = p_alias.add_subparsers(dest="alias_command", required=True)
+    for operation in ("add", "remove", "list"):
+        p = p_alias_sub.add_parser(operation)
+        p.add_argument("--path", help=db_path_help)
+        p.add_argument("--root", help=root_help)
+        p.add_argument("--json", action="store_true")
+        if operation != "remove":
+            p.add_argument("--tag", required=True, help="规范名或已有别名")
+        if operation != "list":
+            p.add_argument("--alias", required=True)
+        p.set_defaults(func=cmd_tag)
     return parser
 
 

@@ -327,6 +327,7 @@ class TagCandidate:
     tag: str
     confidence: float
     evidence: dict[str, Any] = field(default_factory=dict)
+    namespace: TagNamespace = TagNamespace.GENERAL
 
 
 @dataclass(frozen=True, slots=True)

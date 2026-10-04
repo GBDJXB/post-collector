@@ -7,9 +7,9 @@ description: "项目开发入口：当前状态、代码导航、命令与实现
 
 ## 当前状态与工作方式
 
-post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入/上传、扫描、去重、落库、CLI 检索；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
+post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入/上传、扫描、去重、落库、root 人工打标、CLI 检索与内容查看；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
 
-打标、界面与平台连接器的交付范围见 DESIGN.md §9。阶段 1 的权限范围为 root 与邀请制用户，匿名提报入口属于阶段 2。
+模型打标、敏感度分类、界面与平台连接器的交付范围见 DESIGN.md §9。阶段 1 的权限范围为 root 与邀请制用户，匿名提报入口属于阶段 2。
 
 修改实现前读取 DESIGN.md 对应章节。改变设计契约时，同时更新该章节和附录 C。改代码必须同步 AGENTS.md 与 README.md；两份入口文档以当前事实、操作和约束为主，历史方案、实测过程与设计理由放在 DESIGN.md，迁移细节放在 migrations/README.md。用肯定句描述当前路径，必要的安全禁令保留明确表述。
 
@@ -31,7 +31,7 @@ post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来
 | 重算派生数据与索引 | `uv run pc db reindex --recompute-derived` |
 | 查看 / 播种设置 | `uv run pc config show --explain` / `uv run pc config seed` |
 
-测试在临时目录运行。最近完整结果为 818 通过、3 条 Windows 符号链接权限跳过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
+测试在临时目录运行。最近完整结果为 923 通过、5 条 Windows 符号链接权限跳过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
 
 doctor 报告库、索引与运行时目录的状态和配置来源；各段不可达时仍完成体检。完整 CLI 参数、备份和升级步骤见 README.md。
 
@@ -48,8 +48,16 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | `src/pc/domain.py` | 状态、跨层结构、规范化、分词与帖签名 |
 | `src/pc/ports/` | 13 个 Protocol 端口 |
 | `src/pc/config.py` | 严格校验、四层解析、设置变更闸门 |
-| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search 接线 |
+| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search/tag/render/show/open/reveal 接线 |
 | `src/pc/adapters/sqlite.py` | 路径、连接、迁移、备份、设置与派生数据重算 |
+| `src/pc/services/tagging.py` | 标签应用、撤销、建议确认、审计与计数 |
+| `src/pc/adapters/tag_normalizer.py` | 规范名、别名解析与有效标签条件 |
+| `src/pc/services/viewing.py` | 详情入口、内容类型与复制前置检查 |
+| `src/pc/adapters/content_detail.py` | ID 详情查询、读快照与批量组装 |
+| `src/pc/adapters/view_files.py` | 有界媒体读取、哈希验证、查看副本与静态 HTML |
+| `src/pc/adapters/windows_view.py` | 默认程序、文件定位与 Unicode 文本/文件剪贴板 |
+| `src/pc/view_presentation.py` | 终端正文控制字符过滤 |
+| `src/pc/presentation.py` | 纯数据表格渲染、中文宽度与终端布局 |
 | `src/pc/adapters/fts_search.py` | 索引维护、部件解释及批量组装 |
 | `src/pc/adapters/post_search.py` | 帖查询、候选、可见性、折叠与游标 |
 | `src/pc/adapters/safe_files.py` | roots 边界、链接/reparse 检查与句柄校验 |
@@ -84,6 +92,26 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 - worker 抢占时 attempts +1；正常完成经 _finalize 落账。超时 running 尚有次数则 queued，耗尽则 dead，写原因、finished_at、审计并清锁。确定性失败死信，偶发异常退避。
 - 处理幂等；media.sha256 唯一，content_media 为多对多。media.scan_status 是字节属性，本次扫描判定落在内容项上。
 - message.origin_note 为调用方注解，raw_payload 保存原始载荷。search_extra 与文本索引在落库和批量重算中保持同值。
+
+## 标签与输出契约
+
+- 人工生产者生成 `ClassificationResult(source=human)`；统一服务当前接受 human/suggested，未来模型适配器只负责解析结果。普通名称由 root 自定义，namespace 默认 general，rating/source/system 留给对应组件。
+- 标签写操作验证目标与 root 身份，关联、分类记录、审计、计数和派生索引同事务完成。本地 CLI 沿用 upload 的操作系统权限边界，审计标记 local_root；显式 actor_id 必须为有效 root。
+- `tag_assignment` 的 content/tag/source 唯一；撤销与恢复复用行、保留审计。建议确认生成 human 关联、撤销 suggested，证据保留建议 ID 与模型来源；拒绝只撤销建议。
+- 有效标签为未撤销的 human/system/auto/merged 关联，标签状态 active/deprecated。suggested/pending 排除于过滤、输出、关键词索引及计数；usage_count 按不同内容项计数。
+- `tag_synonym` 为别名事实源，服务同步 tag.aliases。规范名与别名交叉冲突在写事务内拒绝；名称采用 NFKC、casefold、空白/下划线统一，规范化后 1~255 字符，拒绝控制字符。
+- `SearchIndex.index_many` 参与调用方事务，空集合保持只读；标签刷新保持帖签名原值，维护重算继续分批提交。
+- 查询服务返回业务数据，CLI 序列化或渲染；默认表格与 `pc render table` 共用 presentation，渲染器只读输入。JSON 保留完整值，stdout 为单一 JSON，诊断进入 stderr。CLI JSON 统一使用 ensure_ascii=True，兼容 Windows PowerShell 5.1 默认 ASCII 管道；人工展示保留 Unicode。
+- 结果类型 search/tags/assignments/aliases，版本 result_version=1。保持检索现有分页字段；渲染层控制列宽与总宽，前端全局排序经查询端执行。
+
+## 内容查看契约
+
+- `show/open/reveal` 每次接受一个消息或内容项 ID，按 ordinal/content_id 和媒体 ordinal/media_id/role 排序；详情服务返回 content v1，JSON 完整且只读。
+- 当前默认可见性与检索一致；展示文本与图片。图片说明正文算混合内容；混合 `--copy` 在缓存与系统调用前报错，`--json` 与 `--copy` 互斥。
+- `show` 当前显示纯文本，过滤终端控制字符；终端图片按 DESIGN §5.1 的 DST 验证结果暂缓。系统打开、定位与复制支持 Windows。
+- 媒体按 backend_id 读取本地后端绝对 root，验证 canonical 对象键、大小、哈希与魔数，拒绝删除/隔离/未通过扫描媒体。单次媒体总量上限 256 MiB；缓存不替代实时可见性检查。
+- 查看副本放在 data_root/view-cache，独立复制、原子替换并验证链接/reparse 与硬链接。静态 HTML 转义正文，仅引用生成的相对图片名；HEIC 混合内容报错。
+- 剪贴板文本为 CF_UNICODETEXT，图片为 CF_HDROP，立即渲染且文件在命令退出后保留。当前手动清理查看缓存，删除归档时须同时清理对应副本；后续容量管理接入该目录。
 
 ## 检索契约
 
@@ -121,7 +149,7 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | 来源与连接器 | §1.3、§9.1 |
 | schema、迁移、删除、去重 | §3，尤其 §3.8 |
 | worker、打标与模型供给 | §4 |
-| 检索 | §5，预算 §5.6 |
+| 检索与内容查看 | §5，预算 §5.6；文件安全 §6.5；目录 §10.2 |
 | 权限、配置与外发 | §6 |
 | 备份、容量与保留 | §7 |
 | 交付范围与进程模型 | §9、§10 |

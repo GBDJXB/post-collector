@@ -7,6 +7,7 @@ import json
 import time
 from typing import Any
 
+from pc.adapters.tag_normalizer import effective_assignment
 from pc.domain import ITEM_TYPES, post_composition_label, post_type_mask
 
 
@@ -23,7 +24,7 @@ class PostSearch:
             (int(row[1]), int(row[0]))
             for row in self._conn.execute(
                 "SELECT tag_id, CASE WHEN usage_count > 0 THEN usage_count ELSE "
-                "(SELECT count(*) FROM tag_assignment ta WHERE ta.tag_id=tag.tag_id AND ta.revoked_at IS NULL) END "
+                f"(SELECT count(DISTINCT ta.content_id) FROM tag_assignment ta WHERE ta.tag_id=tag.tag_id AND {effective_assignment()}) END "
                 f"FROM tag WHERE tag_id IN ({marks})",
                 tag_ids,
             )
@@ -38,7 +39,7 @@ class PostSearch:
             return "FROM post p", []
         return (
             "FROM (SELECT DISTINCT c.message_id FROM tag_assignment ta JOIN content_item c INDEXED BY content_item_lookup_idx USING(content_id) "
-            "WHERE ta.tag_id=? AND ta.revoked_at IS NULL) t CROSS JOIN post p ON p.message_id=t.message_id",
+            f"WHERE ta.tag_id=? AND {effective_assignment()}) t CROSS JOIN post p ON p.message_id=t.message_id",
             [sizes[0][1]],
         )
 
@@ -89,7 +90,7 @@ class PostSearch:
         for tag in filters.get("tag_ids") or ():
             clauses.append(
                 f"EXISTS (SELECT 1 FROM content_item c CROSS JOIN tag_assignment ta USING(content_id) "
-                f"WHERE c.message_id={alias}.message_id AND {visible} AND ta.tag_id=? AND ta.revoked_at IS NULL)"
+                f"WHERE c.message_id={alias}.message_id AND {visible} AND ta.tag_id=? AND {effective_assignment()})"
             )
             params.extend([*values, int(tag)])
         for plan in plans:
