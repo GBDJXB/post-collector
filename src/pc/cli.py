@@ -137,7 +137,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """体检：报告环境、文件、依赖与运行时目录；只读，不修改任何东西。"""
     root = Path(args.root).resolve() if args.root else find_repo_root()
 
-    print(f"post-collector {__version__} —— 骨架阶段（业务功能尚未实现）")
+    print(f"post-collector {__version__} 本机内容归档与检索")
     print()
     print("[运行时]")
     print(f"  Python      : {platform.python_version()}  ({sys.executable})")
@@ -176,10 +176,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 2
     if missing_deps:
         print(f"结论：结构就绪，尚未安装依赖（{', '.join(missing_deps)}）。")
-        print("      安装后即可启动：uv sync && uv run uvicorn pc.api.app:create_app --factory")
+        print("      安装后即可启动：uv sync；uv run pc serve")
     else:
         print("结论：结构与依赖均已就绪。")
-        print("      启动：uv run uvicorn pc.api.app:create_app --factory --port 8080")
+        print("      启动：uv run pc serve")
     print("      说明：本阶段没有任何 AI 外发代码路径，内容不会离开本机。")
     return 0
 
@@ -259,7 +259,9 @@ def cmd_config_show(args: argparse.Namespace) -> int:
             print(f"      含义：{spec.label} —— {spec.help}")
             print(f"      影响：{spec.impact}")
             print(f"      类型：{spec.type}{bounds}{unit}")
-            check = config_mod.validate_value(spec, resolved.value, registry=index, values=snap.values)
+            check = config_mod.validate_value(
+                spec, resolved.value, registry=index, values=snap.values
+            )
             if check["warning"]:
                 print(f"      提示：{check['warning']}")
             if spec.note:
@@ -366,9 +368,7 @@ def _doctor_runtime_dirs(root: Path) -> None:
     from pc.adapters import sqlite as db
 
     try:
-        resolved = db.resolve_paths(
-            env_file=root / ".env", app_config=root / "config/app.yaml"
-        )
+        resolved = db.resolve_paths(env_file=root / ".env", app_config=root / "config/app.yaml")
     except Exception as exc:  # pragma: no cover - 适配器不可导入时的兜底
         print(f"  · 无法解析数据根目录：{exc}")
         return
@@ -421,9 +421,7 @@ def _doctor_database_section(root: Path) -> None:
         print(f"  · {str(exc).splitlines()[0]}")
         return
 
-    resolved = db.resolve_db_path(
-        None, env_file=root / ".env", app_config=root / "config/app.yaml"
-    )
+    resolved = db.resolve_db_path(None, env_file=root / ".env", app_config=root / "config/app.yaml")
     if not resolved.path.is_file():
         print(f"  · 文件 {resolved.path}（{resolved.source}）：尚未创建")
         print("    建库：uv run pc db apply")
@@ -481,9 +479,7 @@ def _doctor_search_section(root: Path) -> None:
         print(f"  · {str(exc).splitlines()[0]}")
         return
 
-    resolved = db.resolve_db_path(
-        None, env_file=root / ".env", app_config=root / "config/app.yaml"
-    )
+    resolved = db.resolve_db_path(None, env_file=root / ".env", app_config=root / "config/app.yaml")
     if not resolved.path.is_file():
         print(f"  · 还没有数据库文件（{resolved.path}）")
         return
@@ -528,7 +524,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
 
     if not resolved.path.is_file():
         print(
-            f"  ✗ 数据库文件还不存在。建库：uv run pc db apply --path \"{resolved.path}\"",
+            f'  ✗ 数据库文件还不存在。建库：uv run pc db apply --path "{resolved.path}"',
             file=sys.stderr,
         )
         return 2
@@ -546,8 +542,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     print(f"  foreign_keys：{'ON' if status['foreign_keys'] else 'OFF（外键会静默失效）'}")
     print(f"  完整性检查：{status['integrity']}")
     print(
-        f"  FTS5 索引：{len(status['fts_tables'])}/2"
-        f"（{'、'.join(status['fts_tables']) or '无'}）"
+        f"  FTS5 索引：{len(status['fts_tables'])}/2（{'、'.join(status['fts_tables']) or '无'}）"
     )
     print(f"  表：{len(status['tables'])} 张（预期 {len(db.EXPECTED_TABLES)} 张）")
 
@@ -559,8 +554,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         print(f"  迁移记账：一条都没有（库状态：{status['state']}）")
     if expected:
         print(
-            f"  迁移目录：{directory.as_posix()} 共 {len(expected)} 个版本"
-            f"（最新 {expected[-1]}）"
+            f"  迁移目录：{directory.as_posix()} 共 {len(expected)} 个版本（最新 {expected[-1]}）"
         )
     if status["migrations_missing"]:
         print(
@@ -727,7 +721,11 @@ def cmd_db_reindex(args: argparse.Namespace) -> int:
                 )
                 print(
                     f"  ✓ 帖表：对齐 {result['posts']} 帖"
-                    + (f"，清掉 {result['posts_removed']} 张空帖" if result["posts_removed"] else "")
+                    + (
+                        f"，清掉 {result['posts_removed']} 张空帖"
+                        if result["posts_removed"]
+                        else ""
+                    )
                 )
             reindexed = db.reindex_fts(conn)
     except db.DatabaseError as exc:
@@ -1224,7 +1222,9 @@ def cmd_work(args: argparse.Namespace) -> int:
                     total += report.claimed
                     _print_work_report(report, prefix="  ")
                     if not report.claimed:
-                        print(f"  · 队列空了（本次共处理 {total} 条），{args.interval} 秒后再看；Ctrl+C 退出")
+                        print(
+                            f"  · 队列空了（本次共处理 {total} 条），{args.interval} 秒后再看；Ctrl+C 退出"
+                        )
                     time.sleep(max(1, args.interval))
             else:
                 report = worker.run_once(limit=limit)
@@ -1399,7 +1399,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(cfg_dump_json(result))
         return 0
     if stale:
-        print(f"  {stale} 条内容还没有分词结果，请重算：pc db reindex --recompute-derived", file=sys.stderr)
+        print(
+            f"  {stale} 条内容还没有分词结果，请重算：pc db reindex --recompute-derived",
+            file=sys.stderr,
+        )
     return render_result(result, timings=args.timings)
 
 
@@ -1427,8 +1430,11 @@ def cmd_render(args: argparse.Namespace) -> int:
     import json
 
     try:
-        raw = (sys.stdin.buffer.read().decode("utf-8-sig")
-               if hasattr(sys.stdin, "buffer") else sys.stdin.read().lstrip("\ufeff"))
+        raw = (
+            sys.stdin.buffer.read().decode("utf-8-sig")
+            if hasattr(sys.stdin, "buffer")
+            else sys.stdin.read().lstrip("\ufeff")
+        )
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("输入须为结果对象")
@@ -1451,11 +1457,14 @@ def cmd_tag(args: argparse.Namespace) -> int:
     try:
         with db.open_db(resolved.path, expect_exists=True) as conn:
             operation = args.tag_command
-            targets = {"message_ids": getattr(args, "message", None) or (),
-                       "content_ids": getattr(args, "content", None) or ()}
+            targets = {
+                "message_ids": getattr(args, "message", None) or (),
+                "content_ids": getattr(args, "content", None) or (),
+            }
             if operation == "add":
                 output = tagging.apply_classification(
-                    conn, tagging.manual_result(args.tag, args.namespace), **targets)
+                    conn, tagging.manual_result(args.tag, args.namespace), **targets
+                )
             elif operation == "remove":
                 output = tagging.remove_tags(conn, args.tag, **targets)
             elif operation == "show":
@@ -1485,10 +1494,9 @@ def cmd_view(args: argparse.Namespace) -> int:
     import sqlite3
 
     from pc.adapters import sqlite as db
-    from pc.adapters import view_files, windows_view
-    from pc.services import viewing
+    from pc.config import ingest_limits
+    from pc.services import desktop_view, viewing
 
-    copied = False
     try:
         if getattr(args, "json", False) and args.copy:
             raise viewing.ViewError("--json 与 --copy 不能同时使用")
@@ -1496,57 +1504,76 @@ def cmd_view(args: argparse.Namespace) -> int:
         if not _require_database(resolved):
             return 2
         with db.open_db(resolved.path, expect_exists=True) as conn:
-            result = viewing.detail(conn, message_id=args.message, content_id=args.content)
             if getattr(args, "json", False):
+                result = viewing.detail(conn, message_id=args.message, content_id=args.content)
                 print(cfg_dump_json(result))
                 return 0
-            kind = viewing.preflight(result, copy=args.copy)
-            if args.command == "show" and kind != "text":
-                raise viewing.ViewError(
-                    "终端图片展示尚未通过 DST 集成验收；show 当前支持纯文本与 --json。"
-                )
-            if args.command != "show" or args.copy:
-                windows_view.require_windows()
-            body = viewing.text_body(result)
-            if args.copy and kind == "text" and "\0" in body:
-                raise viewing.ViewError("正文含 NUL，无法完整复制到剪贴板")
-            images = []
-            files = None
-            if args.command != "show":
-                from pc.config import ingest_limits
-
-                limits = ingest_limits(_load_app_config(_project_root(args)))
-                images = view_files.read_images(conn, result, limit=limits.max_media_bytes)
-                files = view_files.materialize(
-                    result, images, cache_root=paths.data_root / "view-cache", kind=kind
-                )
-            # 系统操作前再读一次目标，缓存不替代可见性检查。
-            current = viewing.detail(conn, message_id=args.message, content_id=args.content)
-            if current != result:
-                raise viewing.ViewError("目标在准备期间发生变化，请重新执行")
-        if args.copy:
-            if kind == "text":
-                windows_view.copy_text(body)
-            else:
-                assert files is not None
-                windows_view.copy_files(files.files)
-            copied = True
+            limits = ingest_limits(_load_app_config(_project_root(args)))
+            result = desktop_view.execute(
+                conn,
+                message_id=args.message,
+                content_id=args.content,
+                action=args.command,
+                copy=args.copy,
+                cache_root=paths.data_root / "view-cache",
+                limit=limits.max_media_bytes,
+            )
         if args.command == "show":
-            # 终端正文去除 C0/C1 控制字符，JSON/TXT/剪贴板保留原始正文。
             from pc.view_presentation import terminal_text
 
-            print(terminal_text(body))
+            print(terminal_text(result["body"]))
         else:
-            assert files is not None
-            if args.command == "open":
-                windows_view.open_files(files.open_files)
-            else:
-                windows_view.reveal_files(files.open_files)
-            print(str(files.directory))
+            print(result["directory"])
         return 0
     except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
-        suffix = "；剪贴板复制已完成" if copied else ""
+        suffix = "；剪贴板复制已完成" if getattr(exc, "copied", False) else ""
         print(f"展示失败：{exc}{suffix}", file=sys.stderr)
+        return 2
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """仅监听本机，输出一次性授权链接；后台处理仍由 work 命令执行。"""
+    import uvicorn
+
+    from pc import config as cfg
+    from pc.adapters import sqlite as db
+    from pc.api.app import Runtime, create_app
+
+    try:
+        if not 1 <= args.port <= 65535:
+            raise ValueError("端口必须在 1~65535 之间")
+        resolved, paths = _db_and_paths(args)
+        if not _require_database(resolved):
+            return 2
+        root = _project_root(args)
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            status = db.database_status(conn, root / db.DEFAULT_MIGRATIONS_DIR)
+            if not status["ok"]:
+                raise ValueError("数据库结构需要检查，请运行 pc db status / pc db apply")
+        registry = cfg.registry_index(cfg.load_registry(root / cfg.DEFAULT_REGISTRY_PATH))
+        defaults = cfg.load_app_defaults(root / cfg.DEFAULT_APP_CONFIG_PATH, registry=registry)
+        limits = cfg.ingest_limits(_load_app_config(root))
+        app = create_app(
+            Runtime(
+                resolved.path,
+                paths.data_root / "view-cache",
+                limits.max_media_bytes,
+                registry=registry,
+                yaml_defaults=defaults,
+                port=args.port,
+            )
+        )
+        print(
+            f"本机临时 root 授权链接（10 分钟内使用一次）：\n"
+            f"http://127.0.0.1:{args.port}/#token={app.state.sessions.bootstrap}",
+            flush=True,
+        )
+        uvicorn.run(
+            app, host="127.0.0.1", port=args.port, workers=1, proxy_headers=False, access_log=False
+        )
+        return 0
+    except (ValueError, OSError, db.DatabaseError, cfg.ConfigError) as exc:
+        print(f"Web 启动失败：{exc}", file=sys.stderr)
         return 2
 
 
@@ -1557,6 +1584,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"post-collector {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_serve = sub.add_parser("serve", help="启动本机 Web 操作页面")
+    p_serve.add_argument("--root", help="指定仓库根目录")
+    p_serve.add_argument("--path", help="指定数据库文件")
+    p_serve.add_argument("--port", type=int, default=8080, help="本机端口（默认 8080）")
+    p_serve.set_defaults(func=cmd_serve)
 
     p_doctor = sub.add_parser("doctor", help="体检：报告环境、文件、依赖与运行时目录")
     p_doctor.add_argument("--root", help="指定仓库根目录（默认自动查找）")
@@ -1570,7 +1603,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--key", help="只看某一项；也可给命名空间前缀（如 dedup）")
     p_show.add_argument("--json", action="store_true", help="输出 JSON，便于脚本与贴 issue")
     p_show.add_argument("--root", help="指定仓库根目录（默认自动查找）")
-    p_show.add_argument("--path", help="显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析")
+    p_show.add_argument(
+        "--path", help="显式指定数据库文件；默认按 env > .env > app.yaml > 平台默认解析"
+    )
     p_show.set_defaults(func=cmd_config_show)
 
     p_seed = p_config_sub.add_parser(
@@ -1605,9 +1640,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_status.add_argument("--root", help=root_help)
     p_db_status.set_defaults(func=cmd_db_status)
 
-    p_db_backup = p_db_sub.add_parser(
-        "backup", help="生成事务一致的快照并校验（VACUUM INTO）"
-    )
+    p_db_backup = p_db_sub.add_parser("backup", help="生成事务一致的快照并校验（VACUUM INTO）")
     p_db_backup.add_argument("--path", help=db_path_help)
     p_db_backup.add_argument("--root", help=root_help)
     p_db_backup.add_argument(
@@ -1746,7 +1779,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument(
         "--include-duplicates", action="store_true", help="不折叠同一段文本的重复项"
     )
-    p_search.add_argument("--sort", choices=["relevance", "time"], help="排序（默认：有词按相关度，无词按时间）")
+    p_search.add_argument(
+        "--sort", choices=["relevance", "time"], help="排序（默认：有词按相关度，无词按时间）"
+    )
     p_search.add_argument("--limit", type=int, help="每页条数（默认取设置项，硬上限 50）")
     p_search.add_argument("--page", type=int, default=1, help="相关度排序下的页码（默认 1）")
     p_search.add_argument("--cursor", help="时间序翻页游标，取自上一次 --json 的 next_cursor")

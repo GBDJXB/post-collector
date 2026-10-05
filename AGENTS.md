@@ -7,9 +7,9 @@ description: "项目开发入口：当前状态、代码导航、命令与实现
 
 ## 当前状态与工作方式
 
-post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入/上传、扫描、去重、落库、root 人工打标、CLI 检索与内容查看；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
+post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入/上传、扫描、去重、落库、root 人工打标、CLI 与本机 Web 检索和内容查看；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
 
-模型打标、敏感度分类、界面与平台连接器的交付范围见 DESIGN.md §9。阶段 1 的权限范围为 root 与邀请制用户，匿名提报入口属于阶段 2。
+模型打标、敏感度分类、邀请制账户与平台连接器的交付范围见 DESIGN.md §9。本机 Web 使用临时 root 会话，持久账户与远程鉴权按 §6.1 后续交付；匿名提报入口属于阶段 2。
 
 修改实现前读取 DESIGN.md 对应章节。改变设计契约时，同时更新该章节和附录 C。改代码必须同步 AGENTS.md 与 README.md；两份入口文档以当前事实、操作和约束为主，历史方案、实测过程与设计理由放在 DESIGN.md，迁移细节放在 migrations/README.md。用肯定句描述当前路径，必要的安全禁令保留明确表述。
 
@@ -26,12 +26,12 @@ post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来
 | 语法检查 | `python -m compileall -q src` |
 | 测试 | `uv run pytest` |
 | 检索性能验收 | `uv run python tools/bench_search.py --scale 100000 --assert` |
-| 本地 API | `uv run uvicorn pc.api.app:create_app --factory --host 127.0.0.1 --port 8080` |
+| 本机 Web / API | `uv run pc serve` |
 | 应用迁移 / 结构校验 | `uv run pc db apply` / `uv run pc db status` |
 | 重算派生数据与索引 | `uv run pc db reindex --recompute-derived` |
 | 查看 / 播种设置 | `uv run pc config show --explain` / `uv run pc config seed` |
 
-测试在临时目录运行。最近完整结果为 923 通过、5 条 Windows 符号链接权限跳过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
+测试在临时目录运行。最近完整结果为 944 通过、5 条 Windows 符号链接权限跳过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
 
 doctor 报告库、索引与运行时目录的状态和配置来源；各段不可达时仍完成体检。完整 CLI 参数、备份和升级步骤见 README.md。
 
@@ -48,11 +48,13 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | `src/pc/domain.py` | 状态、跨层结构、规范化、分词与帖签名 |
 | `src/pc/ports/` | 13 个 Protocol 端口 |
 | `src/pc/config.py` | 严格校验、四层解析、设置变更闸门 |
-| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search/tag/render/show/open/reveal 接线 |
+| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search/tag/render/show/open/reveal/serve 接线 |
 | `src/pc/adapters/sqlite.py` | 路径、连接、迁移、备份、设置与派生数据重算 |
 | `src/pc/services/tagging.py` | 标签应用、撤销、建议确认、审计与计数 |
 | `src/pc/adapters/tag_normalizer.py` | 规范名、别名解析与有效标签条件 |
 | `src/pc/services/viewing.py` | 详情入口、内容类型与复制前置检查 |
+| `src/pc/services/desktop_view.py` | CLI 与 Web 共用的文件准备、复查和系统操作 |
+| `src/pc/web/` | 原生 HTML、JavaScript、CSS 表单与结果展示 |
 | `src/pc/adapters/content_detail.py` | ID 详情查询、读快照与批量组装 |
 | `src/pc/adapters/view_files.py` | 有界媒体读取、哈希验证、查看副本与静态 HTML |
 | `src/pc/adapters/windows_view.py` | 默认程序、文件定位与 Unicode 文本/文件剪贴板 |
@@ -66,7 +68,7 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | `src/pc/adapters/local_storage.py` | 内容寻址、原子写入与幂等存储 |
 | `src/pc/adapters/magic_scan.py` | 类型白名单、字节限额、扫描判定 |
 | `src/pc/services/` | 来源、摄入、worker、检索业务规则 |
-| `src/pc/api/` | 参数校验、鉴权与路由 |
+| `src/pc/api/` | 本机会话、参数校验、媒体与业务路由 |
 | `tests/` | 单元、端到端、schema、安全与性能工具回归 |
 
 ## 安全与分层
@@ -112,6 +114,14 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 - 媒体按 backend_id 读取本地后端绝对 root，验证 canonical 对象键、大小、哈希与魔数，拒绝删除/隔离/未通过扫描媒体。单次媒体总量上限 256 MiB；缓存不替代实时可见性检查。
 - 查看副本放在 data_root/view-cache，独立复制、原子替换并验证链接/reparse 与硬链接。静态 HTML 转义正文，仅引用生成的相对图片名；HEIC 混合内容报错。
 - 剪贴板文本为 CF_UNICODETEXT，图片为 CF_HDROP，立即渲染且文件在命令退出后保留。当前手动清理查看缓存，删除归档时须同时清理对应副本；后续容量管理接入该目录。
+
+## 本机 Web 契约
+
+- `pc serve` 校验已有库结构后，单进程监听 `127.0.0.1`，关闭代理头信任；后台任务由 `pc work` 执行。业务运行时从配置解析后注入应用，直接调用工厂提供页面、探针和接口定义。
+- 一次性授权令牌在 fragment 中传入，10 分钟有效；交换后清除 fragment。会话驻内存，Cookie 为 HttpOnly/SameSite=Strict，8 小时绝对到期、30 分钟空闲到期，退出及进程重启立即失效。
+- 业务请求验证会话、本机对端与当前 Host；写操作验证 Origin 与 CSRF。身份由服务器授予本机 root，客户端不能指定 actor_id。标签写入复用 local_root 审计与事务。
+- 查询与详情沿用既有服务和版本化结果，默认 active/safe。数据库及文件操作在同步路由执行边界运行，连接按请求关闭。媒体接口检查可见关联并复用安全读取，存储与缓存目录保持私有。
+- 页面使用 textContent 展示归档文本，以内容项/媒体 ID 构造图片地址；同源资源受 CSP 约束。系统动作调用共享服务，不执行 CLI 子进程；混合复制在生成文件前拒绝，部分失败响应保留 copied 状态。
 
 ## 检索契约
 
