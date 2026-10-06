@@ -801,21 +801,15 @@ def _load_app_config(root: Path) -> Any:
 def _build_worker(conn: Any, paths: Any, root: Path, *, worker_id: str | None = None) -> Any:
     """组装 worker：存储、隔离区、扫描器与队列参数全部来自配置（没有硬编码字面量）。"""
     from pc import config as cfg
-    from pc.adapters.local_storage import LocalStorageBackend
-    from pc.adapters.magic_scan import MagicNumberScanner
-    from pc.services.pipeline import Worker
+    from pc.services.runtime import build_worker
 
     app_config = _load_app_config(root)
-    limits = cfg.ingest_limits(app_config)
-    return Worker(
-        conn,
-        storage=LocalStorageBackend(paths.media_root),
-        quarantine=LocalStorageBackend(paths.quarantine_root),
-        scanner=MagicNumberScanner(policy=cfg.security_policy(app_config), limits=limits),
-        limits=limits,
-        job_settings=cfg.job_settings(app_config),
+    return build_worker(
+        conn, paths, limits=cfg.ingest_limits(app_config),
+        security=cfg.security_policy(app_config), jobs=cfg.job_settings(app_config),
         worker_id=worker_id,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +1525,49 @@ def cmd_view(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_user(args: argparse.Namespace) -> int:
+    """本机系统权限下管理受邀账号，密码只从隐藏输入获取。"""
+    import getpass
+    import sqlite3
+    import warnings
+
+    from pc.adapters import sqlite as db
+    from pc.services import accounts
+
+    try:
+        resolved, _ = _db_and_paths(args)
+        if not _require_database(resolved):
+            return 2
+        password = None
+        if args.user_command == "create":
+            with db.open_db(resolved.path, expect_exists=True) as conn:
+                args.username = accounts.check_new_username(conn, args.username)
+        if args.user_command in {"create", "reset-password"}:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("密码（15~128 字符）：")
+                if password != getpass.getpass("再次输入密码："):
+                    raise ValueError("两次密码不一致")
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            if args.user_command == "list":
+                result = accounts.list_users(conn)
+            elif args.user_command == "create":
+                result = accounts.create_user(conn, args.username, password)
+            else:
+                result = accounts.change_user(conn, args.username, args.user_command, password)
+        if args.json:
+            print(cfg_dump_json(result))
+        elif args.user_command == "list":
+            for row in result:
+                print(f"{row['user_id']}  {row['username']}  tier={row['tier']}  {row['status']}")
+        else:
+            print(f"账号操作完成：{result['username']} ({result['status']})")
+        return 0
+    except (ValueError, OSError, sqlite3.Error, db.DatabaseError, EOFError, getpass.GetPassWarning) as exc:
+        print(f"账号操作失败：{exc}", file=sys.stderr)
+        return 2
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """仅监听本机，输出一次性授权链接；后台处理仍由 work 命令执行。"""
     import uvicorn
@@ -1542,6 +1579,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         if not 1 <= args.port <= 65535:
             raise ValueError("端口必须在 1~65535 之间")
+        mode = getattr(args, "mode", "local")
+        if mode == "remote":
+            from pc.api.remote_auth import public_origin
+
+            if not args.public_origin:
+                raise ValueError("远程模式需要 --public-origin HTTPS 地址")
+            public_origin(args.public_origin)
+        elif getattr(args, "public_origin", None):
+            raise ValueError("--public-origin 仅用于远程模式")
         resolved, paths = _db_and_paths(args)
         if not _require_database(resolved):
             return 2
@@ -1550,6 +1596,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
             status = db.database_status(conn, root / db.DEFAULT_MIGRATIONS_DIR)
             if not status["ok"]:
                 raise ValueError("数据库结构需要检查，请运行 pc db status / pc db apply")
+        if mode == "remote":
+            from pc.api.remote_auth import create_remote_app
+
+            app = create_remote_app(resolved.path, args.public_origin)
+            print(f"受邀用户登录入口：{args.public_origin}；代理后端 127.0.0.1:{args.port}；仅返回身份 JSON", flush=True)
+            uvicorn.run(app, host="127.0.0.1", port=args.port, workers=1,
+                        proxy_headers=False, access_log=False)
+            return 0
         registry = cfg.registry_index(cfg.load_registry(root / cfg.DEFAULT_REGISTRY_PATH))
         defaults = cfg.load_app_defaults(root / cfg.DEFAULT_APP_CONFIG_PATH, registry=registry)
         limits = cfg.ingest_limits(_load_app_config(root))
@@ -1561,6 +1615,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 registry=registry,
                 yaml_defaults=defaults,
                 port=args.port,
+                paths=paths,
+                limits=limits,
+                security=cfg.security_policy(_load_app_config(root)),
+                jobs=cfg.job_settings(_load_app_config(root)),
             )
         )
         print(
@@ -1589,7 +1647,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--root", help="指定仓库根目录")
     p_serve.add_argument("--path", help="指定数据库文件")
     p_serve.add_argument("--port", type=int, default=8080, help="本机端口（默认 8080）")
+    p_serve.add_argument("--mode", choices=["local", "remote"], default="local", help="本机管理或远程认证入口")
+    p_serve.add_argument("--public-origin", help="远程模式的外部 HTTPS origin，由代理保留 Host")
     p_serve.set_defaults(func=cmd_serve)
+
+    p_user = sub.add_parser("user", help="本机管理受邀账号")
+    p_user_sub = p_user.add_subparsers(dest="user_command", required=True)
+    for operation in ("create", "list", "disable", "enable", "reset-password"):
+        p = p_user_sub.add_parser(operation)
+        if operation != "list":
+            p.add_argument("username", help="受邀账号用户名")
+        p.add_argument("--root", help="指定仓库根目录")
+        p.add_argument("--path", help="指定数据库文件")
+        p.add_argument("--json", action="store_true", help="输出账号状态 JSON，不含凭据")
+        p.set_defaults(func=cmd_user)
 
     p_doctor = sub.add_parser("doctor", help="体检：报告环境、文件、依赖与运行时目录")
     p_doctor.add_argument("--root", help="指定仓库根目录（默认自动查找）")

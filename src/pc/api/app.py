@@ -16,10 +16,14 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from pc import __version__
 from pc.adapters import sqlite as db
 from pc.adapters import view_files
+from pc.adapters.safe_files import UnsafeLocalPathError
+from pc.config import IngestLimits, JobSettings, SecurityPolicy
+from pc.domain import SourceNotAuthorizedError
 from pc.services import desktop_view, search, tagging, viewing
 
 ID = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
@@ -87,6 +91,10 @@ class Runtime:
     registry: Any = None
     yaml_defaults: dict[str, Any] = field(default_factory=dict)
     port: int = 8080
+    paths: Any = None
+    limits: IngestLimits = field(default_factory=IngestLimits)
+    security: SecurityPolicy = field(default_factory=SecurityPolicy)
+    jobs: JobSettings = field(default_factory=JobSettings)
 
 
 class Sessions:
@@ -133,6 +141,8 @@ class Sessions:
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     """工厂直接启动保留探针；业务页面通过 pc serve 注入本机运行时。"""
+    from pc.services.accounts import identity
+
     app = FastAPI(title="post-collector", version=__version__, docs_url=None, redoc_url=None)
     sessions = Sessions()
     app.state.sessions = sessions
@@ -175,12 +185,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     protected = [Depends(authorized)]
 
+    @app.exception_handler(UnsafeLocalPathError)
     @app.exception_handler(ValueError)
     @app.exception_handler(search.SearchError)
     async def invalid_request(request: Request, exc: Exception):
         return JSONResponse(
             {"detail": str(exc), "copied": getattr(exc, "copied", False)}, status_code=400
         )
+
+    @app.exception_handler(SourceNotAuthorizedError)
+    async def source_denied(request: Request, exc: Exception):
+        return JSONResponse({"detail": str(exc)}, status_code=403)
 
     @app.exception_handler(sqlite3.Error)
     @app.exception_handler(OSError)
@@ -210,6 +225,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     assets = Path(__file__).resolve().parent.parent / "web"
     app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
+    @app.get("/add", include_in_schema=False)
+    @app.get("/manage", include_in_schema=False)
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(assets / "index.html")
@@ -224,11 +241,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             raise HTTPException(503, "请使用 pc serve 启动业务页面")
         ident, csrf = sessions.exchange(body.token)
         response.set_cookie("pc_session", ident, httponly=True, samesite="strict", path="/")
-        return {"csrf": csrf}
+        return {**identity(), "csrf": csrf}
 
     @app.get("/api/v1/session", dependencies=protected)
     def session(request: Request):
-        return {"csrf": sessions.check(request.cookies.get("pc_session", ""))}
+        return {**identity(), "csrf": sessions.check(request.cookies.get("pc_session", ""))}
+
+    @app.get("/identity", dependencies=protected)
+    def identity_json():
+        return identity()
 
     @app.post("/api/v1/logout", dependencies=protected)
     def logout(request: Request, response: Response):
@@ -239,6 +260,34 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def connect():
         assert runtime is not None
         return db.open_db(runtime.database, expect_exists=True)
+
+    upload_lock = threading.Lock()
+
+    @app.post("/api/v1/uploads", dependencies=protected)
+    async def upload(request: Request):
+        from pc.api.upload_form import parse
+        from pc.services import uploads
+
+        assert runtime is not None
+        form = await parse(request, media_limit=runtime.media_limit)
+
+        def execute():
+            paths = runtime.paths or db.resolve_paths(env={"PC_DATA_ROOT": str(runtime.cache_root.parent)})
+            limits = runtime.limits
+            # 工厂测试也沿用显式媒体限额。
+            from dataclasses import replace
+
+            limits = replace(limits, max_media_bytes=runtime.media_limit)
+            with upload_lock, connect() as conn:
+                return uploads.submit(
+                    conn, paths=paths, limits=limits, security=runtime.security, jobs=runtime.jobs,
+                    text=form.get("text", ""), note=form.get("note", ""), images=form.getlist("images"),
+                )
+
+        try:
+            return await run_in_threadpool(execute)
+        finally:
+            await form.close()
 
     @app.get("/api/v1/search", dependencies=protected)
     def find(request: Request):

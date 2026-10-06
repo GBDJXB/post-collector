@@ -64,9 +64,31 @@ Windows PowerShell 使用 `uv run pc ...`。WSL 使用其自身的 Python 与 uv
 
 ## 本机 Web 操作
 
-先完成建库和导入，再运行 `uv run pc serve`，打开终端输出的完整授权链接。链接在 10 分钟内有效，使用一次后建立临时 root 会话，页面会清除地址栏中的令牌。会话最长 8 小时，空闲 30 分钟失效；刷新页面保留会话，退出或重启服务使会话失效。需要重新授权时重启 `pc serve`。
+先完成建库，再运行 `uv run pc serve`，打开终端输出的完整授权链接。链接在 10 分钟内有效，使用一次后建立临时 root 会话，页面会清除地址栏中的令牌。会话最长 8 小时，空闲 30 分钟失效；刷新页面保留会话，退出或重启服务使会话失效。需要重新授权时重启 `pc serve`。
 
-服务监听 `127.0.0.1`，浏览器使用输出链接中的地址。可通过 `--port 8135`、`--path <库文件>` 和 `--root <仓库根目录>` 调整启动位置。临时 root 凭据授予本机内容操作权限，请保管终端中的授权链接。远程访问和持久账户按 DESIGN §6.1 后续交付。
+服务监听 `127.0.0.1`，浏览器使用输出链接中的地址。可通过 `--port 8135`、`--path <库文件>` 和 `--root <仓库根目录>` 调整启动位置。入口页提供加入新内容和检索/管理链接。临时 root 凭据授予本机内容操作权限，请保管终端中的授权链接。受邀用户远程认证入口见下节；持久 root 账户按 DESIGN §6.1 后续交付。
+
+### 在 Web 中加入内容
+
+进入“加入新内容”，粘贴文本、选择图片并填写可选备注。一次提交组成一条消息，图片保持选择顺序；提交后自动处理本次消息，显示成功、重复、隔离或任务失败。可见内容提供详情链接，后续可在管理页打标。
+
+支持 PNG、JPEG、GIF、WebP、AVIF、HEIC/HEIF。一次最多 19 张，单图遵循 `ingest.max_media_bytes`（默认 50 MiB），图片合计最多 256 MiB，请求体最多 258 MiB。文本遵循 `ingest.max_text_chars`（默认 100000 字符），备注最多 4096 字符。
+
+上传字节先保存到 `<data_root>/upload-staging/<随机ID>/`。成功和死信清理暂存副本；待重试保留，运行 `uv run pc work` 接续。隔离字节保存在隔离后端，不作为正常图片展示。进程异常留下的暂存目录先保留；手动检查时对照 `message.media_refs` 和对应 `job`，确认无 queued/failed/running 引用后再清理，清理前关闭服务与 worker。
+
+### 前端开发与构建
+
+前端是 React 单入口 SPA，路径为 `/`、`/add` 和 `/manage`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
+
+```powershell
+npm ci
+npm test
+npm run build
+```
+
+构建输出到 Python 包的 `src/pc/web`，修改源码后同步提交构建产物及 npm 锁文件。运行服务使用已构建资源，Python 部署无需 Node。组件测试使用模拟 API，实际页面验收建议先设置独立的 `PC_DATA_ROOT` 和 `PC__DB__PATH`，然后执行 `pc db apply`。
+
+### 检索与管理
 
 - 检索表单支持关键词、来源、标签、类型、日期、排序和重复消息选项。空关键词按时间展示最近消息，下一页沿用本次查询；重新检索返回第一页。默认展示 active、安全级内容。
 - 勾选结果中的消息可以批量添加或撤销标签。标签每行一个名称；选择“详情中勾选的内容项”可以给单独的部件打标。关联记录保留撤销历史，有效建议可以勾选确认或拒绝。
@@ -76,6 +98,29 @@ Windows PowerShell 使用 `uv run pc ...`。WSL 使用其自身的 Python 与 uv
 图片读取复用归档文件安全校验，浏览器预览支持 JPEG、PNG、GIF、WebP 和 AVIF，具体解码由浏览器决定。其他格式显示媒体链接与提示。Web 服务与导入/处理分别启动，待处理任务通过 `pc work` 执行。
 
 业务 API 位于 `/api/v1`，需要本机会话；写请求还需同源 Origin 和会话 CSRF 凭据。检索、标签、关联、别名与详情沿用版本化 JSON；媒体通过内容项与媒体 ID 获取。接口定义见 `/openapi.json`。查看缓存的保留与清理规则同 CLI。
+
+## 受邀账号与远程登录
+
+本机 root 使用现有一次性令牌和管理页面。登录响应包含身份说明，登录后访问 `/identity` 可直接查看 JSON。你本人远程访问时使用独立受邀账号。
+
+```powershell
+uv run pc user create reader
+uv run pc user list --json
+uv run pc user disable reader
+uv run pc user enable reader
+uv run pc user reset-password reader
+uv run pc serve --mode remote --port 8081 --public-origin https://archive.example.com
+```
+
+账号命令支持 `--path` 和 `--root`。创建账号先校验用户名和重名，通过后隐藏输入两次密码；重置密码同样隐藏输入两次，长度 15~128 字符；用户名为 3~64 位 ASCII 字母、数字、点、下划线或连字符，统一小写，root 为保留名称。密码以 Argon2id 哈希保存。停用、重新启用和重置密码使旧会话失效，账号操作遵循本机文件系统权限边界。
+
+远程服务监听 `127.0.0.1:8081`，由 HTTPS 代理或隧道转发。`--public-origin` 为精确的 HTTPS origin，例如 `https://archive.example.com`，不带末尾斜杠、路径、凭据、查询或 fragment。代理保留该 Host，只转发远程端口；本机管理端口独立。应用不信任转发头，也不根据代理的本机地址授予 root 权限。先确保其他应用没有占用端口，再启动两个入口。
+
+远程首页提供用户名和密码表单；成功后直接返回 `identity_version=1` JSON，包含 `identity`、`scope`、`operations` 和会话 `csrf`。`GET /api/v1/session` 可刷新身份，`POST /api/v1/logout` 携带同源 Origin 和 `X-CSRF-Token` 退出。登录表单的短期 CSRF 凭据随页面生成，5 分钟有效、使用一次。远程会话 8 小时绝对到期、30 分钟空闲到期，退出或服务重启后失效。
+
+当前远程入口只开放登录、会话、退出和健康检查。权限 JSON 中的受邀范围为全库 active、未删除、safe 图片及含图片混合消息；操作含现有 CLI 命令模板和中文注释，`executable=false`。它描述后续权限，不调用 CLI，也不提供检索或原图下载接口。本机 root 的操作标记 `execution_context=local_cli`，表示在本机终端执行。
+
+登录请求体最多 8 KiB，按实际接收字节计算；每个规范化用户名每分钟 5 次尝试，整个入口每分钟 30 次，超限返回 429。限流和会话状态驻内存且有容量上限，进程重启清空。远程仅接受有效受邀账号；未知账号、错误密码、停用账号和 root 账号使用统一认证失败消息。权限说明不授予远程用户服务器终端或本机文件系统访问能力。
 
 ## 导入文件
 
@@ -232,7 +277,7 @@ uv run pc reveal --message 123
 | Linux | `$XDG_DATA_HOME/post-collector`，缺省 `~/.local/share/post-collector` |
 | macOS | `~/Library/Application Support/post-collector` |
 
-数据根包含 `media/`、`thumbs/`、`cold/`、`quarantine/`、`backup/`、`models/` 和 `view-cache/`；当前实际内容主要在库文件、媒体与隔离目录中。
+数据根包含 `media/`、`thumbs/`、`cold/`、`quarantine/`、`backup/`、`models/`、`upload-staging/` 和 `view-cache/`；当前实际内容主要在库文件、媒体与隔离目录中。
 
 | 配置 | 作用 |
 | --- | --- |

@@ -46,8 +46,9 @@ def web(tmp_path, monkeypatch, capsys):
             targets[name.partition(".")[0]] = row
         elif row["item_type"] == "text":
             targets["text"] = row
-    app = create_app(Runtime(path, data / "view-cache", 50 * 1024 * 1024))
-    return {"app": app, "path": path, "data": data, "targets": targets}
+    runtime = Runtime(path, data / "view-cache", 50 * 1024 * 1024)
+    app = create_app(runtime)
+    return {"app": app, "path": path, "data": data, "targets": targets, "runtime": runtime}
 
 
 @pytest_asyncio.fixture
@@ -332,7 +333,264 @@ async def test_page_csp_and_text_data(client, web):
     page = await client.get("/")
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     script = (await client.get("/assets/app.js")).text
-    assert "innerHTML" not in script and "textContent" in script
+    assert "textContent" in script
+    assert 'type="module"' in page.text
     detail = (await client.get("/api/v1/detail", params=target(web))).json()
     assert "<script>" in detail["parts"][0]["text"]
     assert "bootstrap" not in (await client.get("/openapi.json")).text
+
+
+@pytest.mark.asyncio
+async def test_spa_routes_and_missing_resources(client):
+    home = await client.get("/")
+    for route in ("/add", "/manage"):
+        assert (await client.get(route)).text == home.text
+    assert (await client.get("/api/v1/missing")).status_code == 404
+    assert (await client.get("/assets/missing.js")).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("csrf", [False, True])
+async def test_upload_auth_before_reading(client, web, csrf):
+    if csrf:
+        await login(client, web)
+        client.headers["X-CSRF-Token"] = "wrong"
+
+    async def unread():
+        raise AssertionError("鉴权失败应当先于读取请求体")
+        yield b""
+
+    response = await client.post("/api/v1/uploads", content=unread(), headers={"Content-Type": "multipart/form-data; boundary=x"})
+    assert response.status_code == (403 if csrf else 401)
+
+
+@pytest.mark.asyncio
+async def test_upload_text_and_duplicate(client, web):
+    await login(client, web)
+    async def post(text, note):
+        return await client.post("/api/v1/uploads", files={"text": (None, text), "note": (None, note)})
+    first = await post("新内容 中文\n原始格式", "第一份备注")
+    assert first.status_code == 200, first.text
+    data = first.json()
+    assert data["status"] == "succeeded" and not data["duplicate"] and len(data["content_ids"]) == 1
+    second = (await post("新内容 中文 原始格式", "后来的备注")).json()
+    assert second["duplicate"] and second["message_id"] == data["message_id"]
+    detail = (await client.get("/api/v1/detail", params={"message_id": data["message_id"]})).json()
+    assert detail["parts"][0]["text"] == "新内容 中文\n原始格式"
+    assert detail["origin_note"] == "第一份备注"
+
+
+@pytest.mark.asyncio
+async def test_upload_single_image_cli_compatibility(client, web):
+    await login(client, web)
+    response = await client.post("/api/v1/uploads", files={"images": ("更名.png", PNG)})
+    assert response.status_code == 200, response.text
+    assert response.json()["duplicate"]
+    assert response.json()["message_id"] == web["targets"]["image"]["message_id"]
+    assert not list((web["data"] / "upload-staging").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_upload_multi_image_order_names_and_mixed(client, web):
+    await login(client, web)
+    gif = b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 20
+    files = [("images", ("同名.png", PNG)), ("images", ("同名.gif", gif)), ("text", (None, "多图配文"))]
+    response = await client.post("/api/v1/uploads", files=files)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["status"] == "succeeded" and len(data["content_ids"]) == 3
+    detail = (await client.get("/api/v1/detail", params={"message_id": data["message_id"]})).json()
+    assert [p["item_type"] for p in detail["parts"]] == ["text", "image", "image"]
+    assert [p["original_name"] for p in detail["parts"][1:]] == ["同名.png", "同名.gif"]
+    assert not list((web["data"] / "upload-staging").iterdir())
+    again = (await client.post("/api/v1/uploads", files=files)).json()
+    assert again["duplicate"] and again["message_id"] == data["message_id"]
+    reversed_files = [files[1], files[0], files[2]]
+    assert (await client.post("/api/v1/uploads", files=reversed_files)).json()["message_id"] != data["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_upload_same_filenames_are_separate(client, web):
+    await login(client, web)
+    response = await client.post("/api/v1/uploads", files=[("images", ("same.png", PNG)), ("images", ("same.png", PNG)), ("text", (None, "同名多图"))])
+    assert response.status_code == 200, response.text
+    assert len(response.json()["content_ids"]) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("files", [
+    [("text", (None, "  \n"))], [("actor_id", (None, "1"))],
+    [("text", (None, "a")), ("text", (None, "b"))],
+    [("images", ("../outside.png", PNG))], [("images", ("a.png", b""))],
+    [("images", ("a.txt", b"text"))], [("images", ("NUL.png", PNG))],
+    [("images", (None, "fake"))], [("text", ("x.txt", b"text"))],
+    [("note", (None, "a" * 4097)), ("text", (None, "text"))],
+])
+async def test_upload_invalid_form(client, web, files):
+    await login(client, web)
+    response = await client.post("/api/v1/uploads", files=files)
+    assert response.status_code in {400, 422}, response.text
+    root = web["data"] / "upload-staging"
+    assert not root.exists() or not list(root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_upload_length_and_count_limits(client, web):
+    from dataclasses import replace
+
+    await login(client, web)
+    web["runtime"].limits = replace(web["runtime"].limits, max_text_chars=3)
+    assert (await client.post("/api/v1/uploads", files={"text": (None, "四个字符")})).status_code == 400
+    web["runtime"].media_limit = 10
+    assert (await client.post("/api/v1/uploads", files={"images": ("x.png", PNG)})).status_code == 413
+    web["runtime"].media_limit = 100000
+    assert (await client.post("/api/v1/uploads", files=[("images", (f"{i}.png", PNG)) for i in range(20)])).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_upload_actual_body_and_total_limit(client, web, monkeypatch):
+    from pc.adapters import upload_files
+
+    await login(client, web)
+    request = client.build_request("POST", "/api/v1/uploads", files={"images": ("x.png", PNG)})
+    body = request.read()
+    monkeypatch.setattr(upload_files, "MAX_REQUEST_BYTES", len(body) - 1)
+
+    async def stream():
+        yield body[:40]
+        yield body[40:]
+
+    response = await client.post("/api/v1/uploads", content=stream(), headers={"Content-Type": request.headers["Content-Type"], "Content-Length": "1"})
+    assert response.status_code == 413
+    monkeypatch.setattr(upload_files, "MAX_REQUEST_BYTES", 1000000)
+    monkeypatch.setattr(upload_files, "MAX_TOTAL_BYTES", len(PNG) + 1)
+    assert (await client.post("/api/v1/uploads", files=[("images", ("a.png", PNG)), ("images", ("b.png", PNG))])).status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_upload_quarantine(client, web):
+    await login(client, web)
+    response = await client.post("/api/v1/uploads", files={"images": ("fake.png", b"MZ" + b"bad executable" * 4)})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "quarantined" and not response.json()["content_ids"]
+    assert not list((web["data"] / "upload-staging").iterdir())
+    assert list((web["data"] / "quarantine").rglob("*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_non_image_with_image_name_is_quarantined(client, web):
+    await login(client, web)
+    # MP4 是普通管线支持的媒体，但浏览器入口只接收图片。
+    video = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 30
+    response = await client.post("/api/v1/uploads", files={"images": ("video.png", video)})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "quarantined"
+    assert not response.json()["content_ids"]
+
+
+@pytest.mark.asyncio
+async def test_upload_revoked_authorization(client, web):
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        conn.execute("UPDATE source_authorization SET revoked_at=?", (db.now_iso(),))
+    response = await client.post("/api/v1/uploads", files={"images": ("x.png", PNG)})
+    assert response.status_code == 403
+    assert not (web["data"] / "upload-staging").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_retry_retains_files_and_work_cleans(client, web, monkeypatch):
+    from pc.services.pipeline import Worker
+
+    await login(client, web)
+    original = Worker._collect_one
+    monkeypatch.setattr(Worker, "_collect_one", lambda *args: (_ for _ in ()).throw(OSError("暂时失败")))
+    response = await client.post("/api/v1/uploads", files=[("images", ("x.png", PNG)), ("text", (None, "重试样本"))])
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["status"] == "failed"
+    assert list((web["data"] / "upload-staging").rglob("x.png"))
+    monkeypatch.setattr(Worker, "_collect_one", original)
+    with db.open_db(web["path"]) as conn:
+        conn.execute("UPDATE job SET run_after='2000-01-01T00:00:00.000Z' WHERE target_id=?", (data["message_id"],))
+    assert cli.main(["work", "--path", str(web["path"])]) == 0
+    assert not list((web["data"] / "upload-staging").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_upload_does_not_run_other_jobs(client, web):
+    path = web["data"] / "later.txt"
+    path.write_text("排队但不执行", encoding="utf-8")
+    assert cli.main(["upload", str(path), "--no-process", "--path", str(web["path"])]) == 0
+    with db.open_db(web["path"]) as conn:
+        old = dict(conn.execute("SELECT * FROM job WHERE status='queued'").fetchone())
+    await login(client, web)
+    assert (await client.post("/api/v1/uploads", files={"text": (None, "定向处理")})).json()["status"] == "succeeded"
+    with db.open_db(web["path"]) as conn:
+        assert dict(conn.execute("SELECT * FROM job WHERE job_id=?", (old["job_id"],)).fetchone()) == old
+
+
+@pytest.mark.asyncio
+async def test_upload_staging_redirect_rejected(client, web):
+    import os
+
+    destination = web["data"] / "outside"
+    destination.mkdir()
+    root = web["data"] / "upload-staging"
+    try:
+        os.symlink(destination, root, target_is_directory=True)
+    except OSError:
+        pytest.skip("系统不允许创建符号链接")
+    await login(client, web)
+    assert (await client.post("/api/v1/uploads", files={"images": ("x.png", PNG)})).status_code == 400
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_upload_dead_cleans_and_enqueue_failure_cleans(client, web, monkeypatch):
+    from pc.services import ingest
+    from pc.services.pipeline import PermanentError, Worker
+
+    await login(client, web)
+    monkeypatch.setattr(Worker, "_collect_one", lambda *args: (_ for _ in ()).throw(PermanentError("终态失败")))
+    response = await client.post("/api/v1/uploads", files=[("images", ("x.png", PNG)), ("text", (None, "死信样本"))])
+    assert response.json()["status"] == "dead"
+    assert not list((web["data"] / "upload-staging").iterdir())
+    monkeypatch.setattr(ingest, "ingest_messages", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("入队失败")))
+    response = await client.post("/api/v1/uploads", files={"images": ("x.png", PNG)})
+    assert response.status_code == 503
+    assert not list((web["data"] / "upload-staging").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_upload_targeted_recovery_leaves_other_running_jobs(client, web):
+    path = web["data"] / "stale.txt"
+    path.write_text("独立超时任务", encoding="utf-8")
+    assert cli.main(["upload", str(path), "--no-process", "--path", str(web["path"])]) == 0
+    with db.open_db(web["path"]) as conn:
+        conn.execute("UPDATE job SET status='running',attempts=1,locked_at='2000-01-01T00:00:00.000Z',locked_by='other' WHERE status='queued'")
+        old = dict(conn.execute("SELECT * FROM job WHERE status='running'").fetchone())
+    await login(client, web)
+    response = await client.post("/api/v1/uploads", files={"text": (None, "另一个定向消息")})
+    assert response.json()["status"] == "succeeded"
+    with db.open_db(web["path"]) as conn:
+        assert dict(conn.execute("SELECT * FROM job WHERE job_id=?", (old["job_id"],)).fetchone()) == old
+
+
+def test_staging_cleanup_scope_and_hardlink(tmp_path):
+    import os
+
+    from pc.adapters import upload_files
+
+    root = tmp_path / "uploads"
+    root.mkdir()
+    outside = tmp_path / "keep.txt"
+    outside.write_text("保留", encoding="utf-8")
+    with pytest.raises(ValueError, match="范围"):
+        upload_files.cleanup(root, outside)
+    directory = root / ("a" * 32)
+    directory.mkdir()
+    os.link(outside, directory / "linked.txt")
+    with pytest.raises(ValueError, match="硬链接"):
+        upload_files.cleanup(root, directory)
+    assert outside.read_text(encoding="utf-8") == "保留"

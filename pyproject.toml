@@ -21,10 +21,12 @@ classifiers = [
 # 注意：不引入 ORM，也不引入数据库驱动 —— 迁移与查询走顺序 SQL（见 migrations/），
 # SQLite 由标准库 sqlite3 提供（Python 3.12 自带 ≥ 3.40，启动时校验）。
 dependencies = [
+  "argon2-cffi>=23.1",
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "pydantic>=2.9",
   "pyyaml>=6.0",
+  "python-multipart>=0.0.20",
 ]
 
 # 开发依赖使用 PEP 735 的 dependency-groups：`uv sync` 会默认装上它们，

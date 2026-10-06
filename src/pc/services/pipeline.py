@@ -24,8 +24,9 @@ import platform as platform_module
 import sqlite3
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from pc.adapters.magic_scan import MagicNumberScanner, declared_mime_for_name, item_type_for
@@ -164,6 +165,7 @@ class Worker:
         job_settings: JobSettings | None = None,
         worker_id: str | None = None,
         stale_lock_minutes: int = STALE_LOCK_MINUTES,
+        upload_root: Path | None = None,
     ) -> None:
         self._conn = conn
         self._storage = storage
@@ -174,6 +176,7 @@ class Worker:
         self._worker_id = worker_id or f"{os.getpid()}@{platform_module.node() or 'local'}"
         self._stale_minutes = stale_lock_minutes
         self._backend_ids: dict[str, int] = {}
+        self._upload_root = upload_root
 
     @property
     def worker_id(self) -> str:
@@ -181,13 +184,15 @@ class Worker:
 
     # -- 队列 ---------------------------------------------------------------
 
-    def recover_stale(self) -> int:
+    def recover_stale(self, *, message_id: int | None = None) -> int:
         """恢复超时 running：尚有次数则排队，耗尽则死信并审计。"""
         cutoff = _iso_minutes_ago(self._stale_minutes)
+        target_sql = " AND target_type='message' AND target_id=? AND job_type='ingest.process'" if message_id is not None else ""
+        target_args = (message_id,) if message_id is not None else ()
         with transaction(self._conn):
             exhausted = self._conn.execute(
                 "SELECT * FROM job WHERE status = 'running' AND attempts >= max_attempts "
-                "AND (locked_at IS NULL OR locked_at < ?)", (cutoff,)
+                "AND (locked_at IS NULL OR locked_at < ?)" + target_sql, (cutoff, *target_args)
             ).fetchall()
             for row in exhausted:
                 moment = now_iso()
@@ -204,12 +209,15 @@ class Worker:
                 )
             cursor = self._conn.execute(
                 "UPDATE job SET status = 'queued', locked_by = NULL, locked_at = NULL, "
-                "updated_at = ? WHERE status = 'running' AND (locked_at IS NULL OR locked_at < ?)",
-                (now_iso(), cutoff),
+                "updated_at = ? WHERE status = 'running' AND (locked_at IS NULL OR locked_at < ?)" + target_sql,
+                (now_iso(), cutoff, *target_args),
             )
+        for row in exhausted:
+            if row['target_type'] == 'message':
+                self._cleanup_upload(int(row['target_id']))
         return int(cursor.rowcount or 0) + len(exhausted)
 
-    def claim(self) -> dict[str, Any] | None:
+    def claim(self, *, message_id: int | None = None) -> dict[str, Any] | None:
         """原子抢占一条任务（``BEGIN IMMEDIATE`` + 选一条 + 标记，见 DESIGN §2.3）。
 
         ``attempts`` 在这里就 +1：抢占即一次尝试，进程被杀也要算数，否则一个能稳定
@@ -221,8 +229,9 @@ class Worker:
                 "SELECT job_id FROM job "
                 "WHERE status IN ('queued', 'failed') AND run_after <= ? "
                 "  AND attempts < max_attempts "
-                "ORDER BY priority, job_id LIMIT 1",
-                (moment,),
+                + ("AND target_type='message' AND target_id=? AND job_type='ingest.process' " if message_id is not None else "")
+                + "ORDER BY priority, job_id LIMIT 1",
+                (moment, message_id) if message_id is not None else (moment,),
             ).fetchone()
             if row is None:
                 return None
@@ -257,6 +266,33 @@ class Worker:
         return report
 
     # -- 任务执行 -----------------------------------------------------------
+
+    def run_message(self, message_id: int) -> WorkReport:
+        """只抢占指定消息的可执行任务，不改动其他任务。"""
+        recovered = self.recover_stale(message_id=message_id)
+        job = self.claim(message_id=message_id)
+        if job is None:
+            return WorkReport(recovered=recovered)
+        status, note = self._run_job(job)
+        return WorkReport(recovered=recovered).with_outcome(
+            int(job["job_id"]), status, note, claimed=1,
+            **{status: 1} if status in {"succeeded", "failed", "dead"} else {},
+        )
+
+    def _cleanup_upload(self, message_id: int) -> None:
+        if self._upload_root is None:
+            return
+        from pc.adapters.upload_files import cleanup_refs
+
+        message = self._load("message", message_id)
+        if message is not None:
+            try:
+                cleanup_refs(self._upload_root, self._refs(message))
+            except (OSError, RuntimeError, ValueError):
+                # 终态已经落账；清理失败保留字节供人工检查。
+                import logging
+
+                logging.getLogger(__name__).exception("上传暂存清理失败")
 
     def _run_job(self, job: Mapping[str, Any]) -> tuple[str, str]:
         try:
@@ -320,6 +356,8 @@ class Worker:
                     status,
                 ),
             )
+        if status in {'succeeded', 'dead'}:
+            self._cleanup_upload(int(job.get('target_id') or 0))
         return status, note
 
     # -- 单条消息 -----------------------------------------------------------
@@ -391,6 +429,14 @@ class Worker:
         declared = declared_mime_for_name(name)
         data = connector.fetch_media(ref)
         verdict = self._scanner.scan(data, declared_mime=declared)
+        if self._upload_root is not None:
+            from pc.adapters.safe_files import absolute_path
+
+            path = absolute_path(ref)
+            if path.is_relative_to(absolute_path(self._upload_root)) and verdict.details.get("mime_detected") not in {
+                "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/heic",
+            }:
+                verdict = replace(verdict, passed=False, reasons=(*verdict.reasons, "浏览器上传仅支持指定图片格式"))
         digest = hashlib.sha256(data).hexdigest()
         if self._tombstoned(digest):
             raise PermanentError(

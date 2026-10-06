@@ -7,9 +7,9 @@ description: "项目开发入口：当前状态、代码导航、命令与实现
 
 ## 当前状态与工作方式
 
-post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入/上传、扫描、去重、落库、root 人工打标、CLI 与本机 Web 检索和内容查看；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
+post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来源的内容。当前可用链路为本地导入、CLI 与 Web 上传、扫描、去重、落库、root 人工打标、受邀账号管理与独立远程认证、CLI 与本机 Web 检索和内容查看；配置解析、迁移、备份、索引重建与健康接口已接线。schema 为 35 张 STRICT 表、2 个 FTS5 索引、6 个同步触发器，迁移到 0009；端口共 13 个。
 
-模型打标、敏感度分类、邀请制账户与平台连接器的交付范围见 DESIGN.md §9。本机 Web 使用临时 root 会话，持久账户与远程鉴权按 §6.1 后续交付；匿名提报入口属于阶段 2。
+模型打标、敏感度分类、邀请制账户与平台连接器的交付范围见 DESIGN.md §9。本机 Web 使用临时 root 会话，持久 root 账户与远程业务按 §6.1 后续交付；受邀密码认证已实现；匿名提报入口属于阶段 2。
 
 修改实现前读取 DESIGN.md 对应章节。改变设计契约时，同时更新该章节和附录 C。改代码必须同步 AGENTS.md 与 README.md；两份入口文档以当前事实、操作和约束为主，历史方案、实测过程与设计理由放在 DESIGN.md，迁移细节放在 migrations/README.md。用肯定句描述当前路径，必要的安全禁令保留明确表述。
 
@@ -23,6 +23,7 @@ post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来
 | 只安装运行时依赖 | `uv sync --no-dev` |
 | 体检 | `uv run pc doctor` |
 | 静态检查 | `uv run ruff check src`；改过测试时 `uv run ruff check src tests` |
+| 前端构建与组件测试 | 在 frontend 中运行 npm ci、npm test、npm run build；提交锁文件和构建产物 |
 | 语法检查 | `python -m compileall -q src` |
 | 测试 | `uv run pytest` |
 | 检索性能验收 | `uv run python tools/bench_search.py --scale 100000 --assert` |
@@ -31,7 +32,7 @@ post-collector 使用 Python、SQLite 与本地目录存储，归档已授权来
 | 重算派生数据与索引 | `uv run pc db reindex --recompute-derived` |
 | 查看 / 播种设置 | `uv run pc config show --explain` / `uv run pc config seed` |
 
-测试在临时目录运行。最近完整结果为 944 通过、5 条 Windows 符号链接权限跳过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
+测试在临时目录运行。最近完整结果为 1009 通过、6 条 Windows 符号链接权限跳过；前端组件测试 7 项通过。新接口测试按库的弃用提示选用客户端。API 提供 `/`、`/healthz`、`/api/v1/meta`、`/docs`。
 
 doctor 报告库、索引与运行时目录的状态和配置来源；各段不可达时仍完成体检。完整 CLI 参数、备份和升级步骤见 README.md。
 
@@ -48,13 +49,17 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | `src/pc/domain.py` | 状态、跨层结构、规范化、分词与帖签名 |
 | `src/pc/ports/` | 13 个 Protocol 端口 |
 | `src/pc/config.py` | 严格校验、四层解析、设置变更闸门 |
-| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search/tag/render/show/open/reveal/serve 接线 |
+| `src/pc/cli.py` | doctor/config/db/source/import/upload/work/item/search/tag/render/show/open/reveal/user/serve 接线 |
 | `src/pc/adapters/sqlite.py` | 路径、连接、迁移、备份、设置与派生数据重算 |
 | `src/pc/services/tagging.py` | 标签应用、撤销、建议确认、审计与计数 |
 | `src/pc/adapters/tag_normalizer.py` | 规范名、别名解析与有效标签条件 |
 | `src/pc/services/viewing.py` | 详情入口、内容类型与复制前置检查 |
 | `src/pc/services/desktop_view.py` | CLI 与 Web 共用的文件准备、复查和系统操作 |
-| `src/pc/web/` | 原生 HTML、JavaScript、CSS 表单与结果展示 |
+| `frontend/` | React 页面、React Router 路由、组件测试与 npm 锁文件 |
+| `src/pc/services/uploads.py` | 浏览器提交、幂等身份与本次消息定向处理 |
+| `src/pc/services/runtime.py` | CLI 与 HTTP 共用 worker 构造 |
+| `src/pc/adapters/upload_files.py` | 有界暂存、文件名与路径检查、终态清理 |
+| `src/pc/web/` | React/Vite 构建的单入口 HTML 和本地 JS/CSS 资源 |
 | `src/pc/adapters/content_detail.py` | ID 详情查询、读快照与批量组装 |
 | `src/pc/adapters/view_files.py` | 有界媒体读取、哈希验证、查看副本与静态 HTML |
 | `src/pc/adapters/windows_view.py` | 默认程序、文件定位与 Unicode 文本/文件剪贴板 |
@@ -68,6 +73,9 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 | `src/pc/adapters/local_storage.py` | 内容寻址、原子写入与幂等存储 |
 | `src/pc/adapters/magic_scan.py` | 类型白名单、字节限额、扫描判定 |
 | `src/pc/services/` | 来源、摄入、worker、检索业务规则 |
+| `src/pc/adapters/passwords.py` | Argon2id 哈希与确定性验证结果 |
+| `src/pc/services/accounts.py` | 受邀账号、Argon2id、审计、会话版本与封闭身份目录 |
+| `src/pc/api/remote_auth.py` | 独立远程登录、CSRF、有界限流与身份 JSON |
 | `src/pc/api/` | 本机会话、参数校验、媒体与业务路由 |
 | `tests/` | 单元、端到端、schema、安全与性能工具回归 |
 
@@ -117,11 +125,25 @@ doctor 报告库、索引与运行时目录的状态和配置来源；各段不�
 
 ## 本机 Web 契约
 
-- `pc serve` 校验已有库结构后，单进程监听 `127.0.0.1`，关闭代理头信任；后台任务由 `pc work` 执行。业务运行时从配置解析后注入应用，直接调用工厂提供页面、探针和接口定义。
+- `pc serve` 校验已有库结构后，单进程监听 `127.0.0.1`，关闭代理头信任；Web 上传立即处理本次消息，其他后台任务由 `pc work` 执行。业务运行时从配置解析后注入应用，直接调用工厂提供页面、探针和接口定义。
 - 一次性授权令牌在 fragment 中传入，10 分钟有效；交换后清除 fragment。会话驻内存，Cookie 为 HttpOnly/SameSite=Strict，8 小时绝对到期、30 分钟空闲到期，退出及进程重启立即失效。
 - 业务请求验证会话、本机对端与当前 Host；写操作验证 Origin 与 CSRF。身份由服务器授予本机 root，客户端不能指定 actor_id。标签写入复用 local_root 审计与事务。
 - 查询与详情沿用既有服务和版本化结果，默认 active/safe。数据库及文件操作在同步路由执行边界运行，连接按请求关闭。媒体接口检查可见关联并复用安全读取，存储与缓存目录保持私有。
-- 页面使用 textContent 展示归档文本，以内容项/媒体 ID 构造图片地址；同源资源受 CSP 约束。系统动作调用共享服务，不执行 CLI 子进程；混合复制在生成文件前拒绝，部分失败响应保留 copied 状态。
+- 页面使用 React 文本节点展示归档文本，以内容项/媒体 ID 构造图片地址；同源资源受 CSP 约束。系统动作调用共享服务，不执行 CLI 子进程；混合复制在生成文件前拒绝，部分失败响应保留 copied 状态。
+
+- 前端源码在 frontend，使用 npm ci/npm test/npm run build；构建产物 src/pc/web 随 wheel 分发并提交。运行服务无需 Node，开发构建要求 Node 22.12 以上。路由 /、/add、/manage 共用 HTML，刷新可直接访问；会话交换清除 fragment 并保留路径与查询。
+- POST /api/v1/uploads 接受 text/note/images multipart，身份为会话 root，来源固定 manual。鉴权在请求体读取前完成，按实际字节校验单图、256 MiB 媒体总量与 258 MiB 请求上限，最多 19 张；文本用配置上限，备注 4096 字符。
+- 暂存位于 data_root/upload-staging/UUID，按选择顺序存独立子目录；来源 roots 持久化以支持 pc work 接续。成功或死信清理、可重试保留，清理仅允许该根的 UUID 直接子目录；异常残留先保留并人工对照任务检查。
+- worker.run_message 只恢复与抢占指定消息任务，执行复用原有扫描、授权、重试和审计。单图/纯文本身份与 CLI 兼容，多图身份包含有序媒体哈希与规范化文本哈希；文件名和备注不参与身份。
+
+## 受邀账号与远程认证契约
+
+- pc user create/list/disable/enable/reset-password 仅经本机 CLI 管理 app_user；创建固定 tier=1；先只读校验用户名与重名，再隐藏输入两次密码，写入事务再次查重。用户名规范化为小写 ASCII、3~64 位，root 保留；密码 15~128 字符且保持原样。Argon2id 参数为 19 MiB、2 次迭代、并行度 1。
+- pc serve --mode remote --port 8081 --public-origin https://archive.example.com 创建独立认证应用，只监听回环。HTTPS 代理保留精确 Host，仅转发此端口；后端检查 socket/Host/Origin，关闭转发头信任。远程应用不挂载本机资源、归档业务或 OpenAPI。
+- 远程入口仅有 /、/api/v1/session、/api/v1/logout、/healthz。登录接收有界 URL 编码表单，成功返回 identity_version=1 JSON。受邀策略固定为全库 safe 图片及含图片混合消息，业务 executable=false；root 及其他 tier 均拒绝远程认证。
+- 本机临时 root 保留一次性令牌、现有业务和 csrf 字段，新增身份 JSON 与受保护 /identity。两个应用的 Cookie、凭据与会话独立；远程本机 socket 不构成 root 证明。操作目录仅作说明，不能执行 CLI。
+- 远程 Cookie 使用 Secure/HttpOnly/SameSite=Strict/Path=/，登录表单 CSRF 5 分钟单次有效，登录轮换会话。会话 8 小时绝对期限、30 分钟空闲期限，驻内存；每请求检查 tier、状态、密码与账号版本。管理操作推进 updated_at，停用后启用也不能恢复旧会话。
+- 登录实际字节上限 8 KiB；用户名每分钟 5 次、全局每分钟 30 次，有界驻内存状态。认证错误统一，凭据禁止进日志与账号结果。权限与账号认证复用现有表，本次无迁移、无通用 RBAC 编辑、无实际远程内容接口。
 
 ## 检索契约
 
