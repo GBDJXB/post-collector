@@ -7,49 +7,34 @@ description: "post-collector 使用手册：安装、文件导入、检索、配
 
 自托管的内容采集与检索工具，用于归档自己拥有或已获授权的图文内容。通过命令行完成本地导入、扫描、去重和存储，通过 CLI 或本机 Web 页面检索、人工打标和查看内容，数据保存为 SQLite 文件与本地媒体文件。
 
-## 当前能力
+[快速开始](#快速开始) · [本机 Web](#本机-web-操作) · [CLI 使用](#cli-使用) · [配置](#配置) · [备份与升级](#备份与升级) · [开发](#开发)
 
-| 能力 | 状态 |
-| --- | --- |
-| 官方导出目录导入、手工上传、来源授权校验 | 可用 |
-| 魔数扫描、字节限额、隔离存储、SHA-256 去重 | 可用 |
-| 关键词与来源、标签、类型、时间过滤，整帖展示与翻页 | 可用 |
-| root 人工标签、别名、建议确认与 JSON 表格管道 | 可用 |
-| 正文与详情 JSON、Windows 默认程序打开、文件定位与复制 | 可用 |
-| 数据库迁移、结构校验、备份、索引重建 | 可用 |
-| 配置校验、设置项播种、生效值与来源查询 | 可用 |
-| 健康检查与运行模式接口 | 可用 |
-| 本机 Web 检索、详情、标签与别名表单 | 可用 |
+## 安装要求
 
-当前操作入口为 CLI 与本机 Web。模型打标、敏感度分类、邀请制账户、平台连接器、缩略图、内容删除与自动容量管理按 [DESIGN.md §9](DESIGN.md#9-实施路线图) 交付。
-
-## 准备环境
-
-- Python 3.12+，自带 SQLite ≥ 3.40；使用 `uv` 安装项目依赖。
-- 建议 4 核 CPU、8 GB 内存，数据库与近期媒体放在 SSD。
+- Python 3.12+，SQLite 3.40+；使用 [uv](https://docs.astral.sh/uv/) 安装项目依赖。
 - 一个可写的数据目录；备份目标放在另一块盘或 NAS。
 - 首次安装依赖需要联网，本地导入和检索离线运行。
 
-## 五分钟跑起来
+## 快速开始
 
 在仓库根目录执行。首次 `pc db apply` 创建库文件。
 
-```bash
+```powershell
 uv sync
 uv run pc doctor
 uv run pc db apply
 uv run pc db status
 uv run pc config seed
-uv run pc upload <文件或目录> --note "来源线索"
+uv run pc upload "D:\素材\猫.jpg" --note "来源线索"
 uv run pc item list
-uv run pc search <关键词>
+uv run pc search 猫
 ```
 
 `uv sync` 安装运行时与开发依赖；部署时可用 `uv sync --no-dev`。`uv.lock` 随仓库保存。
 
 启动本机 Web：
 
-```bash
+```powershell
 uv run pc serve
 ```
 
@@ -66,7 +51,7 @@ Windows PowerShell 使用 `uv run pc ...`。WSL 使用其自身的 Python 与 uv
 
 先完成建库，再运行 `uv run pc serve`，打开终端输出的完整授权链接。链接在 10 分钟内有效，使用一次后建立临时 root 会话，页面会清除地址栏中的令牌。会话最长 8 小时，空闲 30 分钟失效；刷新页面保留会话，退出或重启服务使会话失效。需要重新授权时重启 `pc serve`。
 
-服务监听 `127.0.0.1`，浏览器使用输出链接中的地址。可通过 `--port 8135`、`--path <库文件>` 和 `--root <仓库根目录>` 调整启动位置。入口页提供加入新内容和检索/管理链接。临时 root 凭据授予本机内容操作权限，请保管终端中的授权链接。受邀用户远程认证入口见下节；持久 root 账户按 DESIGN §6.1 后续交付。
+服务监听 `127.0.0.1`，浏览器使用输出链接中的地址。可通过 `--port 8135`、`--path <库文件>` 和 `--root <仓库根目录>` 调整启动位置。入口页提供加入新内容和检索/管理链接。临时 root 凭据授予本机内容操作权限，请保管终端中的授权链接。受邀账号的独立登录入口见[账号与独立登录](#账号与独立登录)。
 
 ### 在 Web 中加入内容
 
@@ -75,18 +60,6 @@ Windows PowerShell 使用 `uv run pc ...`。WSL 使用其自身的 Python 与 uv
 支持 PNG、JPEG、GIF、WebP、AVIF、HEIC/HEIF。一次最多 19 张，单图遵循 `ingest.max_media_bytes`（默认 50 MiB），图片合计最多 256 MiB，请求体最多 258 MiB。文本遵循 `ingest.max_text_chars`（默认 100000 字符），备注最多 4096 字符。
 
 上传字节先保存到 `<data_root>/upload-staging/<随机ID>/`。成功和死信清理暂存副本；待重试保留，运行 `uv run pc work` 接续。隔离字节保存在隔离后端，不作为正常图片展示。进程异常留下的暂存目录先保留；手动检查时对照 `message.media_refs` 和对应 `job`，确认无 queued/failed/running 引用后再清理，清理前关闭服务与 worker。
-
-### 前端开发与构建
-
-前端是 React 单入口 SPA，路径为 `/`、`/add` 和 `/manage`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
-
-```powershell
-npm ci
-npm test
-npm run build
-```
-
-构建输出到 Python 包的 `src/pc/web`，修改源码后同步提交构建产物及 npm 锁文件。运行服务使用已构建资源，Python 部署无需 Node。组件测试使用模拟 API，实际页面验收建议先设置独立的 `PC_DATA_ROOT` 和 `PC__DB__PATH`，然后执行 `pc db apply`。
 
 ### 检索与管理
 
@@ -99,36 +72,17 @@ npm run build
 
 业务 API 位于 `/api/v1`，需要本机会话；写请求还需同源 Origin 和会话 CSRF 凭据。检索、标签、关联、别名与详情沿用版本化 JSON；媒体通过内容项与媒体 ID 获取。接口定义见 `/openapi.json`。查看缓存的保留与清理规则同 CLI。
 
-## 受邀账号与远程登录
+## CLI 使用
 
-本机 root 使用现有一次性令牌和管理页面。登录响应包含身份说明，登录后访问 `/identity` 可直接查看 JSON。你本人远程访问时使用独立受邀账号。
+本地 CLI 按操作系统文件权限使用；完整参数通过 `uv run pc --help` 或 `uv run pc <命令> --help` 查看。
+
+### 导入文件
+
+#### 手工上传
 
 ```powershell
-uv run pc user create reader
-uv run pc user list --json
-uv run pc user disable reader
-uv run pc user enable reader
-uv run pc user reset-password reader
-uv run pc serve --mode remote --port 8081 --public-origin https://archive.example.com
-```
-
-账号命令支持 `--path` 和 `--root`。创建账号先校验用户名和重名，通过后隐藏输入两次密码；重置密码同样隐藏输入两次，长度 15~128 字符；用户名为 3~64 位 ASCII 字母、数字、点、下划线或连字符，统一小写，root 为保留名称。密码以 Argon2id 哈希保存。停用、重新启用和重置密码使旧会话失效，账号操作遵循本机文件系统权限边界。
-
-远程服务监听 `127.0.0.1:8081`，由 HTTPS 代理或隧道转发。`--public-origin` 为精确的 HTTPS origin，例如 `https://archive.example.com`，不带末尾斜杠、路径、凭据、查询或 fragment。代理保留该 Host，只转发远程端口；本机管理端口独立。应用不信任转发头，也不根据代理的本机地址授予 root 权限。先确保其他应用没有占用端口，再启动两个入口。
-
-远程首页提供用户名和密码表单；成功后直接返回 `identity_version=1` JSON，包含 `identity`、`scope`、`operations` 和会话 `csrf`。`GET /api/v1/session` 可刷新身份，`POST /api/v1/logout` 携带同源 Origin 和 `X-CSRF-Token` 退出。登录表单的短期 CSRF 凭据随页面生成，5 分钟有效、使用一次。远程会话 8 小时绝对到期、30 分钟空闲到期，退出或服务重启后失效。
-
-当前远程入口只开放登录、会话、退出和健康检查。权限 JSON 中的受邀范围为全库 active、未删除、safe 图片及含图片混合消息；操作含现有 CLI 命令模板和中文注释，`executable=false`。它描述后续权限，不调用 CLI，也不提供检索或原图下载接口。本机 root 的操作标记 `execution_context=local_cli`，表示在本机终端执行。
-
-登录请求体最多 8 KiB，按实际接收字节计算；每个规范化用户名每分钟 5 次尝试，整个入口每分钟 30 次，超限返回 429。限流和会话状态驻内存且有容量上限，进程重启清空。远程仅接受有效受邀账号；未知账号、错误密码、停用账号和 root 账号使用统一认证失败消息。权限说明不授予远程用户服务器终端或本机文件系统访问能力。
-
-## 导入文件
-
-### 手工上传
-
-```bash
-uv run pc upload D:\下载\猫.jpg --note "保存来源"
-uv run pc upload D:\下载\图1.png D:\下载\图2.gif
+uv run pc upload "D:\下载\猫.jpg" --note "保存来源"
+uv run pc upload "D:\下载\图1.png" "D:\下载\图2.gif"
 uv run pc item list --limit 20
 ```
 
@@ -136,18 +90,18 @@ uv run pc item list --limit 20
 
 上传默认立即处理；`--no-process` 改为只入队。处理完成前保留原文件，因为 worker 会根据已登记的绝对路径读取字节。空文件与空白文本会跳过并报告。
 
-### 导出目录
+#### 导出目录
 
-```bash
-uv run pc source add my-files --kind export --roots D:\素材
-uv run pc import D:\素材 --source my-files --dry-run
-uv run pc import D:\素材 --source my-files --process
+```powershell
+uv run pc source add my-files --kind export --roots "D:\素材"
+uv run pc import "D:\素材" --source my-files --dry-run
+uv run pc import "D:\素材" --source my-files --process
 uv run pc source list
 ```
 
 来源登记同时写入授权记录，`--evidence` 保存授权证明，`--expires-at` 设置有效期。导入身份按根标签与相对路径确定，消息时间取文件 mtime。重复导入幂等；`--process` 在入队后运行 worker。
 
-### 处理与安全边界
+#### 处理与安全边界
 
 入库复制文件，源目录只读。媒体按内容哈希寻址，多条内容可共享同一份字节。
 
@@ -157,16 +111,16 @@ uv run pc source list
 - 摄入与处理使用最新授权；来源停用、软删、授权撤销或过期会阻止继续落库。
 - 文本或媒体命中有效哈希墓地时，整帖进入死信。
 
-```bash
+```powershell
 uv run pc work                   # 处理到队列为空
 uv run pc work --once            # 处理一条
 uv run pc work --loop            # 持续轮询
 uv run pc item list --status quarantined
 ```
 
-## 检索
+### 检索
 
-```bash
+```powershell
 uv run pc search 蓝发 精灵
 uv run pc search sunset
 uv run pc search 壁纸 --source manual
@@ -200,9 +154,9 @@ uv run pc search 雨 --timings
 
 JSON 的每条 `hits` 使用 `message_id` 标识帖，`parts` 保存部件的 `content_id`、类型、正文、文件名、标签、媒体与命中理由。顶层字段为展示摘要，附件读取 `parts[].media.items`。表格会截断长字段，`--json` 保留完整值。
 
-关键词查询返回候选数，候选预算为 500/2000 帖；带标签时预算为 2000，相关度页凑齐后可提前结束读取。`incomplete` 表示候选被截断。纯过滤列表的总数口径为 `exact`、`at_least`（上限 5000）或标签用量 `estimate`。`has_more` 表示下一页是否还有结果。
+`incomplete` 表示关键词候选达到读取预算。纯过滤列表的总数可能为精确值 `exact`、下限 `at_least` 或估计值 `estimate`。`has_more` 表示下一页是否还有结果。
 
-## 人工标签与结果展示
+### 人工标签与结果展示
 
 本地 CLI 由操作系统权限保护，按 root 操作入口使用。先用 `pc search` 查看帖 ID，或用 `pc item list --json` 查看 `message_id` 和部件 `content_id`。
 
@@ -223,7 +177,7 @@ uv run pc tag alias remove --alias "旅记"
 
 `--message` 与 `--content` 互斥，均可重复；`--tag` 可重复。人工输入立即生效，撤销操作只撤销人工关联，重新添加复用关联 ID。标签目录的 `usage_count` 按具有有效关联的不同内容项计数，作为检索估计值；它与可见帖数可能不同。标签名称经过 NFKC、大小写与空白/下划线统一，规范名与别名共享唯一解析规则。
 
-`tag list` 返回标签目录；`tag show` 返回目标内容上的关联，包括来源、置信度、证据和撤销时间。建议关联先保存，root 用 `pc tag confirm <assign_id> ...` 确认或用 `pc tag reject <assign_id> ...` 拒绝；确认后进入检索和统计。当前人工组件支持普通标签，敏感度分类和模型 API 接入见 DESIGN §4.7。
+`tag list` 返回标签目录；`tag show` 返回目标内容上的关联，包括来源、置信度、证据和撤销时间。root 用 `pc tag confirm <assign_id> ...` 确认已有建议关联，或用 `pc tag reject <assign_id> ...` 拒绝；确认后进入检索和统计。
 
 常用查询直接显示表格，也可将完整 JSON 交给独立渲染命令：
 
@@ -236,9 +190,9 @@ uv run pc tag show --message 123 --json | uv run pc render table
 
 两种表格入口复用相同渲染函数，按中文显示宽度省略长字段，窄终端优先显示 ID 和主要内容。重定向使用 120 格宽度；JSON 保留完整值。JSON 模式的 stdout 只输出数据，诊断进入 stderr。CLI JSON 将非 ASCII 字符写为 Unicode 转义，解析后保留完整中文与 emoji；Windows PowerShell 5.1 默认管道可直接使用上述命令。
 
-查询结果带 `result_version: 1` 与 `result_type`：检索为 `search`/`hits`，标签目录为 `tags`/`tags`，关联为 `assignments`/`assignments`，别名为 `aliases`/`aliases`。渲染命令读取一个 JSON 对象，支持上述类型；无效输入返回非零状态。前端按这些业务字段渲染，跨页排序通过查询参数执行。
+渲染命令读取一个 JSON 对象，支持 search、tags、assignments、aliases 结果；无效输入返回非零状态。
 
-## 查看与复制内容
+### 查看与复制内容
 
 先用 `pc search` 或 `pc item list` 获取消息 ID；查看单个部件时使用其 `content_id`。`--message` 与 `--content` 互斥，每次选择一个目标。
 
@@ -251,15 +205,15 @@ uv run pc open --content 456 --copy
 uv run pc reveal --message 123
 ```
 
-| 内容 | `show` | `open` | `reveal` | `--copy` |
-| --- | --- | --- | --- | --- |
-| 纯文本 | 正文 | 默认程序打开 TXT | 文件管理器选中 TXT | 复制正文 |
-| 图片 | 当前返回能力不可用错误 | 默认程序打开各图片 | 选中全部图片文件 | 复制文件列表 |
-| 图文混合 | 当前返回能力不可用错误 | 默认浏览器打开本地 HTML | 选中 HTML，目录内包含正文与图片 | 返回错误，保持无副作用 |
+| 目标 | 使用方式 |
+| --- | --- |
+| 纯文本 | `show` 输出正文；`open` 打开 TXT；`reveal` 定位 TXT；`--copy` 复制正文 |
+| 图片 | `show --json` 查询详情；`open` 打开图片；`reveal` 定位文件；`--copy` 复制文件列表 |
+| 图文混合 | `show --json` 查询详情；`open` 打开本地 HTML；`reveal` 定位 HTML 与图片目录 |
 
-`open`、`reveal` 与 `--copy` 当前支持 Windows；纯文本 `show` 和详情 JSON 使用 Python 核心。终端图片的验证记录见 [DESIGN.md §5.1](DESIGN.md#51-阶段-1bm25--倒排--过滤sqlite-fts5)。
+`open`、`reveal` 与 `--copy` 当前支持 Windows；纯文本 `show` 和详情 JSON 使用 Python 核心。
 
-查看范围为消息与部件未软删、部件 active 且 NSFW 等级为 0 的内容，按部件顺序处理。图片部件带说明正文时按混合内容处理。文本和图片以外的类型返回错误。`show --json` 支持完整详情查询，返回 `result_type: content`、`result_version: 1`、`message_id` 与有序 `parts`；它与 `--copy` 互斥，保持只读。`pc render table` 继续用于检索与标签结果。
+查看范围为消息与部件未软删、部件 active 且 NSFW 等级为 0 的内容，按部件顺序处理。图片部件带说明正文时按混合内容处理；混合内容 `--copy` 在生成副本前报错。文本和图片以外的类型返回错误。`show --json` 支持完整详情查询，返回 `result_type: content`、`result_version: 1`、`message_id` 与有序 `parts`；它与 `--copy` 互斥，保持只读。`pc render table` 继续用于检索与标签结果。
 
 图片复制采用文件管理器复制文件的格式。多张图片一次复制为文件列表；实际粘贴方式由接收应用决定。复制在打开或定位前完成；后续系统操作失败时，错误信息会注明复制已完成。纯文本多部件以空行连接；终端过滤控制字符，TXT、JSON 与剪贴板保留正文。
 
@@ -267,7 +221,30 @@ uv run pc reveal --message 123
 
 查看副本独立于归档原件，编辑副本后再次查看会重新校验并修复。每次操作重新检查目标可见性及媒体字节；单文件使用现有媒体限额，本次媒体总量上限为 256 MiB。缓存供命令退出后粘贴使用，当前手动清理：完成粘贴并关闭查看程序后，可在文件管理器删除 `view-cache` 下对应消息目录，后续查看会重新生成。删除归档或处理隐私清理时，也应清除对应查看副本；缓存属于可重建数据。
 
-## 数据与配置
+## 账号与独立登录
+
+本机 root 使用现有一次性令牌和管理页面。登录响应包含身份说明，登录后访问 `/identity` 可直接查看 JSON。受邀账号通过独立认证入口登录。
+
+```powershell
+uv run pc user create reader
+uv run pc user list --json
+uv run pc user disable reader
+uv run pc user enable reader
+uv run pc user reset-password reader
+uv run pc serve --mode remote --port 8081 --public-origin https://archive.example.com
+```
+
+账号命令支持 `--path` 和 `--root`。创建账号先校验用户名和重名，通过后隐藏输入两次密码；重置密码同样隐藏输入两次，长度 15~128 字符；用户名为 3~64 位 ASCII 字母、数字、点、下划线或连字符，统一小写，root 为保留名称。密码以 Argon2id 哈希保存。停用、重新启用和重置密码使旧会话失效，账号操作遵循本机文件系统权限边界。
+
+远程服务监听 `127.0.0.1:8081`，由 HTTPS 代理或隧道转发。`--public-origin` 为精确的 HTTPS origin，例如 `https://archive.example.com`，不带末尾斜杠、路径、凭据、查询或 fragment。代理保留该 Host，只转发远程端口；本机管理端口独立。应用不信任转发头，也不根据代理的本机地址授予 root 权限。先确保其他应用没有占用端口，再启动两个入口。
+
+远程首页提供用户名和密码表单；成功后直接返回 `identity_version=1` JSON，包含 `identity`、`scope`、`operations` 和会话 `csrf`。`GET /api/v1/session` 可刷新身份，`POST /api/v1/logout` 携带同源 Origin 和 `X-CSRF-Token` 退出。登录表单的短期 CSRF 凭据随页面生成，5 分钟有效、使用一次。远程会话 8 小时绝对到期、30 分钟空闲到期，退出或服务重启后失效。
+
+远程入口提供登录、会话身份查询、退出和健康检查。身份 JSON 的 `scope` 为策略说明，`operations` 包含 CLI 命令模板和中文注释，`executable=false` 表示模板仅供阅读；此入口的实际操作是账号认证与身份查询。本机 root 的操作标记 `execution_context=local_cli`，表示在本机终端执行。
+
+登录请求体最多 8 KiB，按实际接收字节计算；每个规范化用户名每分钟 5 次尝试，整个入口每分钟 30 次，超限返回 429。限流和会话状态驻内存且有容量上限，进程重启清空。远程仅接受有效受邀账号；未知账号、错误密码、停用账号和 root 账号使用统一认证失败消息。权限说明不授予远程用户服务器终端或本机文件系统访问能力。
+
+## 配置
 
 库文件为 `<data_root>/pc.sqlite3`。默认数据根目录：
 
@@ -277,7 +254,7 @@ uv run pc reveal --message 123
 | Linux | `$XDG_DATA_HOME/post-collector`，缺省 `~/.local/share/post-collector` |
 | macOS | `~/Library/Application Support/post-collector` |
 
-数据根包含 `media/`、`thumbs/`、`cold/`、`quarantine/`、`backup/`、`models/`、`upload-staging/` 和 `view-cache/`；当前实际内容主要在库文件、媒体与隔离目录中。
+归档字节位于 `media/`，隔离字节位于 `quarantine/`；Web 上传和查看副本分别使用 `upload-staging/` 与 `view-cache/`。
 
 | 配置 | 作用 |
 | --- | --- |
@@ -291,37 +268,38 @@ uv run pc reveal --message 123
 
 设置项的生效优先级为环境变量 > 数据库 > YAML > 注册表默认值：
 
-```bash
+```powershell
 uv run pc config show --explain
 uv run pc config show --key search --json
 uv run pc config seed
 ```
 
-`config seed` 仅补齐缺失键。已播种键由数据库提供，环境变量可覆盖，例如 `PC__SEARCH__DEFAULT_PAGE_SIZE=50`。部署段 `db/paths/jobs/ingest/security/models` 保存在配置文件；模型和界面功能的实施计划见 DESIGN.md。
+`config seed` 仅补齐缺失键。已播种键由数据库提供，环境变量可覆盖，例如 PowerShell 中设置 `$env:PC__SEARCH__DEFAULT_PAGE_SIZE = "50"`。部署段 `db/paths/jobs/ingest/security/models` 保存在配置文件。
 
 ## 备份与升级
 
 备份目标使用不同物理介质上的新文件名：
 
-```bash
-uv run pc db backup --to <另一块盘或NAS上的快照文件>
+```powershell
+uv run pc db backup --to "E:\备份\pc-2026-10-08.sqlite3"
 ```
 
 命令用 `VACUUM INTO` 生成一致快照并校验完整性，目标已存在时报错。媒体和隔离区字节另用文件备份工具同步。备份恢复需要同时匹配数据库与对应媒体文件。
 
-升级现有实例时，停止 worker，先备份，再执行：
+升级现有实例时，停止 Web 服务与 worker，备份库文件和媒体，再更新代码与依赖并执行：
 
-```bash
+```powershell
+uv sync
 uv run pc db apply
 uv run pc db reindex --recompute-derived
 uv run pc db status
 ```
 
-当前有 9 个迁移版本。0007 建立帖表，重算补齐整帖签名；0008/0009 添加检索覆盖索引。迁移按文件事务执行，结构指纹漂移会报告。
+迁移按连续编号和文件事务执行，结构指纹漂移会报告。迁移操作见 [migrations/README.md](migrations/README.md)。
 
 检索 JSON 为 `message_id + parts`，脚本据此读取结果。v2 游标支持空消息时间，旧游标需重新查询。旧相对 roots 或媒体引用需更新为绝对路径，或用新来源重新导入。
 
-恢复快照：停止所有项目进程，留存当前库与对应 WAL/SHM，再将快照复制到库文件位置，清除该位置的旧 WAL/SHM，执行 `pc db status` 校验后启动。保留期与恢复演练见 [DESIGN.md §7.1](DESIGN.md#71-可靠性设计)。
+恢复快照：停止所有项目进程，留存当前库与对应 WAL/SHM，再将快照复制到库文件位置，清除该位置的旧 WAL/SHM，执行 `pc db status` 校验后启动。
 
 ## 排错与维护
 
@@ -340,4 +318,27 @@ uv run pc db status
 | 翻页游标不兼容 | 保持查询条件，重新查询并复制 `next_cursor` |
 | 中文输出异常 | 使用 UTF-8 终端；Windows 可执行 `chcp 65001` |
 
-开发与验证命令见 [AGENTS.md](AGENTS.md)。设计、路线图与接入条件见 [DESIGN.md](DESIGN.md)。
+开发约束与代码导航见 [AGENTS.md](AGENTS.md)，初版设计契约见 [DESIGN.md](DESIGN.md)，实测和历史记录见 [DESIGN_HISTORY.md](DESIGN_HISTORY.md)。
+
+## 开发
+
+后端在仓库根目录执行：
+
+```powershell
+uv sync
+uv run ruff check src tests
+uv run python -m compileall -q src
+uv run pytest
+```
+
+### 前端
+
+前端是 React 单入口 SPA，路径为 `/`、`/add` 和 `/manage`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
+
+```powershell
+npm ci
+npm test
+npm run build
+```
+
+构建输出到 Python 包的 `src/pc/web`，修改源码后同步提交构建产物及 npm 锁文件。运行服务使用已构建资源，Python 部署无需 Node。组件测试使用模拟 API，实际页面验收建议先设置独立的 `PC_DATA_ROOT` 和 `PC__DB__PATH`，然后执行 `pc db apply`。
