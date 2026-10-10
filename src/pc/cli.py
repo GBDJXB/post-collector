@@ -1438,6 +1438,51 @@ def cmd_render(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_composition(args: argparse.Namespace) -> int:
+    """CLI 组合操作；共用服务管理事务、可见性和审计。"""
+    import sqlite3
+
+    from pc.adapters import sqlite as db
+    from pc.config import ingest_limits
+    from pc.services import compositions
+    from pc.view_presentation import terminal_text
+
+    resolved, _ = _db_and_paths(args)
+    if not _require_database(resolved):
+        return 2
+    try:
+        with db.open_db(resolved.path, expect_exists=True) as conn:
+            operation = args.composition_command
+            if operation == "list":
+                output = compositions.list_compositions(conn, names=args.tag or (), match_member_tags=args.match_member_tags, limit=args.limit, offset=args.offset)
+            elif operation == "show":
+                output = compositions.show(conn, args.id)
+            else:
+                output = compositions.write(conn, operation, ident=getattr(args, "id", None), name=getattr(args, "name", None), description=getattr(args, "description", None), contents=getattr(args, "content", ()) or (), max_text_chars=ingest_limits(_load_app_config(_project_root(args))).max_text_chars)
+        if args.json:
+            print(cfg_dump_json(output))
+        elif operation == "list":
+            from pc.presentation import _print_table
+
+            rows = output["compositions"]
+            _print_table(("id", "名称", "成员", "标签"), [[r["composition_id"], terminal_text(r["name"]), len(r["members"]), " ".join(t["name"] for t in r["tags"])] for r in rows], max_widths={"id": 12, "名称": 40, "成员": 8, "标签": 40}, terminal_width=120)
+            print(f"共 {output['total']} 个组合；offset={output['offset']}")
+        elif operation == "show":
+            print(terminal_text(f"组合 {output['composition_id']}: {output['name']}\n{output['description']}"))
+            print("标签：" + " ".join(t["name"] for t in output["tags"]))
+            for item in output["members"]:
+                if item["available"]:
+                    print(terminal_text(f"[{item['position']}] content={item['content_id']} {item['item_type']}\n{item['text']}"))
+                else:
+                    print(f"[{item['position']}] 成员不可用")
+        else:
+            print(f"组合 {output['composition_id']}：{operation} 完成")
+        return 0
+    except (ValueError, sqlite3.Error, db.DatabaseError) as exc:
+        print(f"组合操作失败：{exc}", file=sys.stderr)
+        return 2
+
+
 def cmd_tag(args: argparse.Namespace) -> int:
     """CLI 负责人工候选输入和输出；标签写入由共用服务执行。"""
     import sqlite3
@@ -1455,7 +1500,14 @@ def cmd_tag(args: argparse.Namespace) -> int:
                 "message_ids": getattr(args, "message", None) or (),
                 "content_ids": getattr(args, "content", None) or (),
             }
-            if operation == "add":
+            if getattr(args, "composition", None) is not None:
+                from pc.services import compositions
+
+                if operation == "show":
+                    output = compositions.show_tags(conn, args.composition)
+                else:
+                    output = compositions.tag_change(conn, args.composition, args.tag, remove=operation == "remove", namespace=getattr(args, "namespace", "general"))
+            elif operation == "add":
                 output = tagging.apply_classification(
                     conn, tagging.manual_result(args.tag, args.namespace), **targets
                 )
@@ -1890,6 +1942,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_render_sub = p_render.add_subparsers(dest="render_command", required=True)
     p_render_sub.add_parser("table", help="输出终端表格").set_defaults(func=cmd_render)
 
+    p_composition = sub.add_parser("composition", help="root 独立有序组合管理")
+    p_composition_sub = p_composition.add_subparsers(dest="composition_command", required=True)
+    for operation in ("create", "list", "show", "update", "set-members", "delete"):
+        p = p_composition_sub.add_parser(operation)
+        p.add_argument("--path", help=db_path_help)
+        p.add_argument("--root", help=root_help)
+        p.add_argument("--json", action="store_true")
+        if operation not in {"create", "list"}:
+            p.add_argument("id", type=int, help="组合 ID")
+        if operation in {"create", "update"}:
+            p.add_argument("--name", required=operation == "create")
+            p.add_argument("--description")
+        if operation in {"create", "set-members"}:
+            p.add_argument("--content", type=int, action="append", required=True, help="成员 ID，顺序保留，允许重复")
+        if operation == "list":
+            p.add_argument("--tag", action="append")
+            p.add_argument("--match-member-tags", action="store_true")
+            p.add_argument("--limit", type=int, default=50)
+            p.add_argument("--offset", type=int, default=0)
+        p.set_defaults(func=cmd_composition)
+
     p_tag = sub.add_parser("tag", help="root 标签管理：人工标注、别名与建议确认")
     p_tag_sub = p_tag.add_subparsers(dest="tag_command", required=True)
     for operation in ("add", "remove", "show", "list", "confirm", "reject"):
@@ -1901,6 +1974,7 @@ def build_parser() -> argparse.ArgumentParser:
             targets = p.add_mutually_exclusive_group(required=True)
             targets.add_argument("--message", type=int, action="append", help="整帖 ID，可重复")
             targets.add_argument("--content", type=int, action="append", help="部件 ID，可重复")
+            targets.add_argument("--composition", type=int, help="独立组合 ID")
         if operation in {"add", "remove"}:
             p.add_argument("--tag", action="append", required=True, help="自定义名称或别名，可重复")
         if operation == "add":

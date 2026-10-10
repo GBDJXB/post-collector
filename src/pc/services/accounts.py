@@ -156,6 +156,13 @@ def identity(*, user_id=None, name="root", remote=False):
 
 
 ROOT_OPERATIONS = [
+    ("compositions.create", "pc composition create --name <名称> --content <ID>", "手动创建独立组合。"),
+    ("compositions.list", "pc composition list --json", "浏览独立组合。"),
+    ("compositions.show", "pc composition show <ID> --json", "查看组合和当前可见成员。"),
+    ("compositions.update", "pc composition update <ID> --name <名称>", "修改组合名称或说明。"),
+    ("compositions.members", "pc composition set-members <ID> --content <ID>", "替换有序成员，允许重复。"),
+    ("compositions.delete", "pc composition delete <ID>", "软删除组合，保留成员原内容。"),
+    ("compositions.tag", "pc tag add --composition <ID> --tag <标签>", "添加组合自身标签。"),
     ("content.search", "pc search <关键词> --json", "检索归档内容。"),
     ("content.list", "pc item list --json", "列出内容项。"),
     ("content.show", "pc show --message <ID> --json", "读取消息详情。"),

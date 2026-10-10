@@ -14,6 +14,7 @@ migrations/
 │   ├── 0007_post_table.sql                ← post 派生表：一帖一行，检索的结果单位（第 35 张表）
 │   ├── 0008_search_visibility_indexes.sql ← 帖可见性与候选映射的覆盖索引，不改表结构
 │   ├── 0009_message_visibility_index.sql  ← 消息可见性与来源的部分索引，减少信封回读
+│   ├── 0010_compositions.sql              独立组合、有序成员及组合标签；使旧帖签名失效
 └── README.md                              本文件
 ```
 
@@ -140,3 +141,5 @@ SQLite 没有 `ALTER TABLE DROP CONSTRAINT`。要改一个 `CHECK`，只能：�
 DESIGN §3.6/§3.8 已经设计好的 canonical 归组（`dup_group_id` + `canonical_id`，由导入
 层填写）。**`media.sha256` 仍然是全局唯一**——字节层面"同一份内容只有一行 media"是
 硬约束，它保证不会重复占盘。
+
+0010 将旧 content_signature/canonical_post_id/dup_group_id 置空，不改原始消息、内容或媒体。升级后运行 pc db reindex --recompute-derived 恢复 v2 有序签名；重算前消息均独立显示。组合成员允许重复，通过位置区分，组合删除不级联删除原内容。

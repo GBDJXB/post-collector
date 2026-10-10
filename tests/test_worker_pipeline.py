@@ -145,7 +145,7 @@ class TestPostRows:
         assert post["sent_at"] == "2026-02-03T04:05:06.000Z"
         assert post["content_signature"] == post_signature(
             [("text", parts["text_hashes"][0])]
-            + [("media", digest) for digest in parts["media_hashes"]]
+            + [("image", digest) for digest in parts["media_hashes"]]
         )
         assert post["canonical_post_id"] == post["message_id"], "第一条帖的代表就是它自己"
 

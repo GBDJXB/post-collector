@@ -321,7 +321,7 @@ class TestTableInventory:
         assert declared == set(db.EXPECTED_TABLES)
 
     def test_expected_shape(self) -> None:
-        assert len(db.EXPECTED_TABLES) == 35
+        assert len(db.EXPECTED_TABLES) == 38
         assert "schema_migration" in db.EXPECTED_TABLES
         # 相对 PostgreSQL 版新增的两张表（DESIGN §3.2、§3.8）
         assert "content_media" in db.EXPECTED_TABLES

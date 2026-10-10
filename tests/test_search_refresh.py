@@ -204,7 +204,7 @@ class TestPostSync:
         db.refresh_search_derived(fresh_db)
         message_id = int(_row(fresh_db, content_id)["message_id"])
         assert _post_row(fresh_db, message_id)["content_signature"] == post_signature(
-            [("media", digest)]
+            [("image", digest)]
         )
 
     def test_same_signature_groups_to_the_smallest_message(self, fresh_db: Any) -> None:

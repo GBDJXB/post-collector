@@ -2290,3 +2290,11 @@ MVP 明确的**不做**：**L2 匿名入口**、第二个与第三个连接器�
 - 检索/向量对比参考（v2 遗留，结论已按 v3 重估）：[Meilisearch vs Qdrant vs pgvector 实测](https://www.harulogs.com/forum/blog/elasticsearch-%ec%93%b0%ea%b8%b0-%ec%a0%84%ec%97%90-meilisearch-vs-qdrant-vs-pgvec-4437)
 - 云视觉定价参考：[Google Cloud Vision Pricing](https://cloud.google.com/vision/pricing)
 - LLM 定价参考：[DeepSeek V3.2 on OpenRouter](https://openrouter.ai/deepseek/deepseek-v3.2)、[Vercel AI Gateway](https://vercel-docs.vercel.sh/ai-gateway/models/deepseek-v3.2-thinking)
+
+## 2026-10-09：独立组合与有序签名验收
+
+实现新增 0010：独立组合、有序可重复成员、组合自身人工标签；旧 --message 批量部件打标保持兼容。来源和媒体归属保持原样，正式数据库未应用迁移。
+
+最终完整 pytest 为 1028 通过、6 条 Windows 符号链接权限跳过；ruff、compileall、差异检查通过。新增回归覆盖跨消息引用、持久化、独立删除、隐藏成员脱敏、标签独立性与匹配位置、审计失败回滚、排列折叠及旧签名失效。
+
+检索工具 bench_search.py --scale 100000 --assert 使用独立合成业务库，100000 内容项、364895 标签关联、100000 媒体关联，每场景 200 次热缓存采样，50 帖/页。纯过滤 P50/P99=7.3/8.7 ms，宽关键词 34.3/47.2 ms，中日文 32.5/37.6 ms，短词 32.7/37.7 ms，关键词+标签+时间 44.3/50.8 ms，三标签交集 54.4/67.8 ms，深分页 7.4/10.9 ms，敏感度过滤 7.4/9.1 ms，消息时间深分页 55.2/70.6 ms。四读者并发 11.6/19.1 ms，后台写入同时读 8.6/14.0 ms。均满足 P50 <150 ms、P99 <500 ms；数据为合成业务形态，不代表正式库的查询质量验收。

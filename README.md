@@ -331,6 +331,10 @@ uv run python -m compileall -q src
 uv run pytest
 ```
 
+修改实现前读取 DESIGN 对应章节；命令、接口、交付状态或项目约定变化时更新受影响的文档。未改变这些内容的拼写修正、内部重构和局部缺陷修复无需同步修改 README 与 AGENTS。
+
+专项验证按改动触发：检索路径运行 `uv run python tools/bench_search.py --scale 100000 --assert`；认证、会话或授权修改运行相关权限边界测试（现有入口为 `tests/test_accounts_auth.py`、`tests/test_web_app.py`）；生成资源及其源码或生成配置修改检查源码与构建产物一致性。具体检查范围见 [AGENTS.md](AGENTS.md#按改动触发验证)。重复步骤优先封装为 `tools/` 小脚本，输出检查对象、结果、状态与错误；产品行为须由断言、结果比较或指标验证，不能仅依据退出码。
+
 ### 前端
 
 前端是 React 单入口 SPA，路径为 `/`、`/add` 和 `/manage`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
@@ -341,4 +345,37 @@ npm test
 npm run build
 ```
 
-构建输出到 Python 包的 `src/pc/web`，修改源码后同步提交构建产物及 npm 锁文件。运行服务使用已构建资源，Python 部署无需 Node。组件测试使用模拟 API，实际页面验收建议先设置独立的 `PC_DATA_ROOT` 和 `PC__DB__PATH`，然后执行 `pc db apply`。
+构建输出到 Python 包的 `src/pc/web`，修改源码或构建配置后重新构建并提交受影响的产物；依赖变化时同步提交 npm 锁文件。修改生成资源时同样检查其与源码一致，核对重新构建后的文件清单和内容。运行服务使用已构建资源，Python 部署无需 Node。组件测试使用模拟 API，实际页面验收建议先设置独立的 `PC_DATA_ROOT` 和 `PC__DB__PATH`，然后执行 `pc db apply`。
+
+## 独立有序组合（CLI）
+
+组合引用已有内容项，可以跨来源和消息，保留顺序与重复成员。原消息、文件与成员标签保持独立，组合由本机 root 手动创建。
+
+```powershell
+uv run pc composition create --name "教程" --description "按顺序阅读" --content 3 --content 7 --content 3
+uv run pc composition list --json
+uv run pc composition show 1 --json
+uv run pc composition update 1 --name "教程修订"
+uv run pc composition set-members 1 --content 7 --content 3
+uv run pc tag add --composition 1 --tag "教程"
+uv run pc tag show --composition 1
+uv run pc tag remove --composition 1 --tag "教程"
+uv run pc composition list --tag "教程" --tag "截图" --match-member-tags --json
+uv run pc composition delete 1
+```
+
+名称最多 255 字符、单行且非空；说明遵守 ingest.max_text_chars（默认 100000 字符）。成员至少一个，写入须当前 active、未删除且 safe。失去可见性的成员只显示位置与不可用状态。删除组合保留原内容和文件。以上命令支持 --path/--root；list 使用 --limit（默认 50，最大 100）及 --offset 分页。组合 JSON 保留完整值，人工展示过滤终端控制字符。
+
+组合标签默认只用于自身；--match-member-tags 允许组合与可见成员共同满足标签 AND 条件，JSON 返回命中目标及成员位置。pc tag --message 仍给各部件分别打标。pc tag list --json 的 usage_count 仍计内容项，composition_usage_count 独立统计组合。组合目前通过 CLI 整理，不自动生成，不提供 Web 整理、组合关键词检索或下载。
+
+### 升级至 0010
+
+先停止本机服务与 worker，确认目标库路径并备份数据库与媒体；现有备份流程见“备份与升级”。随后对同一库执行：
+
+```powershell
+uv run pc db apply --path "D:\archive\pc.sqlite3"
+uv run pc db reindex --recompute-derived --path "D:\archive\pc.sqlite3"
+uv run pc db status --path "D:\archive\pc.sqlite3"
+```
+
+0010 新增三张组合表，清空旧派生帖签名和折叠关系。重算前各消息独立显示；重算后，A/B、B/A、A/B/A 保持不同结果，相同顺序与构成仍可折叠。文件继续按 SHA-256 复用；历史标签和原始消息保持原样。

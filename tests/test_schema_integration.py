@@ -21,7 +21,7 @@ from pc.adapters import sqlite as db
 
 #: 0001 建出的基础表数量 + 0007 的派生表 ``post``。这里刻意写死数字：表清单一旦变化，
 #: 必须有人来本文件明确改一次，而不是让「多出来一张表」悄悄通过 inventory 断言。
-EXPECTED_TABLE_COUNT = 35
+EXPECTED_TABLE_COUNT = 38
 
 #: 迁移记账里记录的文件名（``Path.name``，含扩展名）。
 #: 形如 ``{version: name}``：新增迁移时在这里加一行，同时也是「有人确认过」的痕迹。
@@ -35,6 +35,7 @@ EXPECTED_MIGRATION_NAMES = {
     7: "0007_post_table.sql",
     8: "0008_search_visibility_indexes.sql",
     9: "0009_message_visibility_index.sql",
+    10: "0010_compositions.sql",
 }
 
 

@@ -99,6 +99,9 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "app_user",
         "audit_log",
         "classification_run",
+        "composition",
+        "composition_member",
+        "composition_tag_assignment",
         "content_item",
         "content_media",
         "fetch_log",
@@ -632,9 +635,12 @@ def _rollback(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
     """把一组写操作包进一个显式事务：要么都写，要么都不写。"""
-    _begin(conn)
+    if immediate:
+        _begin(conn)
+    else:
+        conn.execute("BEGIN")
     try:
         yield conn
     except BaseException:
@@ -1461,15 +1467,39 @@ _POST_AGGREGATE_SELECT = (
     " WHERE c.deleted_at IS NULL"
 )
 
-#: 帖的部件摘要：文本项取 content_hash，媒体项取主媒体的 sha256（与 pipeline 同规则）
-_POST_PART_SELECT = (
-    "SELECT c.message_id, c.item_type, c.content_hash,"
-    "       (SELECT md.sha256 FROM content_media cm JOIN media md ON md.media_id = cm.media_id"
-    "         WHERE cm.content_id = c.content_id"
-    "         ORDER BY cm.ordinal, cm.media_id LIMIT 1) AS media_sha "
-    "  FROM content_item c"
-    " WHERE c.deleted_at IS NULL"
-)
+def post_digest_rows(conn: sqlite3.Connection, message_ids: Sequence[int] | None = None):
+    """导入与重算共用摘要读取，保留部件和媒体关联的次序。"""
+    if message_ids == []:
+        return []
+    narrow = "" if message_ids is None else f" AND c.message_id IN ({','.join('?' for _ in message_ids)})"
+    return conn.execute(
+        "SELECT c.message_id,c.content_id,c.item_type,c.content_hash,md.sha256 AS media_sha "
+        "FROM content_item c LEFT JOIN content_media cm ON cm.content_id=c.content_id "
+        "LEFT JOIN media md ON md.media_id=cm.media_id WHERE c.deleted_at IS NULL"
+        + narrow + " ORDER BY c.message_id,c.ordinal,c.content_id,cm.ordinal,cm.media_id,cm.role",
+        [] if message_ids is None else list(message_ids),
+    ).fetchall()
+
+
+def post_digests(rows):
+    """按部件分组媒体，保留边界、类型、顺序及重复出现。"""
+    grouped = {}
+    for row in rows:
+        key = (int(row["message_id"]), int(row["content_id"]))
+        part = grouped.setdefault(key, {"kind": row["item_type"], "text": row["content_hash"], "media": []})
+        part["media"].append(row["media_sha"])
+    digests = {}
+    for (message_id, _content_id), part in grouped.items():
+        if part["kind"] == "text":
+            digest = part["text"]
+        elif any(not item for item in part["media"]):
+            digest = None
+        elif len(part["media"]) == 1:
+            digest = part["media"][0]
+        else:
+            digest = json.dumps(part["media"], separators=(",", ":"))
+        digests.setdefault(message_id, []).append((part["kind"], digest))
+    return digests
 
 
 def sync_post_rows(
@@ -1501,14 +1531,7 @@ def sync_post_rows(
         int(row["message_id"]): row
         for row in conn.execute(f"{agg_sql} GROUP BY c.message_id", agg_params).fetchall()
     }
-    part_sql, part_params = _narrow(_POST_PART_SELECT)
-    digests: dict[int, list[tuple[str, str | None]]] = {}
-    for row in conn.execute(part_sql, part_params).fetchall():
-        message_id = int(row["message_id"])
-        if row["item_type"] == "text":
-            digests.setdefault(message_id, []).append(("text", row["content_hash"]))
-        else:
-            digests.setdefault(message_id, []).append(("media", row["media_sha"]))
+    digests = post_digests(post_digest_rows(conn, wanted))
 
     existing = {
         int(row["message_id"]): row

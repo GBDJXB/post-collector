@@ -278,6 +278,7 @@ def render_result(
                 "revoked_at",
             ),
         ),
+        "composition_assignments": ("assignments", ("assign_id", "composition_id", "name", "namespace", "revoked_at")),
         "aliases": ("aliases", ("synonym_id", "alias", "name", "namespace")),
     }
     width = (

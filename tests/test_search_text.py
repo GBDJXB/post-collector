@@ -179,11 +179,12 @@ class TestPostComposition:
             is expected
         )
 
-    def test_signature_is_order_insensitive_and_deduplicated(self) -> None:
+    def test_signature_preserves_order_and_duplicates(self) -> None:
         forward = post_signature([("text", "aaa"), ("media", "bbb"), ("media", "ccc")])
         backward = post_signature([("media", "ccc"), ("media", "bbb"), ("text", "aaa")])
-        assert forward == backward == "media:bbb|media:ccc|text:aaa"
-        assert post_signature([("media", "bbb"), ("media", "bbb")]) == "media:bbb"
+        assert forward != backward
+        assert forward.startswith("v2:")
+        assert post_signature([("media", "bbb"), ("media", "bbb")]) != post_signature([("media", "bbb")])
 
     def test_signature_is_none_when_it_cannot_be_computed(self) -> None:
         assert post_signature([]) is None

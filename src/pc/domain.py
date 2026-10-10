@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -196,18 +197,11 @@ def post_matches_type(mask: int, bits: int, *, include_mixed: bool) -> bool:
 
 
 def post_signature(parts: Iterable[tuple[str, str | None]]) -> str | None:
-    """整帖去重签名：部件摘要去重、排序后拼接；没有摘要或超长则返回 ``None``。
-
-    ``parts`` 是 ``(kind, digest)`` 序列——文本项 ``("text", content_hash)``、
-    媒体项 ``("media", sha256)``。**拼接而不是哈希**：SQLite 没有 ``sha256()``，而这条
-    规则要在落库与批量重算两条路径上算出同一个串；排序让签名与部件的到达顺序无关。
-
-    ``None`` 的含义是"不参与折叠"：宁可多显示一条重复内容，也绝不误折叠两份不同的内容。
-    """
-    digests = sorted({f"{kind}:{digest}" for kind, digest in parts if digest})
-    if not digests:
+    """v2 有序签名：保留类型、重复次数；摘要缺失则不折叠。"""
+    values = list(parts)
+    if not values or any(not digest for _, digest in values):
         return None
-    joined = "|".join(digests)
+    joined = "v2:" + json.dumps(values, ensure_ascii=True, separators=(",", ":"))
     return joined if len(joined) <= POST_SIGNATURE_LIMIT else None
 
 

@@ -32,7 +32,7 @@ from typing import Any
 from pc.adapters.magic_scan import MagicNumberScanner, declared_mime_for_name, item_type_for
 from pc.adapters.registry import SourceConfigError, UnsupportedSourceKindError, connector_for
 from pc.adapters.safe_files import UnsafeLocalPathError
-from pc.adapters.sqlite import now_iso, transaction
+from pc.adapters.sqlite import now_iso, post_digest_rows, post_digests, transaction
 from pc.config import IngestLimits, JobSettings
 from pc.domain import (
     ITEM_TYPE_LABELS,
@@ -528,13 +528,11 @@ class Worker:
 
             ordinal = 0
             part_types: list[str] = []
-            part_digests: list[tuple[str, str | None]] = []
             if collected.text_raw is not None and collected.text_normalized is not None:
                 self._insert_text_item(
                     message_id, collected, shared_parts, origin_note, sent_at, ordinal, source
                 )
                 part_types.append("text")
-                part_digests.append(("text", collected.text_hash))
                 ordinal += 1
 
             for blob in collected.blobs:
@@ -542,7 +540,6 @@ class Worker:
                     message_id, blob, shared_parts, origin_note, sent_at, ordinal, source
                 )
                 part_types.append(item_type_for(blob.mime_detected))
-                part_digests.append(("media", blob.sha256))
                 ordinal += 1
                 linked += 1
                 if is_quarantined:
@@ -551,7 +548,7 @@ class Worker:
             # 帖行是检索的结果单位（migrations/0007 的文件头），与内容项同一个事务写：
             # 两者不一致时，检索会给出"有帖无部件"或"有部件无帖"的错页。
             self._upsert_post(
-                message_id, part_types=part_types, part_digests=part_digests, sent_at=sent_at
+                message_id, part_types=part_types, sent_at=sent_at
             )
 
         return (
@@ -564,7 +561,6 @@ class Worker:
         message_id: int,
         *,
         part_types: Sequence[str],
-        part_digests: Sequence[tuple[str, str | None]],
         sent_at: str | None,
     ) -> None:
         """写这条消息的帖子行：构成摘要 + 整帖签名 + 帖级归组。
@@ -575,7 +571,7 @@ class Worker:
         """
         if not part_types:
             return  # 没有部件就没有帖子行（空消息不该在结果里出现）
-        signature = post_signature(part_digests)
+        signature = post_signature(post_digests(post_digest_rows(self._conn, [message_id]))[message_id])
         first_seen_at = self._conn.execute(
             "SELECT min(first_seen_at) FROM content_item WHERE message_id = ? AND deleted_at IS NULL",
             (message_id,),

@@ -396,7 +396,7 @@ def review_suggestions(
 
 
 def list_tags(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = [dict(r) for r in conn.execute("SELECT * FROM tag ORDER BY namespace,name_norm,tag_id")]
+    rows = [dict(r) for r in conn.execute("SELECT t.*,(SELECT count(DISTINCT ca.composition_id) FROM composition_tag_assignment ca JOIN composition co USING(composition_id) WHERE ca.tag_id=t.tag_id AND ca.revoked_at IS NULL AND co.deleted_at IS NULL AND t.status IN ('active','deprecated')) AS composition_usage_count FROM tag t ORDER BY namespace,name_norm,tag_id")]
     for row in rows:
         row["aliases"] = json.loads(row["aliases"])
         row["external_ref"] = json.loads(row["external_ref"])
