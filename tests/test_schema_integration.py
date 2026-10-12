@@ -17,11 +17,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from pc.adapters import sqlite as db
 
 #: 0001 建出的基础表数量 + 0007 的派生表 ``post``。这里刻意写死数字：表清单一旦变化，
 #: 必须有人来本文件明确改一次，而不是让「多出来一张表」悄悄通过 inventory 断言。
-EXPECTED_TABLE_COUNT = 38
+EXPECTED_TABLE_COUNT = 39
 
 #: 迁移记账里记录的文件名（``Path.name``，含扩展名）。
 #: 形如 ``{version: name}``：新增迁移时在这里加一行，同时也是「有人确认过」的痕迹。
@@ -36,6 +38,7 @@ EXPECTED_MIGRATION_NAMES = {
     8: "0008_search_visibility_indexes.sql",
     9: "0009_message_visibility_index.sql",
     10: "0010_compositions.sql",
+    11: "0011_model_tagging.sql",
 }
 
 
@@ -82,11 +85,7 @@ def test_table_inventory_matches_expected(applied_schema: Any) -> None:
 
 
 def test_deferred_tables_absent(applied_schema: Any) -> None:
-    """content_embedding / ai_provider_policy / egress_log 属阶段 2，出现即触碰红线。
-
-    这是「无外发」红线的结构层表现：阶段 1 不得引入任何第三方 AI 调用的代码路径，
-    连承载外发记账的表都不该存在（DESIGN §8.1 的 MVP 明确不做外发）。
-    """
+    """0011 仅批准模型打标日志；向量及通用提供商策略表仍不得出现。"""
     present = sorted(db.DEFERRED_TABLES & db.public_tables(applied_schema))
     assert not present, f"阶段 2 才引入的表不该存在：{present}"
 
@@ -453,3 +452,47 @@ def test_every_base_table_is_strict(applied_schema: Any) -> None:
         if not _object_sql(applied_schema, table, "table").endswith("STRICT")
     ]
     assert not offenders, f"这些表不是 STRICT：{offenders}"
+
+
+def test_0011_preserves_existing_rows(tmp_path):
+    """模型迁移保留已有 run/组合标签及引用，不破坏外键。"""
+    import sqlite3
+
+    old = tmp_path / "migrations"
+    old.mkdir()
+    for path in db.DEFAULT_MIGRATIONS_DIR.glob("*.sql"):
+        if int(path.name.split("_")[0]) <= 10:
+            shutil.copy2(path, old / path.name)
+    with db.open_db(tmp_path / "upgrade.db") as conn:
+        db.apply_migration(conn, old)
+        source = conn.execute(
+            "INSERT INTO source(uuid,name,platform,kind) VALUES (?,'s','local','manual') RETURNING source_id",
+            (str(uuid.uuid4()),),
+        ).fetchone()[0]
+        message = conn.execute(
+            "INSERT INTO message(uuid,source_id,platform_msg_id) VALUES (?,?,'m') RETURNING message_id",
+            (str(uuid.uuid4()), source),
+        ).fetchone()[0]
+        content = conn.execute(
+            "INSERT INTO content_item(uuid,message_id,item_type) VALUES (?,?,'text') RETURNING content_id",
+            (str(uuid.uuid4()), message),
+        ).fetchone()[0]
+        conn.execute("INSERT INTO classification_run(run_id,content_id,capability) VALUES (42,?,'manual')", (content,))
+        conn.execute("INSERT INTO composition(composition_id,name,created_at,updated_at) VALUES (9,'c','now','now')")
+        conn.execute("INSERT INTO tag(tag_id,uuid,name,name_norm,namespace) VALUES (7,?,'tag','tag','general')", (str(uuid.uuid4()),))
+        conn.execute("INSERT INTO composition_tag_assignment(assign_id,composition_id,tag_id,assigned_at,updated_at) VALUES (11,9,7,'now','now')")
+        db.apply_migration(conn)
+        assert conn.execute("SELECT content_id FROM classification_run WHERE run_id=42").fetchone()[0] == content
+        assert tuple(conn.execute("SELECT composition_id,tag_id,source FROM composition_tag_assignment WHERE assign_id=11").fetchone()) == (9, 7, 'human')
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert "egress_log" in db.public_tables(conn)
+        conn.execute("INSERT INTO classification_run(composition_id,capability) VALUES (9,'manual')")
+        for sql, args in [
+            ("INSERT INTO classification_run(capability) VALUES ('manual')", ()),
+            ("INSERT INTO classification_run(content_id,composition_id,capability) VALUES (?,9,'manual')", (content,)),
+            ("INSERT INTO composition_tag_assignment(composition_id,tag_id,source,assigned_at,updated_at) VALUES (9,7,'auto','now','now')", ()),
+            ("INSERT INTO composition_tag_assignment(composition_id,tag_id,source,assigned_at,updated_at) VALUES (9,7,'suggested','now','now')", ()),
+        ]:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql, args)

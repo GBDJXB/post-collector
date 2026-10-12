@@ -321,7 +321,7 @@ class TestTableInventory:
         assert declared == set(db.EXPECTED_TABLES)
 
     def test_expected_shape(self) -> None:
-        assert len(db.EXPECTED_TABLES) == 38
+        assert len(db.EXPECTED_TABLES) == 39
         assert "schema_migration" in db.EXPECTED_TABLES
         # 相对 PostgreSQL 版新增的两张表（DESIGN §3.2、§3.8）
         assert "content_media" in db.EXPECTED_TABLES
@@ -330,7 +330,7 @@ class TestTableInventory:
         assert "post" in db.EXPECTED_TABLES
 
     def test_deferred_tables_are_disjoint(self) -> None:
-        assert {"content_embedding", "ai_provider_policy", "egress_log"} == set(
+        assert {"content_embedding", "ai_provider_policy"} == set(
             db.DEFERRED_TABLES
         )
         assert not (db.EXPECTED_TABLES & db.DEFERRED_TABLES)

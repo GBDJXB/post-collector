@@ -15,6 +15,7 @@ migrations/
 │   ├── 0008_search_visibility_indexes.sql ← 帖可见性与候选映射的覆盖索引，不改表结构
 │   ├── 0009_message_visibility_index.sql  ← 消息可见性与来源的部分索引，减少信封回读
 │   ├── 0010_compositions.sql              独立组合、有序成员及组合标签；使旧帖签名失效
+│   ├── 0011_model_tagging.sql             重建分类记录/组合关联约束，新增元数据 egress_log；共39张 STRICT 表
 └── README.md                              本文件
 ```
 
@@ -53,7 +54,7 @@ PostgreSQL 版建表脚本（`migrations/postgres/0001_init.sql`）**已随 PG �
 ## 执行方式
 
 ```bash
-uv run pc db apply                 # 应用 migrations/sqlite/0001_init.sql
+uv run pc db apply                 # 按序应用 migrations/sqlite/ 下全部待应用迁移
 uv run pc db status                # 只读复核：表数、FTS5、PRAGMA、结构指纹
 uv run pc db apply --path <文件>   # 指定数据库文件（默认 <data_root>/pc.sqlite3）
 ```

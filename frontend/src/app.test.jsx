@@ -17,9 +17,12 @@ beforeEach(() => {
     let data = {};
     if (url.endsWith("/session")) data = { csrf: "test-csrf" };
     else if (url.includes("/search?")) data = { hits: [hit], page: 1, total: 1, total_kind: "exact", has_more: false };
+    else if (url.endsWith("/model/status") || url.endsWith("/model/key/set") || url.endsWith("/model/access")) data = { key_present: true, armed: true, enabled: true };
+    else if (url.endsWith("/model/preview")) data = { preview_id: "preview-one", provider: "deepseek", model: "deepseek-flash", endpoint: "https://api.deepseek.com/chat/completions", parts: [{ position: 0, item_type: "text", text: body, images: [] }], candidate_catalog: [{ candidate_id: 1, name: "已有", namespace: "general" }], candidate_count: 1, expires_in_seconds: 300, attempts_remaining: 20, metadata_warning: "原始图片含 EXIF", unknown_outcome_warning: "结果未知可能计费", catalog_warning: "完整候选目录", request_bytes: 42 };
+    else if (url.endsWith("/model/send")) data = { status: "succeeded", request_id: "preview-one" };
     else if (url.endsWith("/tags")) data = { tags: [] };
     else if (url.includes("/detail?")) data = detail;
-    else if (url.includes("/assignments?")) data = { assignments: [{ assign_id: 9, content_id: 7, name: "建议", source: "suggested", confidence: 0.8, revoked_at: null }] };
+    else if (url.includes("/assignments?")) data = { assignments: [{ assign_id: 9, content_id: 7, name: "建议", source: "suggested", confidence: 0.8, revoked_at: null, evidence: { model_proposal: { run_id: 12, version: "b4d9551a-7876-4933-b52f-98b8bacde1e8" } } }] };
     else if (url.includes("/aliases?")) data = { aliases: [{ alias: "别名", name: "测试", namespace: "general" }] };
     else if (url.endsWith("/uploads")) data = { message_id: 3, duplicate: false, status: "succeeded", content_ids: [7], detail: "内容处理完成" };
     return { ok: true, status: 200, json: async () => data };
@@ -112,7 +115,7 @@ test("管理页继续支持打标、建议、别名与系统动作", async () =>
   await waitFor(() => expect(screen.getByRole("status").textContent).toBe("操作完成"));
   await user.click(screen.getByRole("button", { name: "默认程序打开" }));
   await waitFor(() => expect(calls.some(x => x.url.endsWith("/actions/open"))).toBe(true));
-  expect(calls.some(x => x.url.endsWith("/suggestions/confirm"))).toBe(true);
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/suggestions/confirm")).options.body)).toEqual({ ids: [9], expected_runs: { 9: { run_id: 12, version: "b4d9551a-7876-4933-b52f-98b8bacde1e8" } } });
   expect(calls.some(x => x.url.endsWith("/aliases/add"))).toBe(true);
 });
 
@@ -123,6 +126,51 @@ test("授权交换清除 fragment，保留路径和查询参数", async () => {
   expect(window.location.search).toBe("?message_id=3");
   expect(window.location.hash).toBe("");
   expect(JSON.parse(calls.find(x => x.url.endsWith("/session")).options.body)).toEqual({ token: "one-use" });
+});
+
+test("模型密钥提交即清空，总闸要求明确勾选", async () => {
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型 API Key"), "TEST-ONLY-BROWSER-KEY");
+  await user.click(screen.getByRole("button", { name: "设置内存密钥" }));
+  await waitFor(() => expect(screen.getByLabelText("模型 API Key").value).toBe(""));
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/model/key/set")).options.body)).toEqual({ key: "TEST-ONLY-BROWSER-KEY" });
+  expect(screen.getByRole("button", { name: "开启模型外发" }).disabled).toBe(true);
+  await user.click(screen.getByLabelText("我确认开启模型外发总闸"));
+  await user.click(screen.getByRole("button", { name: "开启模型外发" }));
+  await waitFor(() => expect(calls.some(x => x.url.endsWith("/model/access"))).toBe(true));
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/model/access")).options.body)).toEqual({ enabled: true, confirmed: true });
+});
+
+test("模型预览展示正文及完整目录，逐次同意后只发送一次", async () => {
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型目标 ID"), "7");
+  await user.click(screen.getByRole("button", { name: "生成外发预览" }));
+  expect(await screen.findByText(body, { selector: "pre" })).toBeTruthy();
+  expect(screen.getByText("已有 (general)")).toBeTruthy();
+  expect(document.querySelector("script")).toBeNull();
+  expect(calls.some(x => x.url.endsWith("/model/send"))).toBe(false);
+  expect(screen.getByRole("button", { name: "发送本次预览" }).disabled).toBe(true);
+  await user.click(screen.getByLabelText("我同意将本次预览发送给模型"));
+  await user.click(screen.getByRole("button", { name: "发送本次预览" }));
+  await screen.findByText(/模型结果：succeeded/);
+  expect(calls.filter(x => x.url.endsWith("/model/send"))).toHaveLength(1);
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/model/send")).options.body)).toEqual({ preview_id: "preview-one", confirmed: true });
+  await user.click(screen.getByRole("button", { name: "查看模型目标建议" }));
+  await user.click(await screen.findByLabelText("模型选择建议 9"));
+  await user.click(screen.getByRole("button", { name: "确认模型建议" }));
+  await waitFor(() => expect(calls.some(x => x.url.endsWith("/suggestions/confirm"))).toBe(true));
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/suggestions/confirm")).options.body).expected_runs[9].run_id).toBe(12);
+});
+
+test("关闭模型总闸提交明确关闭并清空页面授权", async () => {
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型目标 ID"), "7");
+  await user.click(screen.getByRole("button", { name: "生成外发预览" }));
+  await screen.findByText("本次外发预览");
+  await user.click(screen.getByRole("button", { name: "关闭模型外发并清除密钥" }));
+  await waitFor(() => expect(calls.some(x => x.url.endsWith("/model/access"))).toBe(true));
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/model/access")).options.body)).toEqual({ enabled: false, confirmed: true });
+  expect(screen.queryByText("本次外发预览")).toBeNull();
 });
 
 test("拒绝浏览器无法精确表示的 ID", () => {

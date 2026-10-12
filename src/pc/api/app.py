@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -45,6 +46,7 @@ class TagInput(Targets):
 
 class ReviewInput(Input):
     ids: list[ID] = Field(min_length=1, max_length=500)
+    expected_runs: dict[int, dict[str, Any]] = Field(default_factory=dict)
 
 
 class AliasInput(Input):
@@ -100,7 +102,8 @@ class Runtime:
 class Sessions:
     """一次性引导与可撤销会话；时间使用单调时钟。"""
 
-    def __init__(self):
+    def __init__(self, on_revoke=lambda _ident: None):
+        self.on_revoke = on_revoke
         self.bootstrap = secrets.token_urlsafe(32)
         self.deadline = time.monotonic() + 600
         self.entries: dict[str, dict[str, Any]] = {}
@@ -120,32 +123,55 @@ class Sessions:
             self.entries[ident] = {"created": now, "seen": now, "csrf": csrf}
             return ident, csrf
 
-    def check(self, ident: str) -> str:
+    def check(self, ident: str, *, touch=True) -> str:
         with self.lock:
             now = time.monotonic()
             session = self.entries.get(ident)
-            if (
-                session is None
-                or now - session["created"] >= 28800
-                or now - session["seen"] >= 1800
-            ):
-                self.entries.pop(ident, None)
-                raise HTTPException(401, "本机会话已失效，请重启 pc serve 获取授权链接")
-            session["seen"] = now
-            return session["csrf"]
+            valid = session is not None and now - session["created"] < 28800 and now - session["seen"] < 1800
+            if valid:
+                if touch:
+                    session["seen"] = now
+                return session["csrf"]
+            self.entries.pop(ident, None)
+        # 不持有会话锁调用模型清理，避免会话锁与模型锁顺序反转。
+        self.on_revoke(ident)
+        raise HTTPException(401, "本机会话已失效，请重启 pc serve 获取授权链接")
+
+    def valid(self, ident: str) -> bool:
+        try:
+            self.check(ident, touch=False)
+        except HTTPException:
+            return False
+        return True
 
     def revoke(self, ident: str):
         with self.lock:
             self.entries.pop(ident, None)
+        self.on_revoke(ident)
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     """工厂直接启动保留探针；业务页面通过 pc serve 注入本机运行时。"""
     from pc.services.accounts import identity
+    from pc.services.model_access import ModelAccess
+    from pc.services.model_gateway import ModelGateway
 
-    app = FastAPI(title="post-collector", version=__version__, docs_url=None, redoc_url=None)
-    sessions = Sessions()
+    access = ModelAccess(registry=runtime.registry if runtime else None, yaml_defaults=runtime.yaml_defaults if runtime else None, max_image_pixels=runtime.limits.max_image_pixels if runtime else 100_000_000)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            # Uvicorn 正常关闭（含 Ctrl+C）时主动解除凭据引用；不依赖 GC。
+            access.close()
+
+    app = FastAPI(title="post-collector", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
+    sessions = Sessions(on_revoke=access.invalidate_session)
+    gateway = ModelGateway(access, session_valid=sessions.valid)
     app.state.sessions = sessions
+    app.state.model_access = access
+    app.state.model_gateway = gateway
     origin = f"http://127.0.0.1:{runtime.port if runtime else 8080}"
 
     @app.middleware("http")
@@ -209,12 +235,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return {"status": "ok", "version": __version__}
 
     @app.get("/api/v1/meta")
-    def meta():
+    def meta(request: Request):
+        enabled = False
+        session = request.cookies.get("pc_session", "")
+        if runtime is not None and sessions.valid(session):
+            with connect() as conn:
+                enabled = access.status(conn, session)["enabled"]
         return {
             "name": "post-collector",
             "version": __version__,
             "stage": "local-web",
-            "egress_enabled": False,
+            "egress_enabled": enabled,
             "authentication": "temporary-local-root",
         }
 
@@ -225,6 +256,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     assets = Path(__file__).resolve().parent.parent / "web"
     app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
+    @app.get("/model", include_in_schema=False)
     @app.get("/add", include_in_schema=False)
     @app.get("/manage", include_in_schema=False)
     @app.get("/", include_in_schema=False)
@@ -362,7 +394,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/api/v1/suggestions/{operation}", dependencies=protected)
     def review(operation: Literal["confirm", "reject"], body: ReviewInput):
         with connect() as conn:
-            return tagging.review_suggestions(conn, body.ids, confirm=operation == "confirm")
+            return tagging.review_suggestions(conn, body.ids, confirm=operation == "confirm", expected_runs=body.expected_runs, model_access=access)
 
     @app.post("/api/v1/aliases/{operation}", dependencies=protected)
     def write_alias(operation: Literal["add", "remove"], body: AliasInput):
@@ -388,4 +420,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             )
         return {"action": action, "copied": result["copied"], "ok": True}
 
+    from pc.api.model_routes import register
+
+    register(app, connect=connect, protected=protected, access=access, gateway=gateway)
     return app

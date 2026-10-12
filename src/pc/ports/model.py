@@ -1,8 +1,8 @@
 """模型与安全端口（DESIGN §9.1：ModelProvider、Scanner、TagNormalizer、CharacterResolver）。
 
-**红线**：MVP 阶段不存在任何 AI 外发代码路径。``ModelProvider`` 在本阶段只有
-「本地可用」与「不可用」两种状态；阶段 2 引入外发网关后，外发调用必须收敛到
-单一内部函数，并由 ``egress_log`` 记录（DESIGN §6.3 硬性规则）。
+**红线**：唯一 AI 外发为本机 root 明确放行的固定模型标签建议。
+实际网络调用收敛到 DeepSeek 适配器，业务调用必须经模型网关和 ``egress_log``
+（DESIGN §6.3）；适配器可用不等于获得外发授权。
 """
 
 from __future__ import annotations
@@ -18,26 +18,23 @@ from pc.domain import (
 
 
 class ModelProvider(Protocol):
-    """模型统一入口：本地模型与（未来的）云端模型共用同一签名（DESIGN §4.7.5、§9.1）。
+    """模型统一签名（DESIGN §4.7.5、§9.1）。
 
-    契约要点：
-        * 输入输出与 ``model_version`` 绑定，所有输出都要能追溯「哪个模型、哪个 prompt 版本」；
-        * **必须支持「仅本地」模式**：``ai.involvement = off`` 时本接口返回「不可用」，
-          而**不是报错**——缺模型是正常状态，不是故障（DESIGN §4.7.4）；
-        * 输出不能直接落库，必须经 ``tag_assignment`` 的 ``pending``/``suggested`` 流程；
-        * 模型没有任何工具、插件、网络访问或代码执行能力；
-        * 阶段 2 起，实际外发只能经由单一内部函数，便于审计与断言
-          （「任何绕过 egress_log 的外发调用视为缺陷」）。
+    输入输出绑定模型与 prompt 版本；生产者不写库。云端标签结果只生成
+    suggested，经 root 复核成为 human；不授予工具或代码执行能力。
+    ``available`` 仅报告适配器凭据可用性，不判断参与度或外发授权；
+    策略、当前会话、内存总闸与逐次确认由 ModelAccess/ModelGateway 强制校验。
+    缺模型不妨碍人工功能；任何绕过网关和 egress_log 的外发调用视为缺陷。
     """
 
     def available(self) -> bool:
-        """当前档位下本模型是否可用。返回 False 时管线应跳过该步骤，不产生失败任务。"""
+        """适配器是否具备凭据；不代表策略或会话已允许调用。"""
         ...
 
     def classify(self, content: dict[str, Any]) -> ClassificationResult | None:
         """内容分类与敏感度判定。
 
-        返回 ``None`` 表示本档位下不参与（例如 ``ai.involvement = off``）。
+        返回 ``None`` 表示适配器未产出分类结果；调用前策略校验属于网关职责。
         敏感度判定必须**向上取整**：外部模型只能提高、不能降低本地给出的级别。
         """
         ...

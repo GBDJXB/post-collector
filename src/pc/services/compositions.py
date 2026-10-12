@@ -274,7 +274,7 @@ def tag_change(conn, ident, names, *, remove=False, namespace="general", actor_i
                 else tagging._ensure_tag(conn, candidate, TagSource.HUMAN, actor_id)
             )
             before = conn.execute(
-                "SELECT * FROM composition_tag_assignment WHERE composition_id=? AND tag_id=?",
+                "SELECT * FROM composition_tag_assignment WHERE composition_id=? AND tag_id=? AND source='human'",
                 (ident, tag_id),
             ).fetchone()
             if (remove and (before is None or before["revoked_at"] is not None)) or (
@@ -322,3 +322,8 @@ def show_tags(conn, ident):
             )
         ]
     return tagging.result("composition_assignments", "assignments", rows)
+
+
+def review_composition_suggestions(conn, ids, *, confirm, actor_id=None, expected_runs=None, model_access=None):
+    """组合建议独立审核，不修改任何成员关联。"""
+    return tagging.review_suggestions(conn, ids, confirm=confirm, actor_id=actor_id, expected_runs=expected_runs, composition=True, model_access=model_access)

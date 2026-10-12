@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import uuid
 from pathlib import Path
 
 import httpx
@@ -13,8 +14,6 @@ from pc import cli
 from pc.adapters import sqlite as db
 from pc.adapters import windows_view
 from pc.api.app import Runtime, create_app
-from pc.domain import ClassificationResult, TagCandidate, TagSource
-from pc.services import tagging
 
 ORIGIN = "http://127.0.0.1:8080"
 PNG = base64.b64decode(
@@ -218,11 +217,12 @@ async def test_tags_aliases_and_immediate_search(client, web):
 @pytest.mark.parametrize("operation", ["confirm", "reject"])
 async def test_suggestions(client, web, operation):
     with db.open_db(web["path"]) as conn:
-        classification = ClassificationResult(
-            tags=(TagCandidate("候选标签", 0.8),), source=TagSource.SUGGESTED
-        )
-        tagging.apply_classification(conn, classification, message_ids=[target(web)["message_id"]])
-        ident = conn.execute("SELECT assign_id FROM tag_assignment").fetchone()[0]
+        # 升级前已持久化的无证明建议仍可审核；现行生产入口禁止制造此类行。
+        tag = conn.execute("INSERT INTO tag(uuid,name,name_norm,namespace,status) VALUES (?,'候选标签','候选标签','general','pending') RETURNING tag_id", (str(uuid.uuid4()),)).fetchone()[0]
+        content = web["targets"]["text"]["content_id"]
+        conn.execute("INSERT INTO classification_run(content_id,capability) VALUES (?,'llm')", (content,))
+        ident = conn.execute("INSERT INTO tag_assignment(content_id,tag_id,source,confidence,evidence) VALUES (?,?,'suggested',0.8,'{}') RETURNING assign_id", (content, tag)).fetchone()[0]
+        conn.commit()
     await login(client, web)
     response = await client.post(f"/api/v1/suggestions/{operation}", json={"ids": [ident]})
     assert response.status_code == 200, response.text
@@ -343,7 +343,7 @@ async def test_page_csp_and_text_data(client, web):
 @pytest.mark.asyncio
 async def test_spa_routes_and_missing_resources(client):
     home = await client.get("/")
-    for route in ("/add", "/manage"):
+    for route in ("/add", "/manage", "/model"):
         assert (await client.get(route)).text == home.text
     assert (await client.get("/api/v1/missing")).status_code == 404
     assert (await client.get("/assets/missing.js")).status_code == 404

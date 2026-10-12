@@ -38,8 +38,8 @@ settings:
     note: 底层是 pHash/dHash/aHash 三者的投票结果，见 DESIGN §3.6。
 
   - key: ai.involvement
-    label: AI 自动分类的参与程度
-    help: 决定系统在多大程度上自动帮你判断内容和打标签。选「完全不参与」时不会下载或加载任何模型，所有内容都进待人工分类队列，由你自己判断该不该存、该归到哪个分类。
+    label: AI 标签建议的参与程度
+    help: off/local_only 禁止云端；assist/advisory_auto 允许在 Web 设置内存密钥、开启总闸并逐次同意后调用。当前没有本地模型、自动分类队列或自动采信；不下载模型。
     default: local_only
     type: enum
     # 注意：取值必须加引号。YAML 1.1 会把裸写的 off / on / yes / no 解析成布尔值，
@@ -47,16 +47,16 @@ settings:
     values: ["off", local_only, assist, advisory_auto]
     value_labels:
       "off": 完全不参与（纯手动）
-      local_only: 仅本机模型（推荐）
-      assist: 本机模型 + 云端给出建议（需人工确认）
-      advisory_auto: 本机模型 + 云端建议自动采信（仅高可信时）
+      local_only: 仅本机（当前无本地模型）
+      assist: 云端标签建议（需总闸及逐次确认）
+      advisory_auto: 保留档位（当前云端建议仍须人工确认）
     impact: 调低 → 更少自动判断、更多人工整理、隐私更好；调高 → 更省人力、可能引入误判与外发
     cost: api
     restart_required: false
     dangerous: false
     recompute: classify
     requires: []
-    note: 切到 off 会停止使用模型，但不会删除已有的人工与自动标签。骨架阶段尚未接线模型，两档行为相同。
+    note: off/local_only 禁止云端标签调用；assist/advisory_auto 还须 Web 内存总闸与逐次确认，均只生成 suggested，不自动采信；不删除既有标签。
 
   - key: retention.max_total_bytes
     label: 内容库最大占用
@@ -113,14 +113,14 @@ settings:
     dangerous: true
     recompute: null
     requires: []
-    note: 骨架与 MVP 阶段不存在外发代码路径，本开关当前无消费方，仅为数据模型与后续阶段保留。
+    note: 本机模型标签网关消费此开关。关闭仍须当前会话的内存密钥、Web 总闸和逐次确认；开启阻止发送。
 
 # ---------------------------------------------------------------------------
 # 阶段 2 才会启用的设置项（此处只作声明示例，不生效）
 #
-# 说明：MVP 阶段「不写外发代码路径」（DESIGN §8.1），因此这里不注册任何
-# 「允许外发」类开关 —— 注册一个没有实现的开关只会制造能力错觉。
-# 阶段 2 引入外发网关（DESIGN §6.3）时，按下面的形态追加：
+# 以下是未注册的历史示例，不控制当前固定模型 API；当前外发由
+# privacy.local_only_mode、ai.involvement 和进程内 Web 总闸共同限制。
+# 不因示例存在而开放额外 endpoint 或外发路径（DESIGN §6.3）。
 #
 #   - key: ai.egress_enabled
 #     label: 允许把内容发送到外部 AI 服务

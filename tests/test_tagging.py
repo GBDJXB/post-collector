@@ -43,6 +43,14 @@ def search(conn, word="", names=()):
     return run_search(conn, SearchQuery(q=word, tags=names))
 
 
+def legacy_suggestions(conn, ids, name, confidence=0.8):
+    """只播种升级前的持久化行，不通过现行生产入口制造无快照建议。"""
+    tag = conn.execute("SELECT tag_id FROM tag WHERE name=?", (name,)).fetchone()[0]
+    for content in ids:
+        conn.execute("INSERT INTO classification_run(content_id,capability) VALUES (?,'llm')", (content,))
+        conn.execute("INSERT INTO tag_assignment(content_id,tag_id,source,confidence,evidence) VALUES (?,?,'suggested',?,'{}')", (content, tag, confidence))
+
+
 @pytest.mark.parametrize(
     ("value", "expected"), [("ＡＢ_C", "ab_c"), (" AB  c ", "ab_c"), ("中文 标签", "中文_标签")]
 )
@@ -109,12 +117,10 @@ def test_precise_part_and_quarantine(post):
 
 def test_suggestion_confirm_and_alias_no_leak(post):
     conn, message, _ids = post
-    proposed = ClassificationResult(
-        tags=(TagCandidate("待定名称", 0.8, {"reason": "模型证据"}),), decided_by="future_model"
-    )
-    tags.apply_classification(conn, proposed, message_ids=[message])
+    conn.execute("INSERT INTO tag(uuid,name,name_norm,namespace) VALUES (?,'待定名称','待定名称','general')", (str(uuid.uuid4()),))
+    legacy_suggestions(conn, _ids, "待定名称")
     tags.change_alias(conn, "候选别名", name="待定名称")
-    assert tags.list_tags(conn)["tags"][0]["status"] == "pending"
+    assert tags.list_tags(conn)["tags"][0]["status"] == "active"
     for term in ("待定名称", "候选别名"):
         assert not search(conn, term)["hits"]
         assert not search(conn, names=(term,))["hits"]
@@ -142,8 +148,7 @@ def test_suggestion_confirm_and_alias_no_leak(post):
 def test_suggested_on_active_tag_and_multi_source_count(post):
     conn, _, ids = post
     tags.apply_classification(conn, tags.manual_result(["普通名称"]), content_ids=[ids[0]])
-    proposed = ClassificationResult(tags=(TagCandidate("普通名称", 0.9),))
-    tags.apply_classification(conn, proposed, content_ids=ids)
+    legacy_suggestions(conn, ids, "普通名称", 0.9)
     assert len(search(conn, "普通名称")["hits"][0]["tags"]) == 1
     rows = tags.show_tags(conn, content_ids=ids)["assignments"]
     tags.review_suggestions(
@@ -242,9 +247,11 @@ def test_names_with_colon_and_namespaced_alias(post):
 
 def test_alias_and_confirmation_failure_rollback(post, monkeypatch):
     conn, message, _ = post
-    tags.apply_classification(
-        conn, ClassificationResult(tags=(TagCandidate("suggestion", 0.8),)), message_ids=[message]
-    )
+    conn.execute("INSERT INTO tag(uuid,name,name_norm,namespace) VALUES (?,'suggestion','suggestion','general')", (str(uuid.uuid4()),))
+    legacy_ids = [r[0] for r in conn.execute("SELECT content_id FROM content_item WHERE message_id=?", (message,))]
+    legacy_suggestions(conn, legacy_ids, "suggestion")
+    # 模拟升级前已有的 pending 建议；新写入不再创建 pending 标签。
+    conn.execute("UPDATE tag SET status='pending'")
     ident = tags.show_tags(conn, message_ids=[message])["assignments"][0]["assign_id"]
     before = conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
     with pytest.raises(ValueError):
@@ -292,7 +299,63 @@ def test_explicit_root_actor(post, status):
         assert conn.execute("SELECT actor_id FROM audit_log LIMIT 1").fetchone()[0] == ident
 
 
-@pytest.mark.parametrize("confidence", [-0.1, 1.1, float("nan"), float("inf")])
+def test_suggested_never_creates_new_tag(post):
+    conn, message, _ = post
+    with pytest.raises(ValueError, match="已有"):
+        tags.apply_classification(conn, ClassificationResult(tags=(TagCandidate("新名称", 0.8),)), message_ids=[message])
+    for table in ("tag", "tag_assignment", "classification_run", "audit_log"):
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_existing_ids_require_model_snapshot(post):
+    conn, _, ids = post
+    tag = conn.execute("INSERT INTO tag(uuid,name,name_norm,namespace) VALUES (?,'已有','已有','general') RETURNING tag_id", (str(uuid.uuid4()),)).fetchone()[0]
+    with pytest.raises(ValueError, match="绑定"):
+        tags.apply_classification(conn, ClassificationResult(tags=(TagCandidate("已有", 0.8),)), content_ids=[ids[0]], existing_tag_ids=[tag])
+    assert conn.execute("SELECT count(*) FROM tag_assignment").fetchone()[0] == 0
+
+
+def test_composition_proposal_is_independent_and_guarded(post):
+    from pc.services import compositions as co
+
+    conn, _, ids = post
+    composition = co.write(conn, "create", name="组合", contents=ids)["composition_id"]
+    tag = conn.execute("INSERT INTO tag(uuid,name,name_norm,namespace) VALUES (?,'已有','已有','general') RETURNING tag_id", (str(uuid.uuid4()),)).fetchone()[0]
+    model = conn.execute("INSERT INTO model_version(capability,model_name) VALUES ('llm','test') RETURNING model_version_id").fetchone()[0]
+    proposal = ClassificationResult(tags=(TagCandidate("已有", 0.8, {"reason": "证据"}),), model_version_id=model)
+    from pc.services import model_tagging as mt
+    from pc.services.model_access import ModelAccess
+
+    source = conn.execute("SELECT source_id FROM message LIMIT 1").fetchone()[0]
+    conn.execute("INSERT INTO source_authorization(source_id,mode) VALUES (?,'manual_export')", (source,))
+    access = ModelAccess()
+    access.set_key("session", "TEST-ONLY-KEY")
+    access.set_access(conn, "session", True, confirmed=True)
+    snapshot = mt.make_snapshot(mt.build_input(conn, composition_id=composition), mt.load_catalog(conn), [tag], access.config_digest(conn))
+    args = {"composition_ids": [composition], "existing_tag_ids": [tag], "input_ref": mt.encoded(snapshot).decode()}
+    first = tags.apply_classification(conn, proposal, **args)
+    assignment = co.show_tags(conn, composition)["assignments"][0]
+    assert conn.execute("SELECT count(*) FROM tag_assignment").fetchone()[0] == 0
+    assert co.show(conn, composition)["tags"] == []
+    assert co.list_compositions(conn, names=["已有"])["total"] == 0
+    assert tags.list_tags(conn)["tags"][0]["composition_usage_count"] == 0
+    with pytest.raises(ValueError, match="版本"):
+        co.review_composition_suggestions(conn, [assignment["assign_id"]], confirm=True)
+    expected = {assignment["assign_id"]: json.loads(assignment["evidence"])["model_proposal"]}
+    second = tags.apply_classification(conn, proposal, **args)
+    assert first["run_ids"] != second["run_ids"]
+    with pytest.raises(ValueError, match="版本"):
+        co.review_composition_suggestions(conn, [assignment["assign_id"]], confirm=True, expected_runs=expected)
+    current = co.show_tags(conn, composition)["assignments"][0]
+    co.review_composition_suggestions(conn, [current["assign_id"]], confirm=True, expected_runs={current["assign_id"]: json.loads(current["evidence"])["model_proposal"]}, model_access=access)
+    assert [t["name"] for t in co.show(conn, composition)["tags"]] == ["已有"]
+    assert tags.list_tags(conn)["tags"][0]["composition_usage_count"] == 1
+    assert conn.execute("SELECT count(*) FROM tag_assignment").fetchone()[0] == 0
+    co.tag_change(conn, composition, ["已有"], remove=True)
+    assert co.show(conn, composition)["tags"] == []
+
+
+@pytest.mark.parametrize("confidence", [True, -0.1, 1.1, float("nan"), float("inf")])
 def test_invalid_model_confidence(post, confidence):
     conn, message, _ = post
     with pytest.raises(ValueError):

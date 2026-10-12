@@ -88,7 +88,7 @@ PRAGMA_BASELINE: tuple[str, ...] = (
 #: 两个 FTS5 虚拟表（DESIGN §5.1）。它们由迁移脚本创建，索引可全量重建。
 FTS_VIRTUAL_TABLES: tuple[str, ...] = ("content_fts", "content_word")
 
-#: 迁移建出的 35 张表（含迁移记账表）。
+#: 迁移建出的 39 张表（含迁移记账表）；0010 增加三张组合表，0011 增加 egress_log。
 #: 0001 建 34 张（与 PostgreSQL 版的 32 张相比：新增 ``content_media``（媒体与内容项
 #: 的多对多）与 ``hash_tombstone``（硬删后的哈希墓地）），0007 新增 ``post``
 #: （一帖一行的派生表，检索的结果单位，见 DESIGN §4.4/§5.1）。
@@ -104,6 +104,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "composition_tag_assignment",
         "content_item",
         "content_media",
+        "egress_log",
         "fetch_log",
         "hash_tombstone",
         "inbox_item",
@@ -135,11 +136,8 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
     }
 )
 
-#: 阶段 2 才引入、当前**必须缺席**的三张表。
-#: 缺席本身就是「无外发」红线的一部分（DESIGN §8.1 的 MVP 明确不做外发）。
-DEFERRED_TABLES: frozenset[str] = frozenset(
-    {"content_embedding", "ai_provider_policy", "egress_log"}
-)
+#: 未批准的向量与通用提供商策略表仍必须缺席；0011 仅启用打标外发日志。
+DEFERRED_TABLES: frozenset[str] = frozenset({"content_embedding", "ai_provider_policy"})
 
 #: ``setting.source`` 的允许取值，与 0001 的 CHECK 约束保持一致。
 SETTING_SOURCES: tuple[str, ...] = ("default", "yaml", "db", "env")
@@ -635,8 +633,21 @@ def _rollback(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
-    """把一组写操作包进一个显式事务：要么都写，要么都不写。"""
+def transaction(conn: sqlite3.Connection, *, immediate: bool = True, nested: bool = False) -> Iterator[sqlite3.Connection]:
+    """显式事务；明确 nested=True 时用 SAVEPOINT，不提交调用方事务。"""
+    if nested and conn.in_transaction:
+        conn.execute("SAVEPOINT pc_nested")
+        try:
+            yield conn
+        except BaseException:
+            # SQLite 自行回滚（如 RAISE(ROLLBACK)）可能已删除 SAVEPOINT。
+            with suppress(sqlite3.Error):
+                conn.execute("ROLLBACK TO pc_nested")
+                conn.execute("RELEASE pc_nested")
+            raise
+        else:
+            conn.execute("RELEASE pc_nested")
+        return
     if immediate:
         _begin(conn)
     else:
@@ -1886,9 +1897,10 @@ def write_setting_change(
     _ensure_table(conn, "setting_change", "请先应用迁移：uv run pc db apply")
 
     try:
-        with transaction(conn):
-            # 取写锁后再读旧值，避免「读了旧值、写时已被别人改过」的竞态。
-            # SQLite 没有 SELECT ... FOR UPDATE，这里靠 BEGIN IMMEDIATE 达到同样效果。
+        with transaction(conn, nested=True):
+            # 可参与双设置原子修改；SAVEPOINT 保留值与审计同生共死。
+            # 独立调用通过 BEGIN IMMEDIATE 取得写锁；嵌套调用保留外层锁与快照，
+            # 不单独提交。若外层读快照不能升级写入，SQLite 报错并回滚此次修改。
             row = conn.execute("SELECT value FROM setting WHERE key = ?", (key,)).fetchone()
             before = _decode(row["value"]) if row else None
 

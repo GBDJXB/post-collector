@@ -1,11 +1,7 @@
-"""红线守卫：``src/pc`` 下不存在任何出网代码路径。
+"""红线守卫：仅 DESIGN §4.5/§6.3 批准的固定打标适配器可导入 httpx。
 
-DESIGN §9 阶段 1 验收⑦ 要求「全库 grep 不存在任何外发 AI 调用的代码路径」。
-把它写成**测试**而不是写在文档里，是因为文档会被忽略、测试不会：这条红线一旦破，
-"内容不会离开本机"就从事实退化成一句承诺。
-
-判据是导入图，不是关键字：``import socket`` 与 ``from urllib import request`` 都会被
-``ast`` 抓到，而注释与文档里提到 ``httpx``（比如说明"将来换 httpx2"）不会误报。
+除精确文件/模块组合外继续禁止任何网络客户端及服务商 SDK；端口层无第三方依赖。
+判据是 AST 导入图，不是注释或关键词。实际闸门/审计/计费预算由网关测试验证。
 """
 
 from __future__ import annotations
@@ -91,12 +87,11 @@ def test_there_are_source_files_to_check() -> None:
 @pytest.mark.parametrize("path", _source_files(), ids=lambda path: path.name)
 def test_no_egress_imports(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    offenders = sorted(_imported_roots(tree) & FORBIDDEN_MODULES)
+    allowed = {"httpx"} if path == SRC / "adapters" / "deepseek_model.py" else set()
+    offenders = sorted((_imported_roots(tree) & FORBIDDEN_MODULES) - allowed)
     assert not offenders, (
-        f"{path.relative_to(SRC.parent.parent)} 导入了出网模块：{offenders}\n"
-        "  阶段 1 不允许任何外发代码路径（DESIGN §9 验收⑦、§6.3）。\n"
-        "  如果这确实是必需的（例如阶段 2 的外发网关），先改 DESIGN 与 AGENTS，"
-        "并把调用收敛到单一内部函数 + egress_log，再动这份名单。"
+        f"{path.relative_to(SRC.parent.parent)} 导入了未批准的出网模块：{offenders}\n"
+        "只允许固定打标适配器导入 httpx（DESIGN §4.5/§6.3）；其他出网路径须先获批准。"
     )
 
 
@@ -136,28 +131,19 @@ def _pyproject() -> dict[str, object]:
 
 
 def test_pyproject_runtime_dependencies_are_clean() -> None:
-    """**运行时**依赖里不该出现出网库：装了它，迟早会有人用。"""
+    """唯一批准的网络运行时依赖是固定打标适配器使用的 httpx。"""
     data = _pyproject()
     project = data.get("project", {})
     assert isinstance(project, dict)
     runtime = _dependency_names([str(item) for item in project.get("dependencies", [])])
-    offenders = sorted(runtime & FORBIDDEN_MODULES)
+    offenders = sorted((runtime & FORBIDDEN_MODULES) - {"httpx"})
     assert not offenders, f"运行时依赖里出现了出网库：{offenders}"
 
 
-def test_network_client_is_dev_only() -> None:
-    """``httpx`` 是 FastAPI TestClient 的依赖，只允许出现在 dev 组。
-
-    这条断言的意义在于：它把"它只是测试用的"变成**代码里的事实**。哪天有人把它挪进
-    运行时依赖，这条测试会红，而不是等到某段代码开始发请求才被发现。
-    """
+def test_fixed_model_adapter_has_runtime_httpx() -> None:
+    """uv sync --no-dev 也必须能加载批准的打标适配器，不依赖 dev 组。"""
     data = _pyproject()
-    groups = data.get("dependency-groups", {})
-    assert isinstance(groups, dict)
-    dev = _dependency_names([str(item) for item in groups.get("dev", [])])
-    assert "httpx" in dev, "TestClient 需要 httpx（dev 组）"
-
     project = data.get("project", {})
     assert isinstance(project, dict)
     runtime = _dependency_names([str(item) for item in project.get("dependencies", [])])
-    assert "httpx" not in runtime, "httpx 只该在 dev 组：运行时不发请求"
+    assert "httpx" in runtime, "固定打标适配器需要运行时 httpx"

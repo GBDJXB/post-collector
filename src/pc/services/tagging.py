@@ -115,6 +115,8 @@ def _ensure_tag(
 ) -> int:
     normalizer = SqliteTagNormalizer(conn)
     row = normalizer.resolve(candidate.tag, str(candidate.namespace))
+    if source == TagSource.SUGGESTED and (row is None or row["status"] not in {"active", "deprecated"}):
+        raise TaggingError("建议只能选择已有 active/deprecated 标签")
     if row is None:
         ident = int(
             conn.execute(
@@ -169,9 +171,13 @@ def _assign(
     candidate: TagCandidate,
     model: int | None,
     actor: int | None,
+    *,
+    composition: bool = False,
 ) -> bool:
+    table = "composition_tag_assignment" if composition else "tag_assignment"
+    field = "composition_id" if composition else "content_id"
     before = conn.execute(
-        "SELECT * FROM tag_assignment WHERE content_id=? AND tag_id=? AND source=?",
+        f"SELECT * FROM {table} WHERE {field}=? AND tag_id=? AND source=?",
         (content, tag, str(source)),
     ).fetchone()
     evidence = _json(candidate.evidence)
@@ -192,20 +198,20 @@ def _assign(
     now = db.now_iso()
     ident = int(
         conn.execute(
-            "INSERT INTO tag_assignment(content_id,tag_id,source,confidence,model_version_id,evidence,"
+            f"INSERT INTO {table}({field},tag_id,source,confidence,model_version_id,evidence,"
             "assigned_by,assigned_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(content_id,tag_id,source) DO UPDATE SET confidence=excluded.confidence,"
+            f"ON CONFLICT({field},tag_id,source) DO UPDATE SET confidence=excluded.confidence,"
             "model_version_id=excluded.model_version_id,evidence=excluded.evidence,"
             "assigned_by=excluded.assigned_by,assigned_at=excluded.assigned_at,"
             "updated_at=excluded.updated_at,revoked_at=NULL RETURNING assign_id",
             (content, tag, str(source), confidence, model, evidence, actor, now, now),
         ).fetchone()[0]
     )
-    after = conn.execute("SELECT * FROM tag_assignment WHERE assign_id=?", (ident,)).fetchone()
+    after = conn.execute(f"SELECT * FROM {table} WHERE assign_id=?", (ident,)).fetchone()
     _audit(
         conn,
-        "tag.assign",
-        "tag_assignment",
+        "composition.tag.assign" if composition else "tag.assign",
+        table,
         ident,
         dict(before) if before else None,
         dict(after),
@@ -220,10 +226,14 @@ def _record(
     content: int,
     classification: ClassificationResult,
     candidates: Sequence[TagCandidate],
-) -> None:
-    conn.execute(
-        "INSERT INTO classification_run(content_id,capability,model_version_id,output,status) "
-        "VALUES (?,?,?,?,'succeeded')",
+    *,
+    composition: bool = False,
+    input_ref: str | None = None,
+) -> int:
+    field = "composition_id" if composition else "content_id"
+    return int(conn.execute(
+        f"INSERT INTO classification_run({field},capability,model_version_id,output,input_ref,status) "
+        "VALUES (?,?,?,?,?,'succeeded') RETURNING run_id",
         (
             content,
             "manual" if classification.source == TagSource.HUMAN else "llm",
@@ -244,8 +254,9 @@ def _record(
                     ],
                 }
             ),
+            input_ref,
         ),
-    )
+    ).fetchone()[0])
 
 
 def _refresh(conn: sqlite3.Connection, tags: Sequence[int], contents: Sequence[int]) -> None:
@@ -266,9 +277,12 @@ def apply_classification(
     *,
     message_ids: Sequence[int] = (),
     content_ids: Sequence[int] = (),
+    composition_ids: Sequence[int] = (),
     actor_id: int | None = None,
+    input_ref: str | None = None,
+    existing_tag_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """共同写入入口：生产者在事务外完成请求，此处只接收已解析的结构化结果。"""
+    """只接收已解析结果；模型网关必须拥有外层事务，联合提交外发账本和建议。"""
     if classification.source not in (TagSource.HUMAN, TagSource.SUGGESTED):
         raise TaggingError("当前入口支持 human 与 suggested 来源")
     if classification.rating is not None or not classification.tags:
@@ -277,7 +291,8 @@ def apply_classification(
         if str(c.namespace) not in MANUAL_NAMESPACES:
             raise TaggingError("当前入口支持普通标签命名空间")
         if (
-            not isinstance(c.confidence, (int, float))
+            isinstance(c.confidence, bool)
+            or not isinstance(c.confidence, (int, float))
             or not math.isfinite(c.confidence)
             or not 0 <= c.confidence <= 1
         ):
@@ -286,30 +301,60 @@ def apply_classification(
         if not isinstance(c.evidence, dict):
             raise TaggingError("标签证据必须为对象")
         _json(c.evidence)
-    candidates = SqliteTagNormalizer(conn).resolve_conflicts(classification.tags)
-    with db.transaction(conn):
+    bound = input_ref is not None
+    if bound != (existing_tag_ids is not None):
+        raise TaggingError("模型建议必须同时绑定快照与已有标签")
+    if bound and (classification.source != TagSource.SUGGESTED or classification.model_version_id is None or existing_tag_ids is None):
+        raise TaggingError("模型建议必须绑定已有标签和模型版本")
+    if classification.source == TagSource.SUGGESTED and not bound:
+        raise TaggingError("新模型建议必须绑定快照与已有标签")
+    if any("model_proposal" in c.evidence for c in classification.tags):
+        raise TaggingError("模型建议版本由服务生成")
+    candidates = list(classification.tags) if existing_tag_ids is not None else SqliteTagNormalizer(conn).resolve_conflicts(classification.tags)
+    with db.transaction(conn, nested=bound):
         _root(conn, actor_id)
-        targets = _targets(conn, message_ids, content_ids)
-        tags = [_ensure_tag(conn, c, classification.source, actor_id) for c in candidates]
-        changed: list[int] = []
+        if composition_ids:
+            from pc.services import compositions as co
+
+            if message_ids or content_ids:
+                raise TaggingError("组合与内容目标互斥")
+            targets = list(dict.fromkeys(composition_ids))
+            for target in targets:
+                co._get(conn, target)
+        else:
+            targets = _targets(conn, message_ids, content_ids)
+        if bound and len(targets) != 1:
+            raise TaggingError("模型建议一次只接受一个目标")
+        if existing_tag_ids is None:
+            tags = [_ensure_tag(conn, c, classification.source, actor_id) for c in candidates]
+        else:
+            tags = list(existing_tag_ids)
+            if len(tags) != len(candidates) or len(set(tags)) != len(tags):
+                raise TaggingError("已有标签 ID 必须与建议一一对应")
+            for tag, candidate in zip(tags, candidates, strict=True):
+                row = conn.execute("SELECT * FROM tag WHERE tag_id=?", (tag,)).fetchone()
+                if row is None or row["status"] not in {"active", "deprecated"} or row["name"] != candidate.tag or row["namespace"] != str(candidate.namespace):
+                    raise TaggingError("已有标签发生变化，请重新获取建议")
+        if bound:
+            from pc.services.model_tagging import parse_snapshot, validate_snapshot
+
+            field = "composition_id" if composition_ids else "content_id"
+            validate_snapshot(conn, parse_snapshot(input_ref), target={field: targets[0]}, selected_ids=tags)
+        changed, runs = [], []
         for target in targets:
-            applied = [
-                _assign(
-                    conn,
-                    target,
-                    tag,
-                    classification.source,
-                    c,
-                    classification.model_version_id,
-                    actor_id,
-                )
-                for tag, c in zip(tags, candidates, strict=True)
-            ]
+            current = candidates
+            if bound:
+                run = _record(conn, target, classification, candidates, composition=bool(composition_ids), input_ref=input_ref)
+                runs.append(run)
+                current = [TagCandidate(c.tag, c.confidence, c.evidence | {"model_proposal": {"run_id": run, "version": str(uuid.uuid4())}}, c.namespace) for c in candidates]
+            applied = [_assign(conn, target, tag, classification.source, c, classification.model_version_id, actor_id, composition=bool(composition_ids)) for tag, c in zip(tags, current, strict=True)]
             if any(applied):
-                _record(conn, target, classification, candidates)
+                if not bound:
+                    runs.append(_record(conn, target, classification, candidates, composition=bool(composition_ids)))
                 changed.append(target)
-        _refresh(conn, tags, changed)
-    return {"content_ids": targets, "changed_content_ids": changed, "tag_ids": tags}
+        if not composition_ids:
+            _refresh(conn, tags, changed)
+    return {"content_ids": [] if composition_ids else targets, "changed_content_ids": [] if composition_ids else changed, "composition_ids": targets if composition_ids else [], "changed_composition_ids": changed if composition_ids else [], "tag_ids": tags, "run_ids": runs}
 
 
 def remove_tags(
@@ -341,33 +386,80 @@ def remove_tags(
     return {"content_ids": targets, "changed_content_ids": sorted(changed), "tag_ids": tags}
 
 
-def _revoke(conn: sqlite3.Connection, row: sqlite3.Row, actor: int | None, action: str) -> None:
+def _revoke(conn: sqlite3.Connection, row: sqlite3.Row, actor: int | None, action: str, *, composition: bool = False) -> None:
     now = db.now_iso()
+    table = "composition_tag_assignment" if composition else "tag_assignment"
     conn.execute(
-        "UPDATE tag_assignment SET revoked_at=?,updated_at=? WHERE assign_id=?",
+        f"UPDATE {table} SET revoked_at=?,updated_at=? WHERE assign_id=?",
         (now, now, row["assign_id"]),
     )
     after = dict(row) | {"revoked_at": now, "updated_at": now}
-    _audit(conn, action, "tag_assignment", row["assign_id"], dict(row), after, actor)
+    _audit(conn, action, table, row["assign_id"], dict(row), after, actor)
+
+
+def _review_guard(conn, row, expected_runs, model_access):
+    evidence = json.loads(row["evidence"])
+    if not isinstance(evidence, dict):
+        raise TaggingError("建议证据无效")
+    if "model_proposal" not in evidence:
+        return  # 仅兼容升级前已持久化的历史建议；新建议不得省略快照。
+    proof = evidence["model_proposal"]
+    if (
+        not isinstance(proof, dict)
+        or set(proof) != {"run_id", "version"}
+        or type(proof["run_id"]) is not int
+        or proof["run_id"] <= 0
+        or not isinstance(proof["version"], str)
+    ):
+        raise TaggingError("建议版本证据无效")
+    try:
+        uuid.UUID(proof["version"])
+    except ValueError:
+        raise TaggingError("建议版本证据无效") from None
+    expected = (expected_runs or {}).get(row["assign_id"])
+    if expected != proof:
+        raise TaggingError("建议版本已变化，请重新加载后确认")
+    run = conn.execute("SELECT * FROM classification_run WHERE run_id=?", (proof["run_id"],)).fetchone()
+    field = "composition_id" if "composition_id" in dict(row) else "content_id"
+    if run is None or run[field] != row[field] or run["model_version_id"] != row["model_version_id"]:
+        raise TaggingError("建议版本无效")
+    from pc.services.model_tagging import parse_snapshot, validate_adoption
+
+    validate_adoption(conn, row, parse_snapshot(run["input_ref"]), access=model_access)
 
 
 def review_suggestions(
-    conn: sqlite3.Connection, ids: Sequence[int], *, confirm: bool, actor_id: int | None = None
+    conn: sqlite3.Connection, ids: Sequence[int], *, confirm: bool, actor_id: int | None = None,
+    expected_runs: dict[int, dict[str, Any]] | None = None,
+    composition: bool = False,
+    expected_composition_id: int | None = None,
+    model_access=None,
 ) -> dict[str, Any]:
     if not ids:
         raise TaggingError("请选择建议关联 ID")
+    table = "composition_tag_assignment" if composition else "tag_assignment"
+    field = "composition_id" if composition else "content_id"
     with db.transaction(conn):
         _root(conn, actor_id)
         rows = []
         for ident in dict.fromkeys(ids):
             row = conn.execute(
-                "SELECT ta.*,t.name,t.namespace,t.status FROM tag_assignment ta "
+                f"SELECT ta.*,t.name,t.namespace,t.status FROM {table} ta "
                 "JOIN tag t USING(tag_id) WHERE assign_id=? AND source='suggested'",
                 (ident,),
             ).fetchone()
             if row is None:
                 raise TaggingError(f"建议关联不存在：{ident}")
-            _targets(conn, (), [row["content_id"]])
+            if expected_composition_id is not None and (not composition or row[field] != expected_composition_id):
+                raise TaggingError("建议关联不属于当前组合")
+            if confirm:
+                if composition:
+                    from pc.services import compositions as co
+
+                    co._get(conn, row[field])
+                else:
+                    _targets(conn, (), [row[field]])
+                _review_guard(conn, row, expected_runs, model_access)
             rows.append(row)
         changed, tags = [], []
         for row in rows:
@@ -386,17 +478,18 @@ def review_suggestions(
                     TagNamespace(row["namespace"]),
                 )
                 _ensure_tag(conn, c, TagSource.HUMAN, actor_id)
-                _assign(conn, row["content_id"], row["tag_id"], TagSource.HUMAN, c, None, actor_id)
-                _record(conn, row["content_id"], classification, [c])
-            _revoke(conn, row, actor_id, "tag.confirm" if confirm else "tag.reject")
-            changed.append(row["content_id"])
+                _assign(conn, row[field], row["tag_id"], TagSource.HUMAN, c, None, actor_id, composition=composition)
+                _record(conn, row[field], classification, [c], composition=composition)
+            _revoke(conn, row, actor_id, "tag.confirm" if confirm else "tag.reject", composition=composition)
+            changed.append(row[field])
             tags.append(row["tag_id"])
-        _refresh(conn, tags, changed)
-    return {"assignment_ids": list(dict.fromkeys(ids)), "changed_content_ids": sorted(set(changed))}
+        if not composition:
+            _refresh(conn, tags, changed)
+    return {"assignment_ids": list(dict.fromkeys(ids)), "changed_content_ids": [] if composition else sorted(set(changed)), "changed_composition_ids": sorted(set(changed)) if composition else []}
 
 
 def list_tags(conn: sqlite3.Connection) -> dict[str, Any]:
-    rows = [dict(r) for r in conn.execute("SELECT t.*,(SELECT count(DISTINCT ca.composition_id) FROM composition_tag_assignment ca JOIN composition co USING(composition_id) WHERE ca.tag_id=t.tag_id AND ca.revoked_at IS NULL AND co.deleted_at IS NULL AND t.status IN ('active','deprecated')) AS composition_usage_count FROM tag t ORDER BY namespace,name_norm,tag_id")]
+    rows = [dict(r) for r in conn.execute("SELECT t.*,(SELECT count(DISTINCT ca.composition_id) FROM composition_tag_assignment ca JOIN composition co USING(composition_id) WHERE ca.tag_id=t.tag_id AND ca.source='human' AND ca.revoked_at IS NULL AND co.deleted_at IS NULL AND t.status IN ('active','deprecated')) AS composition_usage_count FROM tag t ORDER BY namespace,name_norm,tag_id")]
     for row in rows:
         row["aliases"] = json.loads(row["aliases"])
         row["external_ref"] = json.loads(row["external_ref"])

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router";
+import { ModelPage, proposalProofs } from "./model.jsx";
 
 const lines = value => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
 const emptyDraft = { text: "", note: "", images: [] };
@@ -90,7 +91,7 @@ export function Shell() {
     await manage.find(false);
   }
   return <><h1>post-collector</h1><p id="session-status">{session}</p><p id="notice" role="status" aria-live="polite">{notice}</p>
-    {csrf && <main id="workspace"><nav><Link to="/">入口</Link> | <Link to="/add">加入新内容</Link> | <Link to="/manage">检索 / 管理已有内容</Link></nav>
+    {csrf && <main id="workspace"><nav><Link to="/">入口</Link> | <Link to="/add">加入新内容</Link> | <Link to="/manage">检索 / 管理已有内容</Link> | <Link to="/model">模型标签建议</Link></nav>
       <button disabled={busy} onClick={() => run(async () => { await api("logout", {}); setCsrf(""); csrfRef.current = ""; setSession("已退出，请重启服务获取新授权链接。"); })}>退出本机会话</button>
       <fieldset className="workspace" disabled={busy}><Routes>
         <Route path="/" element={<section><h2>内容归档</h2><p><Link to="/add">加入新内容</Link></p><p><Link to="/manage">检索 / 管理已有内容</Link></p></section>} />
@@ -103,6 +104,7 @@ export function Shell() {
           {upload && <p role="status">消息 {upload.message_id}：{upload.duplicate ? "已存在；" : ""}{upload.detail} ({upload.status}) {upload.content_ids.length > 0 && <Link to={`/manage?message_id=${upload.message_id}`}>查看本次消息</Link>}</p>}
         </section>} />
         <Route path="/manage" element={<Manage state={manage} run={run} api={api} />} />
+        <Route path="/model" element={<ModelPage api={api} run={run} parseId={safeId} />} />
         <Route path="*" element={<p>页面不存在。<Link to="/">返回入口</Link></p>} />
       </Routes></fieldset></main>}
   </>;
@@ -151,7 +153,7 @@ function Manage({ state: m, run, api }) {
   }
   async function review(operation) {
     if (!m.suggestions.length) throw new Error("请勾选有效建议关联");
-    await api(`suggestions/${operation}`, { ids: m.suggestions }); await m.refresh();
+    await api(`suggestions/${operation}`, { ids: m.suggestions, expected_runs: proposalProofs(m.assignments, m.suggestions) }); await m.refresh();
   }
   return <><section><h2>检索与最近消息</h2><form id="search-form" onSubmit={e => { e.preventDefault(); run(() => m.find()); }}>
     {searchField("q", "关键词", "text", { maxLength: 4096 })}{searchField("source", "来源名或 ID")}
