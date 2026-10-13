@@ -75,6 +75,7 @@ def target(web, kind="text"):
 @pytest.mark.asyncio
 async def test_authorization_and_public_page(client, web):
     assert (await client.get("/")).status_code == 200
+    assert (await client.get("/compositions")).status_code == 200
     assert (await client.get("/assets/app.js")).status_code == 200
     assert (await client.get("/healthz")).json()["status"] == "ok"
     for url in [

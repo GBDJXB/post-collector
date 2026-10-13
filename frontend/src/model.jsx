@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useLocation } from "react-router";
 
 // 只使用当前画面中已加载的证明；确认时不重新从服务端补齐版本。
 export function proposalProofs(rows, ids) {
@@ -9,9 +10,11 @@ export function proposalProofs(rows, ids) {
 }
 
 export function ModelPage({ api, run, parseId }) {
+  const location = useLocation();
+  const linkedId = new URLSearchParams(location.search).get("composition_id");
   const [status, setStatus] = useState(null), [key, setKey] = useState("");
   const [enableConsent, setEnableConsent] = useState(false), [sendConsent, setSendConsent] = useState(false);
-  const [kind, setKind] = useState("content_id"), [id, setId] = useState("");
+  const [kind, setKind] = useState(linkedId ? "composition_id" : "content_id"), [id, setId] = useState(linkedId || "");
   const [preview, setPreview] = useState(null), [outcome, setOutcome] = useState(null);
   const [assignments, setAssignments] = useState([]), [selected, setSelected] = useState([]);
   const [composition, setComposition] = useState(null), [compositions, setCompositions] = useState([]), [error, setError] = useState("");

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import Request
+from fastapi import Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
@@ -41,7 +41,18 @@ class Review(Input):
     expected_runs: dict[int, dict] = Field(default_factory=dict)
 
 
-def register(app, *, connect, protected, access, gateway):
+class CreateComposition(Input):
+    name: str = Field(min_length=1, max_length=255)
+    description: str = ''
+    content_ids: list[ID] = Field(min_length=1, max_length=500)
+
+
+class CompositionTags(Input):
+    names: list[str] = Field(min_length=1, max_length=100)
+    namespace: str = 'general'
+
+
+def register(app, *, connect, protected, access, gateway, max_text_chars=100000):
     @app.exception_handler(RequestValidationError)
     async def invalid_body(_request, _exc):
         # FastAPI 默认详情会包含输入值；密钥和授权令牌不能回显。
@@ -77,10 +88,20 @@ def register(app, *, connect, protected, access, gateway):
         with connect() as conn:
             return gateway.send(conn, request.cookies.get('pc_session', ''), body.preview_id, confirmed=body.confirmed)
 
-    @app.get('/api/v1/compositions', dependencies=protected)
-    def list_compositions():
+    @app.post('/api/v1/compositions', dependencies=protected)
+    def create_composition(body: CreateComposition):
         with connect() as conn:
-            return compositions.list_compositions(conn)
+            return compositions.write(conn, 'create', name=body.name, description=body.description, contents=body.content_ids, max_text_chars=max_text_chars)
+
+    @app.post('/api/v1/compositions/{composition_id}/tags/{operation}', dependencies=protected)
+    def change_composition_tags(composition_id: int, operation: Literal['add', 'remove'], body: CompositionTags):
+        with connect() as conn:
+            return compositions.tag_change(conn, composition_id, body.names, remove=operation == 'remove', namespace=body.namespace)
+
+    @app.get('/api/v1/compositions', dependencies=protected)
+    def list_compositions(tags: Annotated[list[str] | None, Query()] = None, match_member_tags: bool = False, limit: int = 50, offset: int = 0):
+        with connect() as conn:
+            return compositions.list_compositions(conn, names=tags or (), match_member_tags=match_member_tags, limit=limit, offset=offset)
 
     @app.get('/api/v1/compositions/{composition_id}', dependencies=protected)
     def composition(composition_id: int):

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router";
 import { ModelPage, proposalProofs } from "./model.jsx";
+import { CompositionsPage } from "./compositions.jsx";
 
 const lines = value => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
 const emptyDraft = { text: "", note: "", images: [] };
@@ -91,7 +92,7 @@ export function Shell() {
     await manage.find(false);
   }
   return <><h1>post-collector</h1><p id="session-status">{session}</p><p id="notice" role="status" aria-live="polite">{notice}</p>
-    {csrf && <main id="workspace"><nav><Link to="/">入口</Link> | <Link to="/add">加入新内容</Link> | <Link to="/manage">检索 / 管理已有内容</Link> | <Link to="/model">模型标签建议</Link></nav>
+    {csrf && <main id="workspace"><nav><Link to="/">入口</Link> | <Link to="/add">加入新内容</Link> | <Link to="/manage">检索 / 管理已有内容</Link> | <Link to="/compositions">整理组合</Link> | <Link to="/model">模型标签建议</Link></nav>
       <button disabled={busy} onClick={() => run(async () => { await api("logout", {}); setCsrf(""); csrfRef.current = ""; setSession("已退出，请重启服务获取新授权链接。"); })}>退出本机会话</button>
       <fieldset className="workspace" disabled={busy}><Routes>
         <Route path="/" element={<section><h2>内容归档</h2><p><Link to="/add">加入新内容</Link></p><p><Link to="/manage">检索 / 管理已有内容</Link></p></section>} />
@@ -104,6 +105,7 @@ export function Shell() {
           {upload && <p role="status">消息 {upload.message_id}：{upload.duplicate ? "已存在；" : ""}{upload.detail} ({upload.status}) {upload.content_ids.length > 0 && <Link to={`/manage?message_id=${upload.message_id}`}>查看本次消息</Link>}</p>}
         </section>} />
         <Route path="/manage" element={<Manage state={manage} run={run} api={api} />} />
+        <Route path="/compositions" element={<CompositionsPage api={api} run={run} parseId={safeId} />} />
         <Route path="/model" element={<ModelPage api={api} run={run} parseId={safeId} />} />
         <Route path="*" element={<p>页面不存在。<Link to="/">返回入口</Link></p>} />
       </Routes></fieldset></main>}
@@ -165,7 +167,7 @@ function Manage({ state: m, run, api }) {
     {searchField("limit", "每页", "number", { min: 1, max: 50 })}<label><input type="checkbox" checked={m.form.include_duplicates} onChange={e => m.setForm({ ...m.form, include_duplicates: e.target.checked })} />包括重复消息</label><button type="submit">检索 / 返回第一页</button></form>
     {m.result && <p id="search-summary">第 {m.result.page} 页，本页 {m.result.hits.length} 条；总数 {m.result.total ?? "未统计"} ({m.result.total_kind}){m.result.incomplete ? "；候选已截断" : ""}</p>}
     <div className="table-wrap"><table><thead><tr>{["选择", "消息 ID", "类型", "内容", "标签", "来源", "时间", "详情"].map(x => <th key={x}>{x}</th>)}</tr></thead><tbody id="hits">{(m.result?.hits || []).map(hit => <tr key={hit.message_id}>
-      <td><Selection ids={m.messages} setIds={m.setMessages} id={hit.message_id} label={`选择消息 ${hit.message_id}`} /></td><td>{hit.message_id}</td><td>{hit.item_type}</td><td className="summary">{(hit.snippet || hit.text || hit.original_name || "").slice(0, 180)}</td><td>{[...new Set(hit.tags.map(t => typeof t === "string" ? t : t.name))].join(" ")}</td><td>{hit.source_name || hit.source || hit.source_id}</td><td>{hit.first_seen_at}</td><td><button onClick={() => run(() => m.show({ message_id: hit.message_id }))}>查看</button></td></tr>)}</tbody></table></div>
+      <td><Selection ids={m.messages} setIds={m.setMessages} id={hit.message_id} label={`选择消息 ${hit.message_id}`} /></td><td>{hit.message_id}</td><td>{hit.item_type}</td><td className="summary"><span className="summary-clamp">{(hit.snippet || hit.text || hit.original_name || "").slice(0, 180)}</span></td><td>{[...new Set(hit.tags.map(t => typeof t === "string" ? t : t.name))].join(" ")}</td><td>{hit.source_name || hit.source || hit.source_id}</td><td>{hit.first_seen_at}</td><td><button onClick={() => run(() => m.show({ message_id: hit.message_id }))}>查看</button></td></tr>)}</tbody></table></div>
     <button id="next" disabled={!m.result?.has_more} onClick={() => run(() => m.find(true))}>下一页</button></section>
     <section><h2>详情与本机操作</h2><form onSubmit={e => { e.preventDefault(); run(() => m.show({ [m.fields.detailKind]: safeId(m.fields.detailId) })); }}>
       {select("detailKind", "目标", [["message_id", "消息 ID"], ["content_id", "内容项 ID"]])}{field("detailId", "ID", "number", { min: 1, required: true })}<button type="submit">查看</button></form>

@@ -257,6 +257,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
     @app.get("/model", include_in_schema=False)
+    @app.get("/compositions", include_in_schema=False)
     @app.get("/add", include_in_schema=False)
     @app.get("/manage", include_in_schema=False)
     @app.get("/", include_in_schema=False)
@@ -422,5 +423,5 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     from pc.api.model_routes import register
 
-    register(app, connect=connect, protected=protected, access=access, gateway=gateway)
+    register(app, connect=connect, protected=protected, access=access, gateway=gateway, max_text_chars=runtime.limits.max_text_chars if runtime else 100000)
     return app

@@ -93,7 +93,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 
 - CLI composition create/list/show/update/set-members/delete 管理手动组合，可跨消息引用，保留顺序与重复成员。迁移到 0011，39 张 STRICT 表；已有消息与上传不自动建组合。
 - 组合标签 --composition 独立关联，保留 --message 展开部件；usage_count 仍计内容项，composition_usage_count 单独返回。标签默认仅匹配自身，--match-member-tags 扩到当前可见成员；隐藏成员只返回位置及不可用状态。
-- 组合编辑与审计同事务、详情读快照；软删组合不删除成员。CLI 为本机 root；Web 只增加已有组合选取、模型建议和审核，不开放组合 CRUD、远程、关键词索引或下载。
+- 组合编辑与审计同事务、详情读快照；软删组合不删除成员。CLI 为本机 root；本机 Web 支持按帖级检索选内容项、创建组合及关联组合自身人工标签，并可选取已有组合进行模型建议和审核；组合更新、成员替换及删除仍由 CLI 管理，不开放远程、组合关键词索引或下载。
 
 ## 标签、检索与输出
 
@@ -124,7 +124,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 - 本机令牌在 fragment 中传入，10 分钟有效；交换后清除 fragment，保留路径与查询。内存会话 Cookie 为 HttpOnly/SameSite=Strict，8 小时绝对期限、30 分钟空闲期限；退出或重启失效。
 - 业务校验会话、本机对端与当前 Host；写操作校验 Origin/CSRF。身份由服务器授予 local_root，客户端不能指定 actor_id。媒体接口检查可见关联并复用安全读取，存储和缓存保持私有。
 - React 文本节点展示归档文本，同源资源受 CSP 约束，图片地址使用内容项/媒体 ID。系统动作复用服务，不执行 CLI 子进程；部分失败保留 copied 状态。
-- `/`、`/add`、`/manage`、`/model` 共用 HTML，刷新可直接访问。上传 multipart 为 text/note/images，身份为会话 root，来源 manual；读请求体前鉴权。按实际字节限制单图、256 MiB 媒体、258 MiB 请求和最多 19 张；文本按配置，备注 4096 字符。
+- `/`、`/add`、`/manage`、`/compositions`、`/model` 共用 HTML，刷新可直接访问。上传 multipart 为 text/note/images，身份为会话 root，来源 manual；读请求体前鉴权。按实际字节限制单图、256 MiB 媒体、258 MiB 请求和最多 19 张；文本按配置，备注 4096 字符。
 - 暂存在 data_root/upload-staging/UUID，按选择顺序存独立子目录，roots 持久化供 worker 接续。成功或死信清理，可重试保留；清理仅限该根 UUID 直接子目录，异常残留须对照任务检查。
 - worker.run_message 只恢复和抢占指定消息。单图/纯文本身份与 CLI 兼容，多图身份含有序媒体哈希和规范化文本哈希，文件名与备注不参与身份。
 

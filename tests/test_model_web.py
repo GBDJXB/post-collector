@@ -14,6 +14,60 @@ from pc.adapters.deepseek_model import DeepSeekModel
 from pc.services import compositions
 
 
+@pytest.mark.asyncio
+async def test_web_create_composition_preserves_order_and_independent_tags(client, web):
+    await login(client, web)
+    text = web['targets']['text']['content_id']
+    image = web['targets']['image']['content_id']
+    created = await client.post('/api/v1/compositions', json={'name': '网页组合', 'description': '有序', 'content_ids': [image, text, image]})
+    assert created.status_code == 200, created.text
+    ident = created.json()['composition_id']
+    detail = (await client.get(f'/api/v1/compositions/{ident}')).json()
+    assert [m['content_id'] for m in detail['members']] == [image, text, image]
+    assert detail['description'] == '有序'
+    added = await client.post(f'/api/v1/compositions/{ident}/tags/add', json={'names': ['仅组合']})
+    assert added.status_code == 200, added.text
+    assert [t['name'] for t in (await client.get(f'/api/v1/compositions/{ident}')).json()['tags']] == ['仅组合']
+    tag = next(t for t in (await client.get('/api/v1/tags')).json()['tags'] if t['name'] == '仅组合')
+    assert (tag['usage_count'], tag['composition_usage_count']) == (0, 1)
+    assert (await client.post(f'/api/v1/compositions/{ident}/tags/remove', json={'names': ['仅组合']})).status_code == 200
+    assert (await client.post(f'/api/v1/compositions/{ident}/tags/add', json={'names': ['仅组合']})).status_code == 200
+    assert len((await client.get(f'/api/v1/compositions/{ident}/assignments')).json()['assignments']) == 1
+    filtered = await client.get('/api/v1/compositions', params={'tags': '仅组合'})
+    assert [row['composition_id'] for row in filtered.json()['compositions']] == [ident]
+    assert (await client.get('/api/v1/compositions', params={'tags': '不存在'})).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_web_composition_rejects_invalid_and_stale_members_atomically(client, web):
+    await login(client, web)
+    ident = web['targets']['text']['content_id']
+    for body in [
+        {'name': '空', 'content_ids': []},
+        {'name': '坏', 'content_ids': [ident, True]},
+        {'name': '坏', 'content_ids': [ident], 'actor_id': 1},
+        {'name': '坏', 'content_ids': [ident, 999999]},
+    ]:
+        assert (await client.post('/api/v1/compositions', json=body)).status_code in {400, 422}
+    with db.open_db(web['path']) as conn:
+        conn.execute('UPDATE content_item SET deleted_at=? WHERE content_id=?', (db.now_iso(), ident))
+    assert (await client.post('/api/v1/compositions', json={'name': '过期', 'content_ids': [web['targets']['image']['content_id'], ident]})).status_code == 400
+    with db.open_db(web['path']) as conn:
+        assert conn.execute('SELECT count(*) FROM composition').fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_web_composition_requires_session_origin_and_csrf(client, web):
+    ident = web['targets']['text']['content_id']
+    body = {'name': '保护', 'content_ids': [ident]}
+    assert (await client.post('/api/v1/compositions', json=body)).status_code == 401
+    await login(client, web)
+    assert (await client.post('/api/v1/compositions', json=body, headers={'Origin': 'http://evil.example'})).status_code == 403
+    assert (await client.post('/api/v1/compositions', json=body, headers={'X-CSRF-Token': 'invalid'})).status_code == 403
+    with db.open_db(web['path']) as conn:
+        assert conn.execute('SELECT count(*) FROM composition').fetchone()[0] == 0
+
+
 async def setup_model(client, web):
     await login(client, web)
     response = await client.post('/api/v1/tags/add', json={'content_ids': [web['targets']['text']['content_id']], 'names': ['已有']})
