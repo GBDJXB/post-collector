@@ -141,6 +141,43 @@ def test_tags_independent_alias_and_filters(items):
     )
 
 
+def test_list_compositions_filters_literal_name_and_exact_id(items):
+    conn, ids = items
+    first = co.write(conn, 'create', name='午后_图文', contents=[ids[0]])['composition_id']
+    second = co.write(conn, 'create', name='午后%作品', contents=[ids[1]])['composition_id']
+    third = co.write(conn, 'create', name='其他\\内容', contents=[ids[2]])['composition_id']
+    co.write(conn, 'delete', ident=third)
+    assert [r['composition_id'] for r in co.list_compositions(conn)['compositions']] == [second, first]
+    assert [r['composition_id'] for r in co.list_compositions(conn, name='午后_')['compositions']] == [first]
+    assert [r['composition_id'] for r in co.list_compositions(conn, name='%')['compositions']] == [second]
+    assert [r['composition_id'] for r in co.list_compositions(conn, name='\\')['compositions']] == []
+    assert [r['composition_id'] for r in co.list_compositions(conn, composition_id=first)['compositions']] == [first]
+    assert co.list_compositions(conn, composition_id=third)['total'] == 0
+    assert co.list_compositions(conn, composition_id=999999)['total'] == 0
+    assert co.list_compositions(conn, name='正文0')['total'] == 0
+    with pytest.raises(ValueError):
+        co.list_compositions(conn, name='x' * 256)
+    with pytest.raises(ValueError):
+        co.list_compositions(conn, composition_id=0)
+
+
+def test_list_compositions_filters_before_pagination_and_combines_tags(items):
+    conn, ids = items
+    first = co.write(conn, 'create', name='Album One', contents=[ids[0]])['composition_id']
+    second = co.write(conn, 'create', name='Album Two', contents=[ids[1]])['composition_id']
+    co.write(conn, 'create', name='Other', contents=[ids[2]])
+    co.tag_change(conn, first, ['自有'])
+    tagging.apply_classification(conn, tagging.manual_result(['成员']), content_ids=[ids[1]])
+    page = co.list_compositions(conn, name='album', limit=1, offset=1)
+    assert page['total'] == 2 and not page['has_more']
+    assert [row['composition_id'] for row in page['compositions']] == [first]
+    assert [row['composition_id'] for row in co.list_compositions(conn, name='album', names=['自有'])['compositions']] == [first]
+    assert co.list_compositions(conn, name='album', names=['成员'])['total'] == 0
+    assert [row['composition_id'] for row in co.list_compositions(conn, name='album', names=['成员'], match_member_tags=True)['compositions']] == [second]
+    assert co.list_compositions(conn, name='Album One', composition_id=second)['total'] == 0
+    assert [row['composition_id'] for row in co.list_compositions(conn, name='ALBUM ONE', composition_id=first)['compositions']] == [first]
+
+
 def test_cli_and_old_message_tags(items, capsys):
     conn, ids = items
     path = conn.execute("PRAGMA database_list").fetchone()[2]

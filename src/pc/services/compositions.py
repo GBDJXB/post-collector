@@ -195,12 +195,22 @@ def show(conn, ident):
     return {"result_type": "composition", "result_version": 1, **data}
 
 
-def list_compositions(conn, *, names=(), match_member_tags=False, limit=50, offset=0):
+def list_compositions(conn, *, names=(), match_member_tags=False, limit=50, offset=0, name=None, composition_id=None):
     if not 1 <= limit <= 100 or offset < 0:
         raise ValueError("每页 1~100 条，offset 须非负")
+    if name is not None and (not isinstance(name, str) or len(name) > 255):
+        raise ValueError("组合名称检索词过长或类型无效")
+    if composition_id is not None:
+        composition_id = _id(composition_id)
     with db.transaction(conn, immediate=False):
-        wanted = {tagging._tag(conn, name)["tag_id"] for name in names}
+        wanted = {tagging._tag(conn, tag)["tag_id"] for tag in names}
         predicates, params = [], []
+        if name and name.strip():
+            predicates.append("instr(lower(co.name), lower(?)) > 0")
+            params.append(name.strip())
+        if composition_id is not None:
+            predicates.append("co.composition_id=?")
+            params.append(composition_id)
         for tag_id in sorted(wanted):
             own = (
                 "EXISTS(SELECT 1 FROM composition_tag_assignment ta WHERE ta.composition_id=co.composition_id AND ta.tag_id=? AND "

@@ -1,9 +1,11 @@
 import React from "react";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Shell, safeId } from "./app.jsx";
+const webCss = readFileSync("src/style.css", "utf8");
 
 const body = '<script>window.bad=true</script>中文正文';
 const hit = { message_id: 3, item_type: "text", text: body, tags: [], source: "manual", first_seen_at: "2026-10-04" };
@@ -21,6 +23,7 @@ beforeEach(() => {
     else if (url.endsWith("/model/preview")) data = { preview_id: "preview-one", provider: "deepseek", model: "deepseek-flash", endpoint: "https://api.deepseek.com/chat/completions", parts: [{ position: 0, item_type: "text", text: body, images: [] }], candidate_catalog: [{ candidate_id: 1, name: "已有", namespace: "general" }], candidate_count: 1, expires_in_seconds: 300, attempts_remaining: 20, metadata_warning: "原始图片含 EXIF", unknown_outcome_warning: "结果未知可能计费", catalog_warning: "完整候选目录", request_bytes: 42 };
     else if (url.endsWith("/model/send")) data = { status: "succeeded", request_id: "preview-one" };
     else if (url.endsWith("/tags")) data = { tags: [] };
+    else if (url.includes("/compositions?")) data = { result_version: 1, compositions: [], total: 0, offset: 0, limit: 50, has_more: false };
     else if (url.includes("/detail?")) data = detail;
     else if (url.includes("/assignments?")) data = { assignments: [{ assign_id: 9, content_id: 7, name: "建议", source: "suggested", confidence: 0.8, revoked_at: null, evidence: { model_proposal: { run_id: 12, version: "b4d9551a-7876-4933-b52f-98b8bacde1e8" } } }] };
     else if (url.includes("/aliases?")) data = { aliases: [{ alias: "别名", name: "测试", namespace: "general" }] };
@@ -35,6 +38,133 @@ async function open(path = "/") {
   await waitFor(() => expect(screen.getByRole("status").textContent).toBe("操作完成"));
   return userEvent.setup();
 }
+
+test("组合目录进入即列出持久化组合且创建后刷新", async () => {
+  const original = globalThis.fetch;
+  let created = false;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?") && options?.method === "GET") {
+      calls.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ result_version: 1, total: created ? 2 : 1, limit: 50, offset: 0, has_more: false, compositions: [
+        { composition_id: 4, name: "已有组合", tags: [], members: [{ position: 0, content_id: 7, available: true, item_type: "text", text: "旧正文", media: [] }] },
+        ...(created ? [{ composition_id: 12, name: "新组合", tags: [], members: [{ position: 0, content_id: 7, available: true, item_type: "text", text: "新正文", media: [] }] }] : []),
+      ] }) };
+    }
+    if (url.includes("/search?")) return { ok: true, status: 200, json: async () => ({ hits: [{ ...hit, parts: [{ content_id: 7, item_type: "text", text: "新正文", media: { items: [] } }] }], page: 1, has_more: false }) };
+    if (url.endsWith("/compositions") && options?.method === "POST") { created = true; return { ok: true, status: 200, json: async () => ({ composition_id: 12 }) }; }
+    if (url.endsWith("/compositions/12")) return { ok: true, status: 200, json: async () => ({ members: [{ position: 0, content_id: 7, available: true }], tags: [] }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  expect(await screen.findByText(/已有组合（组合 4）/)).toBeTruthy();
+  await user.click(await screen.findByLabelText("加入内容项 7"));
+  await user.type(screen.getByLabelText("组合名称"), "新组合");
+  await user.click(screen.getByRole("button", { name: "确认构建组合" }));
+  expect(await screen.findByText(/新组合（组合 12）/)).toBeTruthy();
+  expect(calls.filter(x => x.url.includes("/compositions?")).length).toBeGreaterThanOrEqual(2);
+});
+
+test("组合目录提供创建区快捷入口和有界结果容器", async () => {
+  const user = await open("/compositions");
+  const shortcut = screen.getByRole("link", { name: "跳到创建新组合" });
+  expect(shortcut.getAttribute("href")).toBe("#create-composition");
+  expect(document.getElementById("create-composition")).toBeTruthy();
+  expect(screen.getByRole("region", { name: "已有组合目录" }).querySelector(".composition-results")).toBeTruthy();
+  await user.click(shortcut);
+});
+
+test("组合目录延迟的首次加载不会覆盖用户提交的筛选", async () => {
+  const original = globalThis.fetch;
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?")) {
+      if (url.includes("name=")) return { ok: true, status: 200, json: async () => ({ compositions: [{ composition_id: 9, name: "筛选结果", tags: [], members: [] }], total: 1, offset: 0, limit: 50, has_more: false }) };
+      return pending;
+    }
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  await user.type(screen.getByLabelText("组合名称包含"), "筛选");
+  await user.click(screen.getByRole("button", { name: "查找组合" }));
+  expect(await screen.findByText(/筛选结果（组合 9）/)).toBeTruthy();
+  await React.act(async () => { release({ ok: true, status: 200, json: async () => ({ compositions: [{ composition_id: 4, name: "旧结果", tags: [], members: [] }], total: 1, offset: 0, limit: 50, has_more: false }) }); await pending; });
+  expect(screen.queryByText(/旧结果（组合 4）/)).toBeNull();
+  expect(screen.getByText(/筛选结果（组合 9）/)).toBeTruthy();
+});
+
+test("组合目录首次加载失败可在页面重试", async () => {
+  const original = globalThis.fetch;
+  let attempts = 0;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?")) {
+      attempts++;
+      return attempts === 1 ? { ok: false, status: 503, json: async () => ({ detail: "暂时不可用" }) } : { ok: true, status: 200, json: async () => ({ compositions: [], total: 0, offset: 0, limit: 50, has_more: false }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  expect(await screen.findByText(/暂时不可用/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "重试读取组合" }));
+  expect(await screen.findByText("共 0 个组合")).toBeTruthy();
+  expect(attempts).toBe(2);
+});
+
+test("创建后详情读取失败仍刷新已有组合目录", async () => {
+  const original = globalThis.fetch;
+  let created = false;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/search?")) return { ok: true, status: 200, json: async () => ({ hits: [{ ...hit, parts: [{ content_id: 7, item_type: "text", text: body, media: { items: [] } }] }], page: 1, has_more: false }) };
+    if (url.includes("/compositions?")) return { ok: true, status: 200, json: async () => ({ compositions: created ? [{ composition_id: 12, name: "已保存", tags: [], members: [{ position: 0, content_id: 7, available: true, item_type: "text" }] }] : [], total: created ? 1 : 0, offset: 0, limit: 50, has_more: false }) };
+    if (url.endsWith("/compositions") && options?.method === "POST") { created = true; return { ok: true, status: 200, json: async () => ({ composition_id: 12 }) }; }
+    if (url.endsWith("/compositions/12")) return { ok: false, status: 503, json: async () => ({ detail: "详情暂不可用" }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  await user.click(await screen.findByLabelText("加入内容项 7"));
+  await user.type(screen.getByLabelText("组合名称"), "已保存");
+  await user.click(screen.getByRole("button", { name: "确认构建组合" }));
+  expect(await screen.findByText(/已保存（组合 12）/)).toBeTruthy();
+});
+
+test("组合创建成功后即使目录刷新失败也显示保存顺序", async () => {
+  const original = globalThis.fetch;
+  let created = false;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/search?")) return { ok: true, status: 200, json: async () => ({ hits: [{ ...hit, parts: [{ content_id: 7, item_type: "text", text: body, media: { items: [] } }] }], page: 1, has_more: false }) };
+    if (url.includes("/compositions?")) return created ? { ok: false, status: 503, json: async () => ({ detail: "目录暂不可用" }) } : { ok: true, status: 200, json: async () => ({ compositions: [], total: 0, offset: 0, limit: 50, has_more: false }) };
+    if (url.endsWith("/compositions") && options?.method === "POST") { created = true; return { ok: true, status: 200, json: async () => ({ composition_id: 12 }) }; }
+    if (url.endsWith("/compositions/12")) return { ok: true, status: 200, json: async () => ({ members: [{ position: 0, content_id: 7, available: true }], tags: [] }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  await user.click(await screen.findByLabelText("加入内容项 7"));
+  await user.type(screen.getByLabelText("组合名称"), "仍可核对");
+  await user.click(screen.getByRole("button", { name: "确认构建组合" }));
+  expect(await screen.findByText(/保存顺序：内容项 7/)).toBeTruthy();
+  expect(await screen.findByText(/目录暂不可用/)).toBeTruthy();
+});
+
+test("目录查找失败不显示旧的组合结果", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?")) return url.includes("name=") ? { ok: false, status: 400, json: async () => ({ detail: "标签不存在" }) } : { ok: true, status: 200, json: async () => ({ compositions: [{ composition_id: 4, name: "旧列表", tags: [], members: [] }], total: 1, limit: 50, offset: 0, has_more: false }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  await screen.findByText(/旧列表（组合 4）/);
+  await user.type(screen.getByLabelText("组合名称包含"), "没有");
+  await user.click(screen.getByRole("button", { name: "查找组合" }));
+  await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("标签不存在"));
+  expect(screen.queryByText(/旧列表（组合 4）/)).toBeNull();
+});
+
+test("过大组合 ID 的错误显示在目录旁", async () => {
+  const user = await open("/compositions");
+  await user.type(screen.getByLabelText("组合 ID"), "9007199254740992");
+  await user.click(screen.getByRole("button", { name: "查找组合" }));
+  await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("ID 必须"));
+});
 
 test("组合页从混合帖选择具体部件并依次构建组合", async () => {
   const original = globalThis.fetch;
@@ -86,7 +216,7 @@ test("组合队列跨检索保留、重复加入并支持拖放和移除", async
   const user = await open("/compositions");
   await user.click(await screen.findByLabelText("加入内容项 7"));
   await user.click(screen.getByLabelText("加入内容项 8"));
-  await user.type(screen.getByLabelText("组合关键词"), "其他条件");
+  await user.type(screen.getByLabelText("内容项关键词"), "其他条件");
   await user.click(screen.getByRole("button", { name: "检索内容项" }));
   await waitFor(() => expect(screen.getByRole("button", { name: "再次加入位置 1 的内容项 7" })).toBeTruthy());
   await user.click(screen.getByRole("button", { name: "再次加入位置 1 的内容项 7" }));
@@ -108,9 +238,9 @@ test("翻页沿用已提交的组合检索关键词", async () => {
     return original(url, options);
   }));
   const user = await open("/compositions");
-  await user.type(screen.getByLabelText("组合关键词"), "初始词");
+  await user.type(screen.getByLabelText("内容项关键词"), "初始词");
   await user.click(screen.getByRole("button", { name: "检索内容项" }));
-  await user.type(screen.getByLabelText("组合关键词"), "未提交");
+  await user.type(screen.getByLabelText("内容项关键词"), "未提交");
   await user.click(screen.getByRole("button", { name: "下一页内容" }));
   await waitFor(() => expect(calls.some(x => x.url.includes("page=2"))).toBe(true));
   const next = new URL(calls.find(x => x.url.includes("page=2")).url, "http://localhost");
@@ -125,9 +255,99 @@ test("组合页按自身标签检索既有组合", async () => {
   }));
   const user = await open("/compositions");
   await user.type(screen.getByLabelText("检索组合标签（每行一个）"), "图文");
-  await user.click(screen.getByRole("button", { name: "检索已有组合" }));
+  await user.click(screen.getByRole("button", { name: "查找组合" }));
   expect(await screen.findByText(/已建组合/)).toBeTruthy();
-  expect(calls.find(x => x.url.includes("/compositions?")).url).toContain("tags=%E5%9B%BE%E6%96%87");
+  await waitFor(() => expect(calls.filter(x => x.url.includes("/compositions?")).at(-1).url).toContain("tags=%E5%9B%BE%E6%96%87"));
+});
+
+test("组合目录按名称和 ID 查找并保留翻页条件", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?")) { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({ compositions: [{ composition_id: 12, name: "午后手记", tags: [], members: [{ position: 0, content_id: 7, available: true, item_type: "text", text: "正文", media: [] }] }], has_more: true, offset: url.includes("offset=50") ? 50 : 0, limit: 50, total: 51 }) }; }
+    return original(url, options);
+  }));
+  const user = await open("/compositions");
+  await screen.findByText(/午后手记/);
+  await user.type(screen.getByLabelText("组合名称包含"), "午后");
+  await user.type(screen.getByLabelText("组合 ID"), "12");
+  await user.click(screen.getByRole("button", { name: "查找组合" }));
+  await waitFor(() => expect(calls.some(x => x.url.includes("name=%E5%8D%88%E5%90%8E"))).toBe(true));
+  await user.type(screen.getByLabelText("组合名称包含"), "未提交");
+  await user.click(screen.getByRole("button", { name: "下一页组合" }));
+  const next = new URL(calls.find(x => x.url.includes("offset=50")).url, "http://localhost");
+  expect(next.searchParams.get("name")).toBe("午后");
+  expect(next.searchParams.get("composition_id")).toBe("12");
+});
+
+test("主消息检索解释混合消息并提供独立组合入口", async () => {
+  const user = await open("/manage");
+  expect(screen.getByText("混合消息（同一消息多种类型）")).toBeTruthy();
+  await user.click(screen.getByRole("link", { name: "查找独立组合" }));
+  expect(await screen.findByRole("heading", { name: "已有组合" })).toBeTruthy();
+});
+
+test("网页解除固定宽度上限", () => {
+  const style = document.createElement("style");
+  style.textContent = webCss;
+  document.head.append(style);
+  try {
+    expect(style.sheet?.cssRules.length).toBeGreaterThan(0);
+    expect(getComputedStyle(document.body).fontFamily).toBe("sans-serif");
+    expect(["", "none"]).toContain(getComputedStyle(document.body).maxWidth);
+  } finally {
+    style.remove();
+  }
+});
+
+test("管理页样式不再定义窄屏单列覆盖", () => {
+  const style = document.createElement("style");
+  style.textContent = webCss;
+  document.head.append(style);
+  try {
+    const layoutRules = Array.from(style.sheet.cssRules).flatMap(rule => [rule, ...Array.from(rule.cssRules || [])]);
+    const columns = layoutRules.filter(rule => rule.selectorText === ".manage-layout")
+      .map(rule => rule.style.getPropertyValue("grid-template-columns")).filter(Boolean);
+    expect(columns).toEqual(["minmax(0,2fr) minmax(0,1fr)"]);
+  } finally {
+    style.remove();
+  }
+});
+
+test("管理页全宽双栏提供可访问的局部横向滚动", async () => {
+  await open("/manage");
+  const viewport = screen.getByRole("region", { name: "检索与详情" });
+  const layout = viewport.querySelector(".manage-layout");
+  const search = screen.getByRole("heading", { name: "检索与最近消息" }).closest("section");
+  const detailPanel = screen.getByRole("heading", { name: "详情与本机操作" }).closest("section");
+  const tags = screen.getByRole("heading", { name: "人工标签与关联" }).closest("section");
+  expect(viewport.tabIndex).toBe(0);
+  expect(Array.from(layout.children)).toEqual([search, detailPanel]);
+  expect(viewport.contains(tags)).toBe(false);
+  expect(search.querySelector(".table-wrap #hits")).toBeTruthy();
+});
+
+test("管理页双栏让内容标签检索与完整详情并列且标签管理仍在下方", async () => {
+  const longText = "很长的正文".repeat(180);
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/detail?")) return { ok: true, status: 200, json: async () => ({ ...detail, parts: [{ content_id: 7, item_type: "image", text: longText, media: [{ media_id: 42, mime_detected: "image/png" }] }] }) };
+    return original(url, options);
+  }));
+  const user = await open("/manage");
+  const layout = document.querySelector(".manage-layout");
+  const search = screen.getByRole("heading", { name: "检索与最近消息" }).closest("section");
+  const detailPanel = screen.getByRole("heading", { name: "详情与本机操作" }).closest("section");
+  const tags = screen.getByRole("heading", { name: "人工标签与关联" }).closest("section");
+  const catalog = screen.getByRole("heading", { name: "标签目录与别名" }).closest("section");
+  expect(layout).not.toBeNull();
+  expect(Array.from(layout.children)).toEqual([search, detailPanel]);
+  expect(search.contains(screen.getByLabelText("标签（每行一个，全部匹配）"))).toBe(true);
+  expect(search.querySelector(".table-wrap #hits")).toBeTruthy();
+  expect(layout.contains(tags) || layout.contains(catalog)).toBe(false);
+  await user.click(search.querySelector("#hits button"));
+  await waitFor(() => expect(detailPanel.querySelector("#parts pre")?.textContent).toBe(longText));
+  expect(detailPanel.querySelector("#parts img")?.getAttribute("src")).toBe("/api/v1/media/7/42");
+  expect(detailPanel.contains(screen.getByRole("button", { name: "默认程序打开" }))).toBe(true);
 });
 
 test("多行诗歌的检索摘要受限但详情保留全文", async () => {

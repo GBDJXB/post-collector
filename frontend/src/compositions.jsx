@@ -10,11 +10,17 @@ export function CompositionsPage({ api, run, parseId }) {
   const [name, setName] = useState(""), [description, setDescription] = useState(""), [tags, setTags] = useState("");
   const [created, setCreated] = useState(null), [savedDetail, setSavedDetail] = useState(null), [warning, setWarning] = useState("");
   const [filter, setFilter] = useState(""), [memberTags, setMemberTags] = useState(false), [existing, setExisting] = useState(null);
+  const [lookupName, setLookupName] = useState(""), [lookupId, setLookupId] = useState("");
+  const [directoryError, setDirectoryError] = useState("");
   const serial = useRef(0), dragged = useRef(null), active = useRef(true), submittedTerm = useRef("");
+  const directoryRequest = useRef(0);
+  const submittedDirectory = useRef({ name: "", id: "", tags: [], memberTags: false });
   useEffect(() => {
     active.current = true;
     api("search?sort=time&limit=40&page=1").then(data => { if (active.current) setResult(data); }).catch(error => { if (active.current) setWarning(error.message); });
-    return () => { active.current = false; };
+    const request = ++directoryRequest.current;
+    api("compositions?limit=50&offset=0").then(data => { if (active.current && directoryRequest.current === request) setExisting(data); }).catch(error => { if (active.current && directoryRequest.current === request) setDirectoryError(error.message); });
+    return () => { active.current = false; ++directoryRequest.current; };
   }, [api]);
   async function search(next = false) {
     const params = new URLSearchParams({ q: next ? submittedTerm.current : term, sort: "time", limit: "40", page: String(next ? result.page + 1 : 1) });
@@ -49,25 +55,71 @@ export function CompositionsPage({ api, run, parseId }) {
     setCreated(saved.composition_id);
     if (names(tags).length) {
       try { await api(`compositions/${saved.composition_id}/tags/add`, { names: names(tags), namespace: "general" }); }
-      catch (error) { setWarning(`组合 ${saved.composition_id} 已创建，但标签关联失败：${error.message}。可以重试关联，勿重复创建。`); return; }
+      catch (error) { setWarning(`组合 ${saved.composition_id} 已创建，但标签关联失败：${error.message}。可以重试关联，勿重复创建。`); await refreshDirectory({ propagate: false }); return; }
     }
     setWarning("");
+    await refreshDirectory({ propagate: false });
     setSavedDetail(await api(`compositions/${saved.composition_id}`));
   }
+  async function refreshDirectory({ propagate = true } = {}) {
+    const request = ++directoryRequest.current;
+    try {
+      const data = await api("compositions?limit=50&offset=0");
+      if (active.current && directoryRequest.current === request) {
+        setExisting(data); setDirectoryError("");
+        submittedDirectory.current = { name: "", id: "", tags: [], memberTags: false };
+        setLookupName(""); setLookupId(""); setFilter(""); setMemberTags(false);
+      }
+    } catch (error) {
+      if (active.current && directoryRequest.current === request) {
+        setExisting(null); setDirectoryError(error.message);
+      }
+      if (propagate) throw error;
+    }
+  }
   async function browse(offset = 0) {
-    const params = new URLSearchParams({ limit: "50", offset: String(offset), match_member_tags: String(memberTags) });
-    names(filter).forEach(tag => params.append("tags", tag));
-    setExisting(await api(`compositions?${params}`));
+    const submitted = offset ? submittedDirectory.current : { name: lookupName.trim(), id: lookupId.trim(), tags: names(filter), memberTags };
+    const params = new URLSearchParams({ limit: "50", offset: String(offset), match_member_tags: String(submitted.memberTags) });
+    if (submitted.name) params.set("name", submitted.name);
+    const request = ++directoryRequest.current;
+    try {
+      if (submitted.id) params.set("composition_id", String(parseId(submitted.id)));
+      submitted.tags.forEach(tag => params.append("tags", tag));
+      const data = await api(`compositions?${params}`);
+      if (active.current && directoryRequest.current === request) {
+        if (!offset) submittedDirectory.current = submitted;
+        setExisting(data); setDirectoryError("");
+      }
+    } catch (error) {
+      if (active.current && directoryRequest.current === request) {
+        setExisting(null); setDirectoryError(error.message);
+      }
+      throw error;
+    }
   }
   async function retryTags() {
     if (!created || !names(tags).length) return;
     await api(`compositions/${created}/tags/add`, { names: names(tags), namespace: "general" });
     setWarning("");
+    await refreshDirectory({ propagate: false });
     setSavedDetail(await api(`compositions/${created}`));
   }
-  return <section><h2>整理独立组合</h2><p>从左侧选择内容项，右侧按阅读顺序排列；一个消息中的正文和图片可以分别选择。</p>
+  return <section><h2>整理独立组合</h2>
+    <section aria-label="已有组合目录"><h3>已有组合</h3><p>打开页面即列出最近的组合；可以用组合 ID、名称或标签进一步查找，查看成员位置以确认保存结果。<a href="#create-composition">跳到创建新组合</a></p>
+      <form onSubmit={event => { event.preventDefault(); run(() => browse()); }}>
+        <label>组合 ID <input type="number" min="1" step="1" value={lookupId} onChange={event => setLookupId(event.target.value)} /></label>
+        <label>组合名称包含 <input value={lookupName} maxLength="255" onChange={event => setLookupName(event.target.value)} /></label>
+        <label>检索组合标签（每行一个）<textarea value={filter} onChange={event => setFilter(event.target.value)} /></label>
+        <label><input type="checkbox" checked={memberTags} onChange={event => setMemberTags(event.target.checked)} />同时匹配可见成员标签</label>
+        <button type="submit">查找组合</button></form>
+      {directoryError && <p role="alert">{directoryError} <button type="button" onClick={() => run(refreshDirectory)}>重试读取组合</button></p>}
+      {existing ? <><p>共 {existing.total} 个组合</p>{existing.total === 0 && <p>未找到符合条件的组合。</p>}<ul className="composition-results" tabIndex="0" aria-label="组合检索结果">{existing.compositions.map(item => <li key={item.composition_id}><strong>{item.name}（组合 {item.composition_id}）</strong>：{item.tags.map(tag => tag.name).join("、") || "无自身标签"}
+        <ol>{item.members.map(member => <li key={member.position}>位置 {member.position}：{member.available ? `内容项 ${member.content_id}（${member.item_type}）` : "不可用"}</li>)}</ol>
+        <Link to={`/model?composition_id=${item.composition_id}`}>用此组合测试模型建议</Link></li>)}</ul><button disabled={!existing.has_more} onClick={() => run(() => browse(existing.offset + existing.limit))}>下一页组合</button></> : !directoryError && <p>正在读取组合…</p>}
+    </section>
+    <h3 id="create-composition">创建新组合</h3><p>从左侧选择内容项，右侧按阅读顺序排列；一个消息中的正文和图片可以分别选择。</p>
     <div className="composition-layout"><section aria-label="检索和勾选区"><h3>检索和勾选</h3>
-      <form onSubmit={event => { event.preventDefault(); run(() => search()); }}><label>组合关键词 <input value={term} onChange={event => setTerm(event.target.value)} maxLength="4096" /></label><button type="submit">检索内容项</button></form>
+      <form onSubmit={event => { event.preventDefault(); run(() => search()); }}><label>内容项关键词 <input value={term} onChange={event => setTerm(event.target.value)} maxLength="4096" /></label><button type="submit">检索内容项</button></form>
       <p>{result ? `第 ${result.page} 页，本页 ${result.hits.length} 条消息` : "正在读取内容…"}</p>
       {(result?.hits || []).map(hit => <article key={hit.message_id}><h4>消息 {hit.message_id}</h4>{(hit.parts || []).map(part => <div className="composition-candidate" key={part.content_id}>
         <label><input type="checkbox" aria-label={`加入内容项 ${part.content_id}`} checked={queue.some(item => item.content_id === part.content_id)} onChange={event => { if (event.target.checked) run(() => add(part)); else setQueue(items => items.filter(item => item.content_id !== part.content_id)); }} />内容项 {part.content_id}（{part.item_type}）</label>
@@ -87,13 +139,5 @@ export function CompositionsPage({ api, run, parseId }) {
       {created && <p>组合 {created} 已创建。<Link to={`/model?composition_id=${created}`}>用此组合测试模型建议</Link></p>}
       {savedDetail && <p>保存顺序：{savedDetail.members.map(member => member.available ? `内容项 ${member.content_id}` : `位置 ${member.position} 不可用`).join(" → ")}；自身标签：{savedDetail.tags.map(tag => tag.name).join("、") || "无"}</p>}
       {warning && <p role="alert">{warning}{created && names(tags).length > 0 && <button onClick={() => run(retryTags)}>重试关联标签</button>}</p>}
-    </section></div>
-    <section><h3>检索已有组合</h3><form onSubmit={event => { event.preventDefault(); run(() => browse()); }}>
-      <label>检索组合标签（每行一个）<textarea value={filter} onChange={event => setFilter(event.target.value)} /></label>
-      <label><input type="checkbox" checked={memberTags} onChange={event => setMemberTags(event.target.checked)} />同时匹配可见成员标签</label>
-      <button type="submit">检索已有组合</button></form>
-      {existing && <><p>共 {existing.total} 个组合</p><ul>{existing.compositions.map(item => <li key={item.composition_id}><strong>{item.name}（组合 {item.composition_id}）</strong>：{item.tags.map(tag => tag.name).join("、") || "无自身标签"}
-        <ol>{item.members.map(member => <li key={member.position}>位置 {member.position}：{member.available ? `内容项 ${member.content_id}（${member.item_type}）` : "不可用"}</li>)}</ol>
-        <Link to={`/model?composition_id=${item.composition_id}`}>用此组合测试模型建议</Link></li>)}</ul><button disabled={!existing.has_more} onClick={() => run(() => browse(existing.offset + existing.limit))}>下一页组合</button></>}
-    </section></section>;
+    </section></div></section>;
 }

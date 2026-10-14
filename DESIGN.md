@@ -151,7 +151,7 @@ EXIF 清理、解码隔离、OCR、感知哈希及缩略图不能凭旧设计或
 
 ### 4.4 组合
 
-组合由本机 root 手动创建，不自动为上传或历史消息生成。CLI 提供 create/list/show/update/set-members/delete；成员替换在同一事务保留参数顺序与重复次数，至少一个成员。名称为 1~255 字符单行文本，说明遵守 ingest.max_text_chars（默认 100000 字符）并保留原文；更新及删除写审计。本机 Web root 还可在 `/compositions` 使用现有帖级关键词检索逐个选取可见内容项、排列/重复成员并创建组合；右栏支持拖放及上移/下移。`POST /api/v1/compositions` 请求名称、说明和有序 content_ids，服务端调用共用事务及长度/可见性校验；`POST /api/v1/compositions/{id}/tags/add|remove` 只操作组合自身的人工关联。`GET /api/v1/compositions` 支持标签 AND、可选成员标签匹配、limit/offset；列表和详情仍为 result_version=1。Web 不提供组合更新/成员替换/删除、嵌套、组合下载、组合关键词索引或远程操作。
+组合由本机 root 手动创建，不自动为上传或历史消息生成。CLI 提供 create/list/show/update/set-members/delete；成员替换在同一事务保留参数顺序与重复次数，至少一个成员。名称为 1~255 字符单行文本，说明遵守 ingest.max_text_chars（默认 100000 字符）并保留原文；更新及删除写审计。本机 Web root 还可在 `/compositions` 使用现有帖级关键词检索逐个选取可见内容项、排列/重复成员并创建组合；右栏支持拖放及上移/下移。`POST /api/v1/compositions` 请求名称、说明和有序 content_ids，服务端调用共用事务及长度/可见性校验；`POST /api/v1/compositions/{id}/tags/add|remove` 只操作组合自身的人工关联。`GET /api/v1/compositions` 支持组合 ID 精确匹配、名称字面子串匹配（ASCII 不区分大小写，不把 `%`、`_` 当通配符）、标签 AND、可选成员标签匹配及 limit/offset；各条件交集后统计总数并分页，默认按创建时间/ID 倒序取最近 50 条，列表和详情仍为 result_version=1。`/compositions` 页面进入即展示最近组合，创建后更新目录并可核对成员顺序；主消息检索的“混合消息”仍只表示同一消息包含多种可见内容类型，另有组合目录入口。Web 不提供组合更新/成员替换/删除、嵌套、组合下载、组合关键词索引或远程操作。
 
 组合标签保存于 composition_tag_assignment，复用名称/别名及 root 校验，人工关联支持撤销与恢复且审计；不传播到成员，不生成内容项 classification_run。pc tag --message 保留展开成员的旧语义，--composition 是互斥独立目标。tag.usage_count 继续只计内容项，composition_usage_count 动态计未删除组合中的有效关联。
 
@@ -429,6 +429,8 @@ serve解析配置路径、验证库后单Uvicorn进程启动。上传同步线�
 实现以src/pc、frontend、config、migrations/sqlite、锁文件和测试为准。历史数据及撤回方案不替代当前契约。
 
 ## 附录 C：变更记录
+
+2026-10-13 本机 Web 组合发现：独立组合目录提升到创建表单之前、默认展示最近组合，创建后刷新；按组合 ID 精确匹配或名称字面子串过滤，和原有标签过滤合并统计、分页。主消息检索说明“混合消息”的含义并提供组合目录入口；不扩展组合成员正文索引。
 
 2026-10-12 本机 Web 组合整理：增加受保护的组合创建与自身人工标签接口；双栏按现有帖级检索选择内容项、调整/重复排列、查看组合标签筛选并跳转模型目标。检索摘要限制宽度及视觉行数，详情正文保持完整；未扩展组合全文索引或远程入口。
 

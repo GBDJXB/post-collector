@@ -39,6 +39,28 @@ async def test_web_create_composition_preserves_order_and_independent_tags(clien
 
 
 @pytest.mark.asyncio
+async def test_web_composition_directory_finds_created_by_name_and_id(client, web):
+    assert (await client.get('/api/v1/compositions', params={'name': '网页'})).status_code == 401
+    await login(client, web)
+    content_id = web['targets']['text']['content_id']
+    response = await client.post('/api/v1/compositions', json={'name': '午后_手记', 'content_ids': [content_id]})
+    assert response.status_code == 200
+    ident = response.json()['composition_id']
+    other = await client.post('/api/v1/compositions', json={'name': '另一组', 'content_ids': [content_id]})
+    assert other.status_code == 200
+    assert (await client.get('/api/v1/compositions')).json()['total'] == 2
+    for params in ({'name': '午后_'}, {'composition_id': ident}, {'composition_id': ident, 'name': '午后_'}):
+        result = (await client.get('/api/v1/compositions', params=params)).json()
+        assert result['total'] == 1
+        assert result['compositions'][0]['composition_id'] == ident
+        assert [(r['position'], r['content_id']) for r in result['compositions'][0]['members']] == [(0, content_id)]
+    assert (await client.get('/api/v1/compositions', params={'composition_id': ident, 'name': '另一组'})).json()['total'] == 0
+    assert (await client.get('/api/v1/compositions', params={'composition_id': 999999})).json()['total'] == 0
+    assert (await client.get('/api/v1/compositions', params={'composition_id': 0})).status_code == 422
+    assert (await client.get('/api/v1/compositions', params={'name': 'a' * 256})).status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_web_composition_rejects_invalid_and_stale_members_atomically(client, web):
     await login(client, web)
     ident = web['targets']['text']['content_id']

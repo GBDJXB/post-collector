@@ -99,9 +99,9 @@ def register(app, *, connect, protected, access, gateway, max_text_chars=100000)
             return compositions.tag_change(conn, composition_id, body.names, remove=operation == 'remove', namespace=body.namespace)
 
     @app.get('/api/v1/compositions', dependencies=protected)
-    def list_compositions(tags: Annotated[list[str] | None, Query()] = None, match_member_tags: bool = False, limit: int = 50, offset: int = 0):
+    def list_compositions(tags: Annotated[list[str] | None, Query()] = None, match_member_tags: bool = False, limit: int = 50, offset: int = 0, name: str | None = Query(default=None, max_length=255), composition_id: int | None = Query(default=None, ge=1, le=2**63 - 1)):
         with connect() as conn:
-            return compositions.list_compositions(conn, names=tags or (), match_member_tags=match_member_tags, limit=limit, offset=offset)
+            return compositions.list_compositions(conn, names=tags or (), match_member_tags=match_member_tags, limit=limit, offset=offset, name=name, composition_id=composition_id)
 
     @app.get('/api/v1/compositions/{composition_id}', dependencies=protected)
     def composition(composition_id: int):
