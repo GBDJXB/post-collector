@@ -295,6 +295,7 @@ class SourceMessage:
     reply_to_platform_id: str | None = None
     permalink: str | None = None
     media_refs: tuple[str, ...] = ()  # 平台侧媒体引用，下载由 fetch 阶段负责
+    ordered_parts: tuple[dict[str, Any], ...] = ()  # 本机有序信封；旧格式仍按正文→媒体处理
     forward_chain: tuple[dict[str, Any], ...] = ()
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
@@ -555,8 +556,8 @@ def search_extra_value(*parts: str | None) -> str:
 
     参与检索的"补充字段"按**固定顺序**拼成一个串，这个顺序就是本函数的契约：
 
-        来源名 → 平台 → 发送者名 → item_type → item_type 中文标签 → 文件名 →
-        标签名与同义词 → 来源备注（origin_note）
+        来源名 → 平台 → 发送者名 → item_type → item_type 中文标签 →
+        文件名（媒体项）或规范 URL 去片段（链接项） → 标签名与同义词 → 来源备注（origin_note）
 
     顺序只影响可读性与 bm25 的列内位置，但必须写死一处：落库（``pipeline``）与批量重算
     （``refresh_search_derived``）是两处调用，各拼一套就会漂移，而漂移的表现是"刚入库的

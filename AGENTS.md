@@ -7,7 +7,7 @@ description: "项目开发入口：当前实现、命令与开发约束。操作
 
 ## 工作方式与当前状态
 
-post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内容。当前已实现本地导入、CLI 与 Web 上传、扫描隔离、去重落库、root 人工打标、CLI 与本机 Web 检索和内容查看，独立有序组合与组合自身标签，以及配置解析、迁移、备份、索引重建、健康接口、受邀账号管理和独立远程认证。
+post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内容。当前已实现本地导入、CLI 与 Web 有序文本/图片/链接上传、Web 可选原子创建组合、扫描隔离、去重落库、root 人工打标、CLI 与本机 Web 检索和内容查看，独立有序组合与组合自身标签，以及配置解析、迁移、备份、索引重建、健康接口、受邀账号管理和独立远程认证。
 
 远程认证应用目前只提供登录、退出和身份 JSON，业务操作标记为 `executable=false`。初版受邀用户的权限限定为检索和下载；当前身份范围为 safe 图片及含图片消息，最终可见范围与下载契约须在实现前讨论并更新 DESIGN。本机 Web 模型 API 标签建议已实现，用户已手动验证单素材真实 API 调用，组合路径尚未手动验收；自然语言检索与指定平台监听尚未实现，自然语言不在本轮范围。
 
@@ -39,7 +39,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 | 静态检查 | `uv run ruff check src`；改过测试时检查 `src tests` |
 | 语法检查 | `uv run python -m compileall -q src` |
 | 测试 | `uv run pytest`；测试在临时目录运行 |
-| 检索性能验收 | `uv run python tools/bench_search.py --scale 100000 --assert` |
+| 检索性能验收 | 帖级 v1：`uv run python tools/bench_search.py --scale 100000 --assert`；Web v2：`uv run python tools/bench_web_search.py --scale 100000 --compositions 1000 --assert` |
 | 前端组件测试与构建 | 在 `frontend` 运行 `npm ci`、`npm test`、`npm run build` |
 | 本机 Web / API | `uv run pc serve` |
 | 应用迁移 / 结构校验 | `uv run pc db apply` / `uv run pc db status` |
@@ -91,9 +91,9 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 
 ## 独立组合
 
-- CLI composition create/list/show/update/set-members/delete 管理手动组合，可跨消息引用，保留顺序与重复成员。迁移到 0011，39 张 STRICT 表；已有消息与上传不自动建组合。
+- CLI composition create/list/show/update/set-members/delete 管理手动组合，可跨消息引用，保留顺序与重复成员。迁移到 0012，39 张 STRICT 表；仅明确勾选的 Web 上传同时新建组合，其他消息不自动建组合。
 - 组合标签 --composition 独立关联，保留 --message 展开部件；usage_count 仍计内容项，composition_usage_count 单独返回。标签默认仅匹配自身，--match-member-tags 扩到当前可见成员；隐藏成员只返回位置及不可用状态。
-- 组合编辑与审计同事务、详情读快照；软删组合不删除成员。CLI 为本机 root；本机 Web 支持按帖级检索选内容项、创建组合及关联组合自身人工标签，并可选取已有组合进行模型建议和审核；组合更新、成员替换及删除仍由 CLI 管理，不开放远程、组合关键词索引或下载。
+- 组合编辑与审计同事务、详情读快照；软删组合不删除成员。CLI 为本机 root；本机 Web 的组合编辑器沿用帖级 v1 检索选内容项，支持创建组合、独立人工标签和模型建议；上传可明确请求组合与归档原子创建。`/manage` v2 统一搜索内容项、组合名称/说明及可见成员；组合更新、成员替换及删除仍由 CLI 管理，不开放远程或下载。
 
 ## 标签、检索与输出
 
@@ -103,15 +103,15 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 - 有效标签为未撤销 human/system/auto/merged 且标签 active/deprecated；suggested/pending 不进入过滤、输出、索引或计数。usage_count 按不同内容项计数。
 - tag_synonym 为别名事实源，同步 tag.aliases；规范名与别名交叉冲突在写事务拒绝。名称 NFKC、casefold、空白/下划线统一，规范化后 1~255 字符，拒绝控制字符。
 - `SearchIndex.index_many` 参与调用方事务，空集合只读；标签刷新保留帖签名，维护重算分批提交。
-- FTS 文档为内容项，返回、分页和预算单位为帖；每条 hit 带 message_id 和全部可见 parts，关键词和标签 AND 可跨可见部件。默认可见为未软删、active、nsfw_level <=0；消息软删排除整帖。
-- 类型按可见部件计算，多种类型 OR，mixed 至少两种类型。存储按内容哈希去重，检索按 post 签名折叠；代表帖须满足完整查询，缺签名保留显示。
+- FTS 文档为内容项。CLI 和默认 Web v1 以帖返回/分页，hit 带 message_id 与全部可见 parts，关键词和标签 AND 可跨部件；`/manage` 与显式 Web result_version=2 以内容项和组合为平级结果，关键词可跨组合名称/说明/不同可见成员，统一时间游标分页，组合标签只查自身；来源/类型/状态过滤由同一个可见成员满足，组合发送时间取可见成员非空最新值。默认可见为未软删、active、nsfw_level <=0；消息软删排除整帖。
+- 类型按可见部件计算，多种类型 OR，mixed 至少两种类型。存储按内容哈希去重；CLI/Web v1 检索按 post 签名折叠，代表帖须满足完整查询，缺签名保留显示；Web v2 不折叠内容项。
 - post 构成、时间和签名在 pipeline._upsert_post 与 sqlite.sync_post_rows 保持同值；type_mask 为 ITEM_TYPES 的 distinct 位值之和。可见性实时计算，签名 v2 由 Python 生成有序 JSON，保留类型与重复次数，缺摘要不折叠；导入和重算共用摘要读取，全量归组按参数上限分批。0010 清空旧派生签名，升级后重算恢复折叠。
 - CJK 1~2 字和拉丁词走 content_word，CJK >=3 字走 content_fts；混查询逐词 AND。用户词转为转义的引号短语，纯标点/emoji 跳过，MATCH 语法仅由适配器构造。
 - 相关度取命中部件最小 bm25，按帖去重后预算 500/2000，带标签预算 2000；截断标 incomplete。候选不足时扩读并校验未读分数边界。
-- 关键词 total=None，纯过滤计数上限 5000；usage_count 仅作估计。has_more 描述下一页。时间排序用 v2 键集游标，相关度用 page；时间字段统一范围、排序与游标，sent 空值排最后并被范围排除。
+- CLI/Web v1 关键词 total=None，纯过滤计数上限 5000；Web v2 无论关键词或纯过滤均不预统计 total，当前仅全局时间排序，不提供相关度及内容项折叠。usage_count 仅作估计。has_more 描述下一页。v1 时间排序用键集游标、相关度用 page；v2 使用独立查询指纹的全局时间游标；sent 空值排最后并被时间范围排除。
 - message.sent_at 为事实源，content_item/post 的 sent_at 为派生副本，重算和 doctor 对齐。时间索引和最小标签集按估算切换，0008/0009 覆盖索引与连接顺序属于性能契约。
-- 查询共享读快照，组装固定三条 SQL：主查询、标签批量、媒体批量；命中解释复用已取列。search_extra 顺序见 domain.search_extra_value，落库与重算同步修改；文件名只保存 basename，用于展示和索引。
-- 服务返回数据，CLI 负责序列化/渲染，渲染器只读。JSON 保留完整值，stdout 单一 JSON、诊断 stderr；CLI 使用 ensure_ascii=True 兼容 PowerShell 5.1 管道。结果 result_version=1，保留现有分页字段；新增表格列须更新对应 MAX_WIDTHS，前端全局排序由查询端执行。
+- 查询共享读快照；v1 组装固定三条 SQL：主查询、标签批量、媒体批量；v2 限定每类候选后合并，再批量取标签。search_extra 顺序见 domain.search_extra_value，落库与重算同步修改；文件名只保存 basename，用于展示和索引。
+- 服务返回数据，CLI 负责序列化/渲染，渲染器只读。JSON 保留完整值，stdout 单一 JSON、诊断 stderr；CLI 使用 ensure_ascii=True 兼容 PowerShell 5.1 管道。CLI 和默认 Web 返回 result_version=1，显式 Web 版本 2 返回平级实体结果；新增表格列须更新对应 MAX_WIDTHS，前端全局排序由查询端执行。
 - 检索路径改动必须跑十万条真实基准：50 帖/页、热缓存、最多 4 并发，P50 <150 ms、P99 <500 ms。超预算在同一改动修复或记录解释；历史实测见 DESIGN_HISTORY。
 
 ## 内容查看与本机 Web
@@ -124,7 +124,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 - 本机令牌在 fragment 中传入，10 分钟有效；交换后清除 fragment，保留路径与查询。内存会话 Cookie 为 HttpOnly/SameSite=Strict，8 小时绝对期限、30 分钟空闲期限；退出或重启失效。
 - 业务校验会话、本机对端与当前 Host；写操作校验 Origin/CSRF。身份由服务器授予 local_root，客户端不能指定 actor_id。媒体接口检查可见关联并复用安全读取，存储和缓存保持私有。
 - React 文本节点展示归档文本，同源资源受 CSP 约束，图片地址使用内容项/媒体 ID。系统动作复用服务，不执行 CLI 子进程；部分失败保留 copied 状态。
-- `/`、`/add`、`/manage`、`/compositions`、`/model` 共用 HTML，刷新可直接访问。上传 multipart 为 text/note/images，身份为会话 root，来源 manual；读请求体前鉴权。按实际字节限制单图、256 MiB 媒体、258 MiB 请求和最多 19 张；文本按配置，备注 4096 字符。
+- `/`、`/add`、`/manage`、`/compositions`、`/model` 共用 HTML，刷新可直接访问。上传 multipart 为旧 text/note/images 或有序 parts JSON 加可选组合名称/说明/标签，身份为会话 root，来源 manual；组合请求在一次归档写事务中完成，失败不留本次新记录且保留隔离证据；读请求体前鉴权。按实际字节限制单图、256 MiB 媒体、258 MiB 请求和最多 19 张；文本按配置，备注 4096 字符。
 - 暂存在 data_root/upload-staging/UUID，按选择顺序存独立子目录，roots 持久化供 worker 接续。成功或死信清理，可重试保留；清理仅限该根 UUID 直接子目录，异常残留须对照任务检查。
 - worker.run_message 只恢复和抢占指定消息。单图/纯文本身份与 CLI 兼容，多图身份含有序媒体哈希和规范化文本哈希，文件名与备注不参与身份。
 

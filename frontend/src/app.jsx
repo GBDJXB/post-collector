@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router";
 import { ModelPage, proposalProofs } from "./model.jsx";
 import { CompositionsPage } from "./compositions.jsx";
+import { LinkedText, safeWebUrl } from "./links.jsx";
 
 const lines = value => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-const emptyDraft = { text: "", note: "", images: [] };
-const initialSearch = { q: "", source: "", tags: "", item_types: [], since: "", until: "", time_field: "ingest", sort: "time", limit: 40, include_duplicates: false };
+const emptyDraft = { text: "", note: "", images: [], entries: [], orderTouched: false, createComposition: false, compositionName: "", compositionDescription: "", compositionTags: "" };
+const initialSearch = { q: "", kind: "all", source: "", tags: "", item_types: [], since: "", until: "", time_field: "ingest", sort: "time", limit: 40, include_duplicates: false };
 export function safeId(value) {
   const id = Number(value);
   if (!Number.isSafeInteger(id) || id <= 0) throw new Error("ID 必须为浏览器能够精确表示的正整数");
@@ -81,11 +82,29 @@ export function Shell() {
       catch (error) { setNotice(error.message); }
     }
   }, [csrf, location.pathname, location.search]);
+  function addEntry(entry) { setDraft(current => ({ ...current, entries: [...current.entries, entry] })); }
+  function updateEntry(index, changed) { setDraft(current => ({ ...current, entries: current.entries.map((entry, position) => position === index ? { ...entry, ...changed } : entry) })); }
+  function moveEntry(from, to) {
+    setDraft(current => { const entries = [...current.entries]; const [entry] = entries.splice(from, 1); entries.splice(to, 0, entry); return { ...current, entries, orderTouched: true }; });
+  }
   async function submit() {
-    if (!draft.text.trim() && !draft.images.length) throw new Error("请输入文本或选择图片");
-    if (draft.images.length > 19) throw new Error("一次最多上传 19 张图片");
-    const body = new FormData(); body.append("text", draft.text); body.append("note", draft.note);
-    draft.images.forEach(file => body.append("images", file));
+    const orderMode = draft.orderTouched || draft.entries.some(entry => entry.kind !== "image");
+    const images = orderMode ? draft.entries.filter(entry => entry.kind === "image").map(entry => entry.file) : draft.images;
+    if (!draft.text.trim() && !images.length && !draft.entries.some(entry => entry.kind === "text" && entry.text.trim() || entry.kind === "link" && entry.url.trim())) throw new Error("请输入文本、链接或选择图片");
+    if (images.length > 19) throw new Error("一次最多上传 19 张图片");
+    const body = new FormData();
+    if (orderMode) {
+      const entries = draft.text.trim() ? [{ kind: "text", text: draft.text }, ...draft.entries] : draft.entries;
+      let imageIndex = 0;
+      body.append("parts", JSON.stringify(entries.map(entry => entry.kind === "image" ? { kind: "image", index: imageIndex++ } : entry)));
+    } else body.append("text", draft.text);
+    body.append("note", draft.note);
+    images.forEach(file => body.append("images", file));
+    if (draft.createComposition) {
+      body.append("create_composition", "true"); body.append("composition_name", draft.compositionName);
+      body.append("composition_description", draft.compositionDescription);
+      body.append("composition_tags", draft.compositionTags);
+    }
     const result = await api("uploads", body);
     setUpload(result);
     setDraft(emptyDraft); setFileKey(x => x + 1);
@@ -98,8 +117,20 @@ export function Shell() {
         <Route path="/" element={<section><h2>内容归档</h2><p><Link to="/add">加入新内容</Link></p><p><Link to="/manage">检索 / 管理已有内容</Link></p></section>} />
         <Route path="/add" element={<section><h2>加入新内容</h2><form onSubmit={e => { e.preventDefault(); run(submit); }}>
           <label>文本 <textarea name="text" rows="8" value={draft.text} onChange={e => setDraft({ ...draft, text: e.target.value })} /></label>
-          <label>图片 <input key={fileKey} name="images" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.avif,.heic,.heif" onChange={e => setDraft({ ...draft, images: Array.from(e.target.files) })} /></label>
-          <ul>{draft.images.map((file, i) => <li key={i}>{file.name} ({file.size} 字节)</li>)}</ul>
+          <label>图片 <input key={fileKey} name="images" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.avif,.heic,.heif" onChange={e => { const files = Array.from(e.target.files); setDraft(current => ({ ...current, images: [...current.images, ...files], entries: [...current.entries, ...files.map(file => ({ kind: "image", file }))] })); }} /></label>
+          <ul>{(draft.orderTouched ? draft.entries.filter(entry => entry.kind === "image").map(entry => entry.file) : draft.images).map((file, i) => <li key={i}>{file.name} ({file.size} 字节)</li>)}</ul>
+          <button type="button" onClick={() => addEntry({ kind: "text", text: "" })}>添加文本条目</button>
+          <button type="button" onClick={() => addEntry({ kind: "link", url: "", description: "" })}>添加链接条目</button>
+          <ol>{draft.entries.map((entry, index) => <li key={index}>
+            {entry.kind === "text" && <label>条目 {index + 1} 文本 <textarea value={entry.text} onChange={e => updateEntry(index, { text: e.target.value })} /></label>}
+            {entry.kind === "link" && <><label>条目 {index + 1} URL <input value={entry.url} onChange={e => updateEntry(index, { url: e.target.value })} /></label><label>条目 {index + 1} 说明 <textarea value={entry.description} onChange={e => updateEntry(index, { description: e.target.value })} /></label></>}
+            {entry.kind === "image" && <span>图片 {entry.file.name}</span>}
+            <button type="button" aria-label={`上移条目 ${index + 1}`} disabled={index === 0} onClick={() => moveEntry(index, index - 1)}>上移</button>
+            <button type="button" aria-label={`下移条目 ${index + 1}`} disabled={index === draft.entries.length - 1} onClick={() => moveEntry(index, index + 1)}>下移</button>
+            <button type="button" aria-label={`移除条目 ${index + 1}`} onClick={() => setDraft(current => ({ ...current, entries: current.entries.filter((_, position) => position !== index), orderTouched: true }))}>移除</button>
+          </li>)}</ol>
+          <label><input type="checkbox" checked={draft.createComposition} onChange={e => setDraft({ ...draft, createComposition: e.target.checked })} />同时创建组合</label>
+          {draft.createComposition && <><label>上传组合名称 <input value={draft.compositionName} maxLength="255" onChange={e => setDraft({ ...draft, compositionName: e.target.value })} /></label><label>上传组合说明 <textarea value={draft.compositionDescription} onChange={e => setDraft({ ...draft, compositionDescription: e.target.value })} /></label><label>上传组合标签（每行一个） <textarea value={draft.compositionTags} onChange={e => setDraft({ ...draft, compositionTags: e.target.value })} /></label></>}
           <label>备注 <textarea name="note" rows="2" maxLength="4096" value={draft.note} onChange={e => setDraft({ ...draft, note: e.target.value })} /></label>
           <p>一次提交组成一条消息，最多 19 张图片。提交后自动扫描、去重并入库。</p><button type="submit">加入内容</button></form>
           {upload && <p role="status">消息 {upload.message_id}：{upload.duplicate ? "已存在；" : ""}{upload.detail} ({upload.status}) {upload.content_ids.length > 0 && <Link to={`/manage?message_id=${upload.message_id}`}>查看本次消息</Link>}</p>}
@@ -118,11 +149,14 @@ function useManage(api) {
   const [messages, setMessages] = useState([]), [parts, setParts] = useState([]), [suggestions, setSuggestions] = useState([]);
   const [tags, setTags] = useState([]), [assignments, setAssignments] = useState([]), [aliases, setAliases] = useState([]);
   const [fields, setFields] = useState({ detailKind: "message_id", detailId: "", actionTarget: "current", copy: false, tagTarget: "messages", names: "", namespace: "general", aliasName: "", aliasValue: "" });
+  const [compositionDetail, setCompositionDetail] = useState(null);
   async function find(next = false) {
     const values = next ? { ...params, page: result.page + 1, cursor: result.next_cursor || null } : { ...form, tags: lines(form.tags), page: 1 };
-    const data = await api(`search?${query(values)}`); setResult(data); setParams(values); setMessages([]);
+    const data = await api(`search?${query({ ...values, result_version: 2 })}`); setResult(data); setParams(values); setMessages([]); setParts([]);
+    if (data.result_version === 2) setFields(current => ({ ...current, tagTarget: "parts" }));
   }
-  async function show(value) { const data = await api(`detail?${query(value)}`); setDetail(data); setTarget(value); setParts([]); }
+  async function show(value) { const data = await api(`detail?${query(value)}`); setDetail(data); setCompositionDetail(null); setTarget(value); setParts([]); }
+  async function showComposition(id) { const data = await api(`compositions/${id}`); setCompositionDetail(data); setDetail(null); setTarget(null); setParts([]); }
   async function loadTags() { setTags((await api("tags")).tags); }
   function targets() {
     const ids = fields.tagTarget === "messages" ? messages : parts;
@@ -132,7 +166,7 @@ function useManage(api) {
   async function loadAssignments() { setAssignments((await api(`assignments?${query(targets())}`)).assignments); setSuggestions([]); }
   async function loadAliases() { setAliases((await api(`aliases?${query({ name: fields.aliasName })}`)).aliases); }
   async function refresh() { await loadTags(); if (target) await show(target); await find(); setAssignments([]); setSuggestions([]); }
-  return { form, setForm, result, detail, target, messages, setMessages, parts, setParts, suggestions, setSuggestions, tags, assignments, aliases, setAliases, fields, setFields, find, show, loadTags, targets, loadAssignments, loadAliases, refresh };
+  return { form, setForm, result, detail, compositionDetail, target, messages, setMessages, parts, setParts, suggestions, setSuggestions, tags, assignments, aliases, setAliases, fields, setFields, find, show, showComposition, loadTags, targets, loadAssignments, loadAliases, refresh };
 }
 
 function Manage({ state: m, run, api }) {
@@ -157,25 +191,34 @@ function Manage({ state: m, run, api }) {
     if (!m.suggestions.length) throw new Error("请勾选有效建议关联");
     await api(`suggestions/${operation}`, { ids: m.suggestions, expected_runs: proposalProofs(m.assignments, m.suggestions) }); await m.refresh();
   }
-  return <><div className="manage-viewport" role="region" aria-label="检索与详情" tabIndex={0}><div className="manage-layout"><section><h2>检索与最近消息</h2><p>这里检索原始消息。<Link to="/compositions">查找独立组合</Link></p><form id="search-form" onSubmit={e => { e.preventDefault(); run(() => m.find()); }}>
-    {searchField("q", "关键词", "text", { maxLength: 4096 })}{searchField("source", "来源名或 ID")}
+  return <><div className="manage-viewport" role="region" aria-label="检索与详情" tabIndex={0}><div className="manage-layout"><section><h2>检索内容项与组合</h2><p>内容项与组合共享结果页。<Link to="/compositions">整理已有组合</Link></p><form id="search-form" onSubmit={e => { e.preventDefault(); run(() => m.find()); }}>
+    {searchField("q", "关键词", "text", { maxLength: 4096 })}<label>结果类型 <select value={m.form.kind} onChange={e => m.setForm({ ...m.form, kind: e.target.value })}><option value="all">内容项与组合</option><option value="content">仅内容项</option><option value="composition">仅组合</option></select></label>{searchField("source", "来源名或 ID")}
     <label>标签（每行一个，全部匹配）<textarea name="tags" rows="2" value={m.form.tags} onChange={e => m.setForm({ ...m.form, tags: e.target.value })} /></label>
-    <fieldset><legend>内容类型（不勾选表示全部）</legend>{[["text", "文本"], ["image", "图片"], ["mixed", "混合消息（同一消息多种类型）"], ["video", "视频"], ["audio", "音频"], ["link", "链接"], ["sticker", "贴纸"], ["file", "文件"]].map(([value, label]) => <label key={value}><input type="checkbox" name="item_types" checked={m.form.item_types.includes(value)} onChange={e => m.setForm({ ...m.form, item_types: e.target.checked ? [...m.form.item_types, value] : m.form.item_types.filter(x => x !== value) })} />{label}</label>)}</fieldset>
+    <fieldset><legend>内容类型（不勾选表示全部）</legend>{[["text", "文本"], ["image", "图片"], ["mixed", "混合组合（成员含多种类型）"], ["video", "视频"], ["audio", "音频"], ["link", "链接"], ["sticker", "贴纸"], ["file", "文件"]].map(([value, label]) => <label key={value}><input type="checkbox" name="item_types" checked={m.form.item_types.includes(value)} onChange={e => m.setForm({ ...m.form, item_types: e.target.checked ? [...m.form.item_types, value] : m.form.item_types.filter(x => x !== value) })} />{label}</label>)}</fieldset>
     {searchField("since", "开始日期", "date")}{searchField("until", "结束日期", "date")}
     <label>时间字段 <select name="time_field" value={m.form.time_field} onChange={e => m.setForm({ ...m.form, time_field: e.target.value })}><option value="ingest">入库时间</option><option value="sent">发送时间</option></select></label>
-    <label>排序 <select name="sort" value={m.form.sort} onChange={e => m.setForm({ ...m.form, sort: e.target.value })}><option value="time">时间</option><option value="relevance">相关度</option></select></label>
-    {searchField("limit", "每页", "number", { min: 1, max: 50 })}<label><input type="checkbox" checked={m.form.include_duplicates} onChange={e => m.setForm({ ...m.form, include_duplicates: e.target.checked })} />包括重复消息</label><button type="submit">检索 / 返回第一页</button></form>
+    <label>排序 <select name="sort" value={m.form.sort} onChange={e => m.setForm({ ...m.form, sort: e.target.value })}><option value="time">时间</option></select></label>
+    {searchField("limit", "每页", "number", { min: 1, max: 50 })}<span>内容项按实际条目展示，不折叠重复。</span><button type="submit">检索 / 返回第一页</button></form>
     {m.result && <p id="search-summary">第 {m.result.page} 页，本页 {m.result.hits.length} 条；总数 {m.result.total ?? "未统计"} ({m.result.total_kind}){m.result.incomplete ? "；候选已截断" : ""}</p>}
-    <div className="table-wrap"><table><thead><tr>{["选择", "消息 ID", "类型", "内容", "标签", "来源", "时间", "详情"].map(x => <th key={x}>{x}</th>)}</tr></thead><tbody id="hits">{(m.result?.hits || []).map(hit => <tr key={hit.message_id}>
+    <div className="table-wrap"><table><thead><tr>{["选择", m.result?.result_version === 2 ? "结果 ID" : "消息 ID", "类型", "内容", "标签", "来源", "时间", "详情"].map(x => <th key={x}>{x}</th>)}</tr></thead><tbody id="hits">{m.result?.result_version === 2 ? m.result.hits.map(hit => <tr key={`${hit.kind}:${hit.entity_id}`}>
+      <td>{hit.kind === "content" && <Selection ids={m.parts} setIds={m.setParts} id={hit.content_id} label={`选择内容项 ${hit.content_id}`} />}</td>
+      <td>{hit.kind === "composition" ? `组合 ${hit.composition_id}` : `内容项 ${hit.content_id}`}</td>
+      <td>{hit.item_type}</td><td className="summary"><span className="summary-clamp">{hit.kind === "composition" ? hit.name : (hit.text || hit.original_name || "").slice(0, 180)}</span></td>
+      <td>{(hit.tags || []).map(tag => tag.name || tag).join(" ")}</td><td>{hit.source_name || ""}</td><td>{hit.sort_time || ""}</td>
+      <td><button aria-label={hit.kind === "composition" ? `查看组合 ${hit.composition_id}` : `查看内容项 ${hit.content_id}`} onClick={() => run(() => hit.kind === "composition" ? m.showComposition(hit.composition_id) : m.show({ content_id: hit.content_id }))}>查看</button></td>
+    </tr>) : (m.result?.hits || []).map(hit => <tr key={hit.message_id}>
       <td><Selection ids={m.messages} setIds={m.setMessages} id={hit.message_id} label={`选择消息 ${hit.message_id}`} /></td><td>{hit.message_id}</td><td>{hit.item_type}</td><td className="summary"><span className="summary-clamp">{(hit.snippet || hit.text || hit.original_name || "").slice(0, 180)}</span></td><td>{[...new Set(hit.tags.map(t => typeof t === "string" ? t : t.name))].join(" ")}</td><td>{hit.source_name || hit.source || hit.source_id}</td><td>{hit.first_seen_at}</td><td><button onClick={() => run(() => m.show({ message_id: hit.message_id }))}>查看</button></td></tr>)}</tbody></table></div>
     <button id="next" disabled={!m.result?.has_more} onClick={() => run(() => m.find(true))}>下一页</button></section>
     <section className="manage-detail"><h2>详情与本机操作</h2><form onSubmit={e => { e.preventDefault(); run(() => m.show({ [m.fields.detailKind]: safeId(m.fields.detailId) })); }}>
       {select("detailKind", "目标", [["message_id", "消息 ID"], ["content_id", "内容项 ID"]])}{field("detailId", "ID", "number", { min: 1, required: true })}<button type="submit">查看</button></form>
       {m.detail && <><p id="detail-summary">消息 {m.detail.message_id}；来源 {m.detail.source}；{m.detail.origin_note || ""}</p><div id="parts">{m.detail.parts.map(part => <article key={part.content_id}><label><Selection ids={m.parts} setIds={m.setParts} id={part.content_id} label={`选择内容项 ${part.content_id}`} />内容项 {part.content_id} ({part.item_type}) {part.original_name || ""}</label>
-        {part.text && <pre>{part.text}</pre>}{part.media.map(media => <Media key={media.media_id} part={part} media={media} />)}</article>)}</div></>}
+        {part.url && safeWebUrl(part.url) && <a href={safeWebUrl(part.url)} target="_blank" rel="noopener noreferrer">{part.url}</a>}{part.text && <pre><LinkedText text={part.text} /></pre>}{part.media.map(media => <Media key={media.media_id} part={part} media={media} />)}</article>)}</div></>}
+      {m.compositionDetail && <><p>{m.compositionDetail.name}：{m.compositionDetail.description}</p><div id="parts">{m.compositionDetail.members.map(member => <article key={member.position}>
+        {member.available ? <>内容项 {member.content_id} ({member.item_type}) {member.text && <pre><LinkedText text={member.text} /></pre>}{member.url && safeWebUrl(member.url) && <a href={safeWebUrl(member.url)} target="_blank" rel="noopener noreferrer">{member.url}</a>}{(member.media || []).map(media => <Media key={media.media_id} part={member} media={media} />)}</> : `位置 ${member.position}：不可用`}
+      </article>)}</div></>}
       {select("actionTarget", "系统操作目标", [["current", "当前查看目标"], ["parts", "详情中勾选的一个内容项"]])}<label><input type="checkbox" checked={m.fields.copy} onChange={e => m.setFields({ ...m.fields, copy: e.target.checked })} />打开 / 定位时同时复制</label>
       {[["open", "默认程序打开"], ["reveal", "文件管理器定位"], ["copy", "复制"]].map(([value, label]) => <button key={value} onClick={() => run(() => action(value))}>{label}</button>)}<p>文本复制正文；图片复制文件。混合内容打开为 HTML，暂不支持复制。</p></section></div></div>
-    <section><h2>人工标签与关联</h2>{select("tagTarget", "标签操作目标", [["messages", "结果中勾选的消息"], ["parts", "详情中勾选的内容项"]])}
+    <section><h2>人工标签与关联</h2>{select("tagTarget", "标签操作目标", m.result?.result_version === 2 ? [["parts", "结果或详情中勾选的内容项"]] : [["messages", "结果中勾选的消息"], ["parts", "详情中勾选的内容项"]])}
       <label>标签名称（每行一个）<textarea rows="3" value={m.fields.names} onChange={e => m.setFields({ ...m.fields, names: e.target.value })} /></label>{field("namespace", "命名空间")}
       <button onClick={() => run(() => tag("add"))}>添加标签</button><button onClick={() => run(() => tag("remove"))}>撤销标签</button><button onClick={() => run(m.loadAssignments)}>查看目标关联记录</button>
       <div className="table-wrap"><table><thead><tr>{["建议选择", "关联 ID", "内容 ID", "名称", "来源", "置信度", "撤销时间"].map(x => <th key={x}>{x}</th>)}</tr></thead><tbody>{m.assignments.map(entry => <tr key={entry.assign_id}><td>{entry.source === "suggested" && !entry.revoked_at && <Selection ids={m.suggestions} setIds={m.setSuggestions} id={entry.assign_id} label={`选择建议 ${entry.assign_id}`} />}</td>{["assign_id", "content_id", "name", "source", "confidence", "revoked_at"].map(key => <td key={key}>{entry[key]}</td>)}</tr>)}</tbody></table></div>

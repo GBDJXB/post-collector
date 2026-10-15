@@ -1295,7 +1295,7 @@ def stale_search_row_count(conn: sqlite3.Connection) -> int:
     **构成没对齐的帖行**（0007 的派生表）都会落在这里。``pc doctor`` 与 ``pc search``
     （0 结果时）用它提示"该跑一次派生列重算了"，而不是让人对着空结果猜。
 
-    文件名那一项**只数补得出来的行**（该消息恰好一个媒体引用）：补不出来的行不该被反复
+    文件名那一项**只数补得出来的媒体行**（该消息恰好一个媒体引用，文本/链接项不计）：补不出来的行不该被反复
     提示"待重算"，那会变成永远为真的假告警。
     """
     row = conn.execute(
@@ -1303,7 +1303,7 @@ def stale_search_row_count(conn: sqlite3.Connection) -> int:
         " WHERE c.deleted_at IS NULL AND ("
         "   (c.text_search IS NULL AND (c.text_content IS NOT NULL OR c.ocr_text IS NOT NULL"
         "        OR c.caption IS NOT NULL OR c.search_extra IS NOT NULL))"
-        "   OR (c.original_name IS NULL AND c.item_type <> 'text'"
+        "   OR (c.original_name IS NULL AND c.item_type NOT IN ('text','link')"
         "       AND json_array_length(m.media_refs) = 1)"
         "   OR c.sent_at IS NOT m.sent_at"
         " )"
@@ -1354,11 +1354,14 @@ def _backfill_original_name(row: Mapping[str, Any]) -> str | None:
     但"哪些引用对应哪一个内容项"只在**恰好一个引用**时才是确定的——多附件消息里那个
     对应关系是 ordinal 与引用顺序之间的隐藏耦合，写进回填逻辑迟早出错。所以：
 
-    * 已有名字 → 原样保留（不回写、不猜）；
-    * 文本项 → 留空（它没有 media ref，补齐要等信封加字段）；
+    * 链接项 → 留空（它没有文件名，即使先前误填也清除）；
+    * 其他项已有名字 → 原样保留（不回写、不猜）；
+    * 无文件名的文本项 → 留空（它没有 media ref）；
     * 媒体项且该消息**恰好一个引用** → 取那个引用的 basename；
     * 其余 → 留空，并如实说明"补不出来"。
     """
+    if row["item_type"] == "link":
+        return None
     if row["original_name"]:
         return str(row["original_name"])
     if row["item_type"] == "text":
@@ -1501,7 +1504,7 @@ def post_digests(rows):
         part["media"].append(row["media_sha"])
     digests = {}
     for (message_id, _content_id), part in grouped.items():
-        if part["kind"] == "text":
+        if part["kind"] in {"text", "link"}:
             digest = part["text"]
         elif any(not item for item in part["media"]):
             digest = None
@@ -1664,6 +1667,7 @@ _SEARCH_DERIVED_SELECT = (
     "       c.search_extra, c.original_name, c.sent_at, c.item_type, s.name AS source_name,"
     "       s.platform, m.sender_display_name, m.origin_note, m.media_refs,"
     "       m.sent_at AS message_sent_at,"
+    "       (SELECT url_canonical FROM link WHERE content_id=c.content_id AND deleted_at IS NULL ORDER BY link_id LIMIT 1) AS link_url,"
     "       (SELECT group_concat(label, ' ') FROM ("
     "          SELECT t.name AS label FROM tag_assignment ta JOIN tag t USING(tag_id)"
     f"          WHERE ta.content_id=c.content_id AND {effective_assignment()}"
@@ -1694,7 +1698,7 @@ def _derived_search_values(row: sqlite3.Row) -> tuple[str | None, str]:
     extra = search_extra_value(
         row["source_name"], row["platform"], row["sender_display_name"], row["item_type"],
         ITEM_TYPE_LABELS.get(str(row["item_type"])), _backfill_original_name(row),
-        row["tag_names"], row["origin_note"],
+        row["link_url"], row["tag_names"], row["origin_note"],
     )
     return search_tokens(row["text_content"], row["ocr_text"], row["caption"], extra), extra
 

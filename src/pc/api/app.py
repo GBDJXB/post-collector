@@ -25,7 +25,7 @@ from pc.adapters import view_files
 from pc.adapters.safe_files import UnsafeLocalPathError
 from pc.config import IngestLimits, JobSettings, SecurityPolicy
 from pc.domain import SourceNotAuthorizedError
-from pc.services import desktop_view, search, tagging, viewing
+from pc.services import desktop_view, search, tagging, viewing, web_search
 
 ID = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
 
@@ -303,6 +303,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
         assert runtime is not None
         form = await parse(request, media_limit=runtime.media_limit)
+        if form.get("create_composition") not in (None, "true", "false"):
+            await form.close()
+            raise HTTPException(422, "是否创建组合须为 true 或 false")
 
         def execute():
             paths = runtime.paths or db.resolve_paths(env={"PC_DATA_ROOT": str(runtime.cache_root.parent)})
@@ -315,6 +318,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 return uploads.submit(
                     conn, paths=paths, limits=limits, security=runtime.security, jobs=runtime.jobs,
                     text=form.get("text", ""), note=form.get("note", ""), images=form.getlist("images"),
+                    parts=form.get("parts"), create_composition=form.get("create_composition") == "true",
+                    composition_name=form.get("composition_name", ""),
+                    composition_description=form.get("composition_description", ""),
+                    composition_tags=form.get("composition_tags", ""),
                 )
 
         try:
@@ -324,6 +331,25 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/api/v1/search", dependencies=protected)
     def find(request: Request):
+        if request.query_params.get("result_version") == "2":
+            kind = request.query_params.get("kind", "all")
+            values_v2: dict[str, Any] = dict(request.query_params)
+            values_v2.pop("result_version", None)
+            values_v2.pop("kind", None)
+            for key in ("item_types", "statuses", "tags"):
+                values_v2[key] = request.query_params.getlist(key)
+            try:
+                params = SearchInput.model_validate(values_v2).model_dump()
+            except ValidationError as exc:
+                raise HTTPException(422, "检索参数无效") from exc
+            assert runtime is not None
+            with connect() as conn:
+                if params["limit"] is None:
+                    params["limit"] = search.default_page_size(
+                        conn, registry=runtime.registry, yaml_defaults=runtime.yaml_defaults,
+                    )
+                with db.transaction(conn, immediate=False):
+                    return web_search.run_web_search(conn, kind=kind, **params)
         values: dict[str, Any] = dict(request.query_params)
         for key in ("item_types", "statuses", "tags"):
             values[key] = request.query_params.getlist(key)

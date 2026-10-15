@@ -376,6 +376,13 @@ class TestStaleCount:
         db.refresh_search_derived(fresh_db)
         assert db.stale_search_row_count(fresh_db) == 0
 
+    def test_link_in_single_media_message_does_not_report_unfillable_filename(self, fresh_db: Any) -> None:
+        source_id = _seed_source(fresh_db)
+        _seed_item(fresh_db, source_id=source_id, item_type="link", refs=("壁纸.jpg",))
+        assert db.stale_search_row_count(fresh_db) == 0
+        db.refresh_search_derived(fresh_db)
+        assert db.stale_search_row_count(fresh_db) == 0
+
     def test_unfillable_rows_are_not_counted(self, fresh_db: Any) -> None:
         """补不出名字的行不该永远被提示（那是永远为真的假告警）。"""
         source_id = _seed_source(fresh_db)

@@ -1,11 +1,12 @@
 import React from "react";
 import { readFileSync } from "node:fs";
+const webCss = readFileSync("src/style.css", "utf8");
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Shell, safeId } from "./app.jsx";
-const webCss = readFileSync("src/style.css", "utf8");
+import { safeWebUrl } from "./links.jsx";
 
 const body = '<script>window.bad=true</script>中文正文';
 const hit = { message_id: 3, item_type: "text", text: body, tags: [], source: "manual", first_seen_at: "2026-10-04" };
@@ -279,10 +280,71 @@ test("组合目录按名称和 ID 查找并保留翻页条件", async () => {
   expect(next.searchParams.get("composition_id")).toBe("12");
 });
 
-test("主消息检索解释混合消息并提供独立组合入口", async () => {
+test("统一检索同页展示内容项和组合并可筛选查看顺序", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/search?") && url.includes("result_version=2")) {
+      calls.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ result_version: 2, hits: [
+        { kind: "composition", entity_id: 12, composition_id: 12, name: "新组合", description: "两段内容", item_type: "composition", sort_time: "2026-10-02", tags: [] },
+        { kind: "content", entity_id: 7, content_id: 7, message_id: 3, item_type: "text", text: "正文", sort_time: "2026-10-01", tags: [] },
+      ], page: 1, has_more: false, total: null, total_kind: "not_counted" }) };
+    }
+    if (url.endsWith("/compositions/12")) return { ok: true, status: 200, json: async () => ({
+      composition_id: 12, name: "新组合", description: "两段内容", tags: [], members: [
+        { position: 0, content_id: 7, item_type: "text", text: "先读", available: true, media: [] },
+        { position: 1, content_id: 8, item_type: "text", text: "后读", available: true, media: [] },
+      ],
+    }) };
+    return original(url, options);
+  }));
   const user = await open("/manage");
-  expect(screen.getByText("混合消息（同一消息多种类型）")).toBeTruthy();
-  await user.click(screen.getByRole("link", { name: "查找独立组合" }));
+  expect(await screen.findByText("新组合")).toBeTruthy();
+  expect(screen.getByText("正文")).toBeTruthy();
+  expect(screen.getByRole("columnheader", { name: "结果 ID" })).toBeTruthy();
+  expect(screen.queryByRole("option", { name: "结果中勾选的消息" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "查看组合 12" }));
+  await screen.findByText("先读");
+  expect(Array.from(document.querySelectorAll("#parts article")).map(item => item.textContent)).toEqual(["内容项 7 (text) 先读", "内容项 8 (text) 后读"]);
+  await user.selectOptions(screen.getByLabelText("结果类型"), "composition");
+  await user.click(screen.getByRole("button", { name: "检索 / 返回第一页" }));
+  const search = calls.filter(call => call.url.includes("/search?")).at(-1).url;
+  expect(new URL(search, "http://localhost").searchParams.get("kind")).toBe("composition");
+});
+
+
+test.each(["翻页", "重新检索"])("统一检索%s后标签操作不包含旧选择", async mode => {
+  const original = globalThis.fetch;
+  let searches = 0;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/search?")) {
+      const id = ++searches === 1 ? 7 : 8;
+      return { ok: true, status: 200, json: async () => ({ result_version: 2,
+        hits: [{ kind: "content", entity_id: id, content_id: id, item_type: "text", text: `正文 ${id}`, tags: [] }],
+        page: searches, has_more: true, next_cursor: "next", total: null, total_kind: "not_counted",
+      }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/manage");
+  await user.click(screen.getByLabelText("选择内容项 7"));
+  if (mode === "重新检索") await user.type(screen.getByLabelText("关键词"), "新关键词");
+  await user.click(screen.getByRole("button", { name: mode === "翻页" ? "下一页" : "检索 / 返回第一页" }));
+  await screen.findByLabelText("选择内容项 8");
+  await user.click(screen.getByRole("button", { name: "添加标签" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toBe("请勾选标签操作目标"));
+  expect(calls.some(call => call.url.endsWith("/tags/add"))).toBe(false);
+  await user.click(screen.getByLabelText("选择内容项 8"));
+  await user.type(screen.getByLabelText("标签名称（每行一个）"), "新标签");
+  await user.click(screen.getByRole("button", { name: "添加标签" }));
+  await waitFor(() => expect(calls.some(call => call.url.endsWith("/tags/add"))).toBe(true));
+  expect(JSON.parse(calls.find(call => call.url.endsWith("/tags/add")).options.body).content_ids).toEqual([8]);
+});
+
+test("统一检索解释混合组合并提供整理入口", async () => {
+  const user = await open("/manage");
+  expect(screen.getByText("混合组合（成员含多种类型）")).toBeTruthy();
+  await user.click(screen.getByRole("link", { name: "整理已有组合" }));
   expect(await screen.findByRole("heading", { name: "已有组合" })).toBeTruthy();
 });
 
@@ -317,7 +379,7 @@ test("管理页全宽双栏提供可访问的局部横向滚动", async () => {
   await open("/manage");
   const viewport = screen.getByRole("region", { name: "检索与详情" });
   const layout = viewport.querySelector(".manage-layout");
-  const search = screen.getByRole("heading", { name: "检索与最近消息" }).closest("section");
+  const search = screen.getByRole("heading", { name: "检索内容项与组合" }).closest("section");
   const detailPanel = screen.getByRole("heading", { name: "详情与本机操作" }).closest("section");
   const tags = screen.getByRole("heading", { name: "人工标签与关联" }).closest("section");
   expect(viewport.tabIndex).toBe(0);
@@ -335,7 +397,7 @@ test("管理页双栏让内容标签检索与完整详情并列且标签管理�
   }));
   const user = await open("/manage");
   const layout = document.querySelector(".manage-layout");
-  const search = screen.getByRole("heading", { name: "检索与最近消息" }).closest("section");
+  const search = screen.getByRole("heading", { name: "检索内容项与组合" }).closest("section");
   const detailPanel = screen.getByRole("heading", { name: "详情与本机操作" }).closest("section");
   const tags = screen.getByRole("heading", { name: "人工标签与关联" }).closest("section");
   const catalog = screen.getByRole("heading", { name: "标签目录与别名" }).closest("section");
@@ -381,6 +443,72 @@ test("导航保留新增草稿与管理表单", async () => {
   await user.click(screen.getByRole("link", { name: "检索 / 管理已有内容" }));
   expect(screen.getByLabelText("关键词").value).toBe("保留检索条件");
 });
+
+test("URL 中格式控制字符不得成为可点击目标", () => {
+  expect(safeWebUrl("https://example.org/\u202eevil")).toBeNull();
+});
+
+
+test("正文 URL 可点击而脚本协议保持纯文本", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/detail?")) return { ok: true, status: 200, json: async () => ({ ...detail, parts: [{ content_id: 7, item_type: "text", text: "看(https://example.org/a)，javascript:alert(1)", media: [] }] }) };
+    return original(url, options);
+  }));
+  const user = await open("/manage");
+  await user.click(screen.getAllByRole("button", { name: "查看", exact: true })[0]);
+  const link = await screen.findByRole("link", { name: "https://example.org/a" });
+  expect(link.getAttribute("href")).toBe("https://example.org/a");
+  expect(screen.queryByRole("link", { name: /javascript:/ })).toBeNull();
+});
+
+
+test("有序编辑器按调整后的顺序提交文本图片和链接", async () => {
+  const user = await open("/add");
+  await user.click(screen.getByRole("button", { name: "添加文本条目" }));
+  await user.type(screen.getByLabelText("条目 1 文本"), "文本 A");
+  await user.upload(screen.getByLabelText("图片"), new File(["png"], "b.png", { type: "image/png" }));
+  await user.click(screen.getByRole("button", { name: "添加链接条目" }));
+  await user.type(screen.getByLabelText("条目 3 URL"), "https://example.org");
+  await user.type(screen.getByLabelText("条目 3 说明"), "人工说明");
+  await user.click(screen.getByRole("button", { name: "上移条目 3" }));
+  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  const sent = calls.find(call => call.url.endsWith("/uploads")).options.body;
+  expect(JSON.parse(sent.get("parts"))).toEqual([
+    { kind: "text", text: "文本 A" },
+    { kind: "link", url: "https://example.org", description: "人工说明" },
+    { kind: "image", index: 0 },
+  ]);
+});
+
+
+test("仅图片队列重排后按显示顺序上传", async () => {
+  const user = await open("/add");
+  await user.upload(screen.getByLabelText("图片"), [
+    new File(["a"], "first.png", { type: "image/png" }),
+    new File(["b"], "second.png", { type: "image/png" }),
+  ]);
+  await user.click(screen.getByRole("button", { name: "下移条目 1" }));
+  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  const body = calls.find(call => call.url.endsWith("/uploads")).options.body;
+  expect(body.getAll("images").map(file => file.name)).toEqual(["second.png", "first.png"]);
+  expect(JSON.parse(body.get("parts"))).toEqual([{ kind: "image", index: 0 }, { kind: "image", index: 1 }]);
+});
+
+
+test("仅图片队列移除后只上传保留的图片", async () => {
+  const user = await open("/add");
+  await user.upload(screen.getByLabelText("图片"), [
+    new File(["a"], "first.png", { type: "image/png" }),
+    new File(["b"], "second.png", { type: "image/png" }),
+  ]);
+  await user.click(screen.getByRole("button", { name: "移除条目 1" }));
+  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  const body = calls.find(call => call.url.endsWith("/uploads")).options.body;
+  expect(body.getAll("images").map(file => file.name)).toEqual(["second.png"]);
+  expect(JSON.parse(body.get("parts"))).toEqual([{ kind: "image", index: 0 }]);
+});
+
 
 test("上传使用 multipart 与 CSRF，成功清空草稿并打开详情", async () => {
   const user = await open("/add");

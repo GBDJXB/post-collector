@@ -70,18 +70,18 @@ async def parse(request: Request, *, media_limit: int):
     try:
         form = await BoundedParser(
             request.headers, bounded_stream(), media_limit=media_limit,
-            max_files=upload_files.MAX_IMAGES, max_fields=2, max_part_size=1024 * 1024,
+            max_files=upload_files.MAX_IMAGES, max_fields=9, max_part_size=1024 * 1024,
         ).parse()
     except MultiPartException as exc:
         raise HTTPException(413 if isinstance(exc, TooLarge) else 400, str(exc)) from exc
     try:
         for key, value in form.multi_items():
-            if key not in {"text", "note", "images"}:
+            if key not in {"text", "note", "images", "parts", "create_composition", "composition_name", "composition_description", "composition_tags", "request_id"}:
                 raise HTTPException(422, "上传包含未知字段")
             if (key == "images") != isinstance(value, UploadFile):
                 raise HTTPException(422, "上传字段类型无效")
-        if len(form.getlist("text")) > 1 or len(form.getlist("note")) > 1:
-            raise HTTPException(422, "文本与备注各只能提供一次")
+        if any(len(form.getlist(key)) > 1 for key in ("text", "note", "parts", "create_composition", "composition_name", "composition_description", "composition_tags", "request_id")):
+            raise HTTPException(422, "上传字段不能重复")
         return form
     except BaseException:
         await form.close()

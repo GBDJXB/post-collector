@@ -39,6 +39,7 @@ EXPECTED_MIGRATION_NAMES = {
     9: "0009_message_visibility_index.sql",
     10: "0010_compositions.sql",
     11: "0011_model_tagging.sql",
+    12: "0012_ordered_upload_search.sql",
 }
 
 

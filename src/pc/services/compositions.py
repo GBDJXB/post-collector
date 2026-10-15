@@ -60,6 +60,7 @@ def write(
     contents=(),
     actor_id=None,
     max_text_chars=100000,
+    nested=False,
 ):
     """编辑与审计同事务；成员列表保持重复及参数顺序。"""
     if operation not in {"create", "update", "set-members", "delete"}:
@@ -68,7 +69,7 @@ def write(
         name = _text(name, 255, name=True)
     if description is not None:
         description = _text(description, max_text_chars)
-    with db.transaction(conn):
+    with db.transaction(conn, nested=nested):
         tagging._root(conn, actor_id)
         before = None if operation == "create" else _get(conn, ident)
         now = db.now_iso()
@@ -143,7 +144,9 @@ def _read(conn, ident):
     members = []
     visible = {}
     for row in conn.execute(
-        "SELECT cm.position,c.*,m.deleted_at AS message_deleted FROM composition_member cm "
+        "SELECT cm.position,c.*,m.deleted_at AS message_deleted,"
+        "(SELECT url_normalized FROM link WHERE content_id=c.content_id AND deleted_at IS NULL ORDER BY link_id LIMIT 1) AS url "
+        "FROM composition_member cm "
         "JOIN content_item c USING(content_id) JOIN message m USING(message_id) "
         "WHERE cm.composition_id=? ORDER BY cm.position",
         (ident,),
@@ -161,6 +164,7 @@ def _read(conn, ident):
             "message_id": row["message_id"],
             "item_type": row["item_type"],
             "text": row["text_content"] or "",
+            "url": row["url"],
             "tags": [],
             "media": [],
         }
@@ -267,14 +271,14 @@ def list_compositions(conn, *, names=(), match_member_tags=False, limit=50, offs
     }
 
 
-def tag_change(conn, ident, names, *, remove=False, namespace="general", actor_id=None):
+def tag_change(conn, ident, names, *, remove=False, namespace="general", actor_id=None, nested=False):
     candidates = SqliteTagNormalizer(conn).resolve_conflicts(
         tagging.manual_result(names, namespace).tags
     )
     if not candidates:
         raise ValueError("请提供标签")
     changed = []
-    with db.transaction(conn):
+    with db.transaction(conn, nested=nested):
         tagging._root(conn, actor_id)
         _get(conn, ident)
         for candidate in candidates:

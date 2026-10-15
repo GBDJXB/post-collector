@@ -24,6 +24,7 @@ def read_detail(
         rows = conn.execute(
             "SELECT c.content_id, c.message_id, c.item_type, c.ordinal, c.text_content,"
             " c.original_name, c.first_seen_at, m.sent_at, m.origin_note, m.source_id,"
+            " (SELECT url_normalized FROM link WHERE content_id=c.content_id AND deleted_at IS NULL ORDER BY link_id LIMIT 1) AS url,"
             " s.name AS source_name FROM content_item c"
             " JOIN message m ON m.message_id=c.message_id"
             " JOIN source s ON s.source_id=m.source_id"
@@ -39,6 +40,7 @@ def read_detail(
                 "item_type": row["item_type"],
                 "ordinal": row["ordinal"],
                 "text": row["text_content"] or "",
+                "url": row["url"],
                 "original_name": row["original_name"],
                 "first_seen_at": row["first_seen_at"],
                 "tags": [],

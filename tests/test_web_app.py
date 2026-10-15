@@ -365,6 +365,500 @@ async def test_upload_auth_before_reading(client, web, csrf):
     assert response.status_code == (403 if csrf else 401)
 
 
+@pytest.mark.parametrize("part", [
+    {"kind": "text", "text": None},
+    {"kind": "link", "url": "https://example.org/"},
+    {"kind": "image"},
+])
+def test_malformed_persisted_ordered_parts_are_permanent_failures(part):
+    import json
+    from types import SimpleNamespace
+
+    from pc.services.pipeline import PermanentError, Worker
+
+    fake = SimpleNamespace(_require_authorized=lambda source_id: None,
+                           _refs=lambda message: [], _tombstoned=lambda *args, **kwargs: False)
+    with pytest.raises(PermanentError, match="有序"):
+        Worker._collect(fake, {"ordered_parts": json.dumps([part]), "media_refs": "[]"}, {"source_id": 1})
+
+
+@pytest.mark.asyncio
+async def test_ordered_upload_rejects_mixed_legacy_text_and_duplicate_image_indices(client, web):
+    import json
+
+    await login(client, web)
+    both = await client.post("/api/v1/uploads", files={
+        "parts": (None, json.dumps([{"kind": "text", "text": "一"}])), "text": (None, "旧文本"),
+    })
+    assert both.status_code in {400, 422}, both.text
+    duplicate = await client.post("/api/v1/uploads", files=[
+        ("parts", (None, json.dumps([{"kind": "image", "index": 0}, {"kind": "image", "index": 0}]))),
+        ("images", ("once.png", PNG)),
+    ])
+    assert duplicate.status_code in {400, 422}, duplicate.text
+
+
+@pytest.mark.asyncio
+async def test_ordered_upload_interleaves_text_image_and_link(client, web):
+    import json
+
+    await login(client, web)
+    parts = [
+        {"kind": "text", "text": "第一段"},
+        {"kind": "image", "index": 0},
+        {"kind": "text", "text": "第二段 https://example.org/a"},
+        {"kind": "link", "url": "HTTPS://Example.ORG:443/page#one", "description": "人工说明"},
+    ]
+    response = await client.post("/api/v1/uploads", files=[
+        ("parts", (None, json.dumps(parts))), ("images", ("ordered.png", PNG)),
+    ])
+    assert response.status_code == 200, response.text
+    detail = (await client.get("/api/v1/detail", params={"message_id": response.json()["message_id"]})).json()
+    assert [(part["ordinal"], part["item_type"], part["text"]) for part in detail["parts"]] == [
+        (0, "text", "第一段"), (1, "image", ""),
+        (2, "text", "第二段 https://example.org/a"), (3, "link", "人工说明"),
+    ]
+    assert detail["parts"][3]["url"] == "https://example.org/page#one"
+    link_id = detail["parts"][3]["content_id"]
+    with db.open_db(web["path"]) as conn:
+        db.refresh_search_derived(conn, content_ids=[link_id])
+        link_row = conn.execute("SELECT original_name,search_extra FROM content_item WHERE content_id=?",
+                                (link_id,)).fetchone()
+        assert link_row["original_name"] is None
+        assert "ordered.png" not in link_row["search_extra"]
+        conn.execute("UPDATE content_item SET original_name='ordered.png' WHERE content_id=?", (link_id,))
+        db.refresh_search_derived(conn, content_ids=[link_id])
+        repaired = conn.execute("SELECT original_name,search_extra FROM content_item WHERE content_id=?",
+                                (link_id,)).fetchone()
+        assert repaired["original_name"] is None
+        assert "ordered.png" not in repaired["search_extra"]
+
+
+@pytest.mark.asyncio
+async def test_unified_search_returns_items_and_matching_compositions_once(client, web):
+    import json
+
+    await login(client, web)
+    uploaded = await client.post("/api/v1/uploads", files={
+        "parts": (None, json.dumps([
+            {"kind": "text", "text": "红杉独特词"},
+            {"kind": "text", "text": "红杉独特词 再现"},
+        ])),
+        "create_composition": (None, "true"),
+        "composition_name": (None, "集合名称"),
+        "composition_description": (None, "专属组合说明"),
+    })
+    assert uploaded.status_code == 200, uploaded.text
+    ids = uploaded.json()["content_ids"]
+    found = (await client.get("/api/v1/search", params={"q": "红杉独特词", "result_version": 2})).json()
+    assert found["result_version"] == 2, found
+    assert {hit["content_id"] for hit in found["hits"] if hit["kind"] == "content"} == set(ids)
+    assert all(hit["source_name"] == "manual" for hit in found["hits"] if hit["kind"] == "content")
+    assert [hit["composition_id"] for hit in found["hits"] if hit["kind"] == "composition"] == [uploaded.json()["composition_id"]]
+    only = (await client.get("/api/v1/search", params={"q": "专属组合说明", "result_version": 2, "kind": "composition"})).json()
+    assert [hit["composition_id"] for hit in only["hits"]] == [uploaded.json()["composition_id"]]
+    assert all(hit["kind"] == "composition" for hit in only["hits"])
+    spanning = (await client.get("/api/v1/search", params={
+        "q": "集合名称 再现", "result_version": 2, "kind": "composition",
+    })).json()
+    assert [hit["composition_id"] for hit in spanning["hits"]] == [uploaded.json()["composition_id"]]
+    filtered = (await client.get("/api/v1/search", params={
+        "q": "红杉独特词", "result_version": 2, "kind": "composition",
+        "source": "manual", "item_types": "text", "statuses": "active",
+    })).json()
+    assert [hit["composition_id"] for hit in filtered["hits"]] == [uploaded.json()["composition_id"]]
+    wrong_type = (await client.get("/api/v1/search", params={
+        "q": "红杉独特词", "result_version": 2, "kind": "composition", "item_types": "image",
+    })).json()
+    assert wrong_type["hits"] == []
+    first_page = (await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "红杉独特词", "limit": 1, "sort": "time",
+    })).json()
+    second_page_response = await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "红杉独特词", "limit": 1, "sort": "time",
+        "cursor": first_page["next_cursor"], "page": 2,
+    })
+    assert second_page_response.status_code == 200, second_page_response.text
+    second_page = second_page_response.json()
+    assert (first_page["hits"][0]["kind"], first_page["hits"][0]["entity_id"]) != (
+        second_page["hits"][0]["kind"], second_page["hits"][0]["entity_id"])
+    malformed = await client.get("/api/v1/search", params={
+        "result_version": 2, "cursor": "a", "sort": "time",
+    })
+    assert malformed.status_code == 400, malformed.text
+
+
+@pytest.mark.asyncio
+async def test_unified_keywords_match_across_distinct_visible_members(client, web):
+    import json
+
+    await login(client, web)
+    uploaded = await client.post("/api/v1/uploads", files={
+        "parts": (None, json.dumps([{"kind": "text", "text": "甲成员专用字"},
+                                    {"kind": "text", "text": "乙成员独有字"}])),
+        "create_composition": (None, "true"), "composition_name": (None, "两件资料"),
+    })
+    assert uploaded.status_code == 200, uploaded.text
+    from pc.services import compositions
+
+    with db.open_db(web["path"]) as conn:
+        compositions.write(conn, "create", name="只含第一件", contents=[uploaded.json()["content_ids"][0]])
+    found = await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "甲成员专用字 乙成员独有字",
+    })
+    assert found.status_code == 200, found.text
+    assert [(hit["kind"], hit["composition_id"]) for hit in found.json()["hits"]] == [
+        ("composition", uploaded.json()["composition_id"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unified_composition_filters_require_same_visible_member(client, web):
+    from pc.services import compositions
+
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        other_source = conn.execute(
+            "INSERT INTO source(uuid,name,platform,kind,config) VALUES (?, 'other-source', 'local', 'export', '{}') "
+            "RETURNING source_id", (str(uuid.uuid4()),),
+        ).fetchone()[0]
+        conn.execute("UPDATE message SET source_id=? WHERE message_id=?",
+                     (other_source, web["targets"]["image"]["message_id"]))
+        ident = compositions.write(conn, "create", name="源类型同人", contents=[
+            web["targets"]["text"]["content_id"], web["targets"]["image"]["content_id"],
+        ])["composition_id"]
+    base = {"result_version": 2, "q": "源类型同人", "kind": "composition", "item_types": "image"}
+    mismatch = await client.get("/api/v1/search", params={**base, "source": "manual"})
+    assert mismatch.status_code == 200, mismatch.text
+    assert mismatch.json()["hits"] == []
+    match = await client.get("/api/v1/search", params={**base, "source": "other-source"})
+    assert match.status_code == 200, match.text
+    assert [row["composition_id"] for row in match.json()["hits"]] == [ident]
+
+
+@pytest.mark.asyncio
+async def test_unified_member_match_returns_each_containing_composition_once(client, web):
+    from pc.services import compositions
+
+    await login(client, web)
+    uploaded = await client.post("/api/v1/uploads", files={"text": (None, "同一内容命中多个组合")})
+    assert uploaded.status_code == 200, uploaded.text
+    content_id = uploaded.json()["content_ids"][0]
+    with db.open_db(web["path"]) as conn:
+        first = compositions.write(conn, "create", name="甲组合", contents=[content_id, content_id])["composition_id"]
+        second = compositions.write(conn, "create", name="乙组合", contents=[content_id])["composition_id"]
+    found = await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "同一内容命中多个组合", "kind": "composition",
+    })
+    assert found.status_code == 200, found.text
+    assert sorted(row["composition_id"] for row in found.json()["hits"]) == sorted([first, second])
+
+
+def test_unified_keyword_materializes_fts_once_for_items_and_compositions(web):
+    from pc.services.web_search import run_web_search
+
+    with db.open_db(web["path"]) as conn:
+        statements = []
+        conn.set_trace_callback(statements.append)
+        try:
+            run_web_search(conn, q="蓝发", limit=1)
+        finally:
+            conn.set_trace_callback(None)
+    statement = next(sql for sql in statements if "entities AS" in sql)
+    assert "AS MATERIALIZED" in statement, statement
+    assert "term_0_compositions AS MATERIALIZED" in statement, statement
+    assert "FROM composition_member cm CROSS JOIN content_item c" in statement, statement
+    assert "FROM content_item c INDEXED BY content_item_time_idx" in statement, statement
+    assert statement.count("content_word MATCH") == 1, statement
+
+
+def test_unified_search_limits_each_entity_kind_before_global_merge(web):
+    from pc.services.web_search import run_web_search
+
+    with db.open_db(web["path"]) as conn:
+        statements = []
+        conn.set_trace_callback(statements.append)
+        try:
+            result = run_web_search(conn, limit=1)
+        finally:
+            conn.set_trace_callback(None)
+    statement = next(sql for sql in statements if sql.startswith("WITH entities AS"))
+    assert statement.count(" LIMIT ") >= 3, statement
+    assert len(result["hits"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_unified_mixed_type_filter_matches_heterogeneous_composition(client, web):
+    from pc.services import compositions
+
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        ident = compositions.write(conn, "create", name="文图合一", contents=[
+            web["targets"]["text"]["content_id"], web["targets"]["image"]["content_id"],
+        ])["composition_id"]
+    response = await client.get("/api/v1/search", params={
+        "result_version": 2, "kind": "composition", "q": "文图合一", "item_types": "mixed",
+    })
+    assert response.status_code == 200, response.text
+    assert [entry["composition_id"] for entry in response.json()["hits"]] == [ident]
+
+
+@pytest.mark.asyncio
+async def test_unified_time_search_does_not_lose_composition_after_many_member_hits(client, web):
+    from pc.services import compositions
+
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        message_id = web["targets"]["text"]["message_id"]
+        conn.executemany(
+            "INSERT INTO content_item(uuid,message_id,item_type,ordinal,text_content,text_search,status) "
+            "VALUES (?,?, 'text',?,?,?, 'active')",
+            [(str(uuid.uuid4()), message_id, index + 100, "稀有三字词", "稀有三字词") for index in range(2003)],
+        )
+        last_id = conn.execute("SELECT max(content_id) FROM content_item").fetchone()[0]
+        ident = compositions.write(conn, "create", name="不含关键词的组合", contents=[last_id])["composition_id"]
+    result = await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "稀有三字词", "kind": "composition", "sort": "time",
+    })
+    assert result.status_code == 200, result.text
+    assert [hit["composition_id"] for hit in result.json()["hits"]] == [ident]
+    assert result.json()["incomplete"] is False
+
+
+@pytest.mark.asyncio
+async def test_unified_composition_sent_time_uses_latest_visible_member(client, web):
+    from pc.services import compositions
+
+    await login(client, web)
+    older = web["targets"]["text"]
+    newer = web["targets"]["image"]
+    with db.open_db(web["path"]) as conn:
+        conn.execute("UPDATE message SET sent_at=? WHERE message_id=?", ("2025-01-01T00:00:00.000Z", older["message_id"]))
+        conn.execute("UPDATE message SET sent_at=? WHERE message_id=?", ("2025-02-01T00:00:00.000Z", newer["message_id"]))
+        composition_id = compositions.write(conn, "create", name="可见发送时间", contents=[older["content_id"], newer["content_id"]])["composition_id"]
+    params = {"result_version": 2, "kind": "composition", "q": "可见发送时间", "time_field": "sent",
+              "since": "2025-02-01", "until": "2025-02-01"}
+    response = await client.get("/api/v1/search", params=params)
+    assert response.status_code == 200, response.text
+    assert [(hit["composition_id"], hit["sort_time"]) for hit in response.json()["hits"]] == [
+        (composition_id, "2025-02-01T00:00:00.000Z"),
+    ]
+    with db.open_db(web["path"]) as conn:
+        conn.execute("UPDATE content_item SET status='quarantined' WHERE content_id=?", (newer["content_id"],))
+    hidden = await client.get("/api/v1/search", params=params)
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json()["hits"] == []
+
+
+@pytest.mark.asyncio
+async def test_ordered_link_duplicate_ignores_fragment_but_preserves_positions(client, web):
+    import json
+
+    await login(client, web)
+    async def submit(url):
+        return await client.post("/api/v1/uploads", files={"parts": (None, json.dumps([
+            {"kind": "link", "url": url, "description": "说明"},
+            {"kind": "link", "url": url, "description": "说明"},
+        ]))})
+    first = await submit("HTTPS://Example.org:443/path#one")
+    assert first.status_code == 200, first.text
+    assert len(first.json()["content_ids"]) == 2
+    with db.open_db(web["path"]) as conn:
+        signature = conn.execute("SELECT content_signature FROM post WHERE message_id=?", (first.json()["message_id"],)).fetchone()
+        assert signature is not None and signature[0]
+    again = await submit("https://example.org/path#two")
+    assert again.status_code == 200, again.text
+    assert again.json()["duplicate"] is True
+    assert again.json()["content_ids"] == first.json()["content_ids"]
+
+
+@pytest.mark.asyncio
+async def test_upload_creates_composition_with_independent_tags(client, web):
+    import json
+
+    await login(client, web)
+    parts = [{"kind": "text", "text": "先看文字"}, {"kind": "image", "index": 0},
+             {"kind": "text", "text": "再读后文"},
+             {"kind": "link", "url": "HTTPS://Example.org:443/archive#one", "description": "后续链接"}]
+    response = await client.post("/api/v1/uploads", files=[
+        ("parts", (None, json.dumps(parts))), ("images", ("atomic.png", PNG)),
+        ("create_composition", (None, "true")), ("composition_name", (None, "顺序组合")),
+        ("composition_description", (None, "保留顺序")), ("composition_tags", (None, "仅组合")),
+    ])
+    assert response.status_code == 200, response.text
+    data = response.json()
+    detail = (await client.get(f'/api/v1/compositions/{data["composition_id"]}')).json()
+    assert [member["content_id"] for member in detail["members"]] == data["content_ids"]
+    assert [tag["name"] for tag in detail["tags"]] == ["仅组合"]
+    assert all(not member["tags"] for member in detail["members"])
+    assert detail["members"][3]["url"] == "https://example.org/archive#one"
+    found = await client.get("/api/v1/search", params={
+        "result_version": 2, "q": "顺序组合", "kind": "composition",
+    })
+    assert found.status_code == 200, found.text
+    assert [tag["name"] for tag in found.json()["hits"][0]["tags"]] == ["仅组合"]
+    with db.open_db(web["path"]) as conn:
+        model_id = conn.execute("INSERT INTO model_version(capability,model_name) VALUES ('llm','test') "
+                                "RETURNING model_version_id").fetchone()[0]
+        conn.execute("UPDATE composition_tag_assignment SET source='suggested', confidence=0.8, "
+                     "model_version_id=? WHERE composition_id=?", (model_id, data["composition_id"]))
+    filtered = await client.get("/api/v1/search", params={
+        "result_version": 2, "kind": "composition", "tags": "仅组合",
+    })
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["hits"] == []
+
+
+@pytest.mark.asyncio
+async def test_upload_with_composition_scan_rejects_all_archive_parts(client, web):
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        before = tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition"))
+    gif = b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 29
+    response = await client.post("/api/v1/uploads", files=[
+        ("text", (None, "不应部分保存")),
+        ("images", ("first.gif", gif)),
+        ("images", ("fake.png", b"MZ" + b"bad executable" * 4)),
+        ("create_composition", (None, "true")), ("composition_name", (None, "应回滚")),
+    ])
+    assert response.status_code in {400, 422}, response.text
+    with db.open_db(web["path"]) as conn:
+        assert tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition")) == before
+    assert list((web["data"] / "quarantine").rglob("*"))
+    import hashlib
+    sha = hashlib.sha256(gif).hexdigest()
+    assert not (web["data"] / "media" / sha[:2] / sha[2:4] / sha).exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_with_composition_rolls_back_new_archive_when_tag_invalid(client, web):
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "post", "composition", "tag")}
+    import hashlib
+    gif = b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 33
+    response = await client.post("/api/v1/uploads", files=[
+        ("text", (None, "原子提交不能留下消息")),
+        ("images", ("new.gif", gif)),
+        ("create_composition", (None, "true")),
+        ("composition_name", (None, "新组合")),
+        ("composition_tags", (None, "\u0001非法")),
+    ])
+    assert response.status_code in {400, 422}, response.text
+    with db.open_db(web["path"]) as conn:
+        assert {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in before} == before
+    sha = hashlib.sha256(gif).hexdigest()
+    assert not (web["data"] / "media" / sha[:2] / sha[2:4] / sha).exists()
+
+
+@pytest.mark.asyncio
+async def test_atomic_failure_preserves_preexisting_shared_media(client, web):
+    import hashlib
+
+    await login(client, web)
+    digest = hashlib.sha256(PNG).hexdigest()
+    with db.open_db(web["path"]) as conn:
+        old = conn.execute("SELECT media_id FROM media WHERE sha256=?", (digest,)).fetchone()
+        assert old is not None
+        before = tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                       for table in ("media", "message", "content_item", "composition", "tag"))
+    response = await client.post("/api/v1/uploads", files=[
+        ("text", (None, "含共享图片的失败组合")), ("images", ("already.png", PNG)),
+        ("create_composition", (None, "true")), ("composition_name", (None, "失败组合")),
+        ("composition_tags", (None, "\u0001非法")),
+    ])
+    assert response.status_code in {400, 422}, response.text
+    with db.open_db(web["path"]) as conn:
+        assert tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                     for table in ("media", "message", "content_item", "composition", "tag")) == before
+        assert conn.execute("SELECT media_id FROM media WHERE sha256=?", (digest,)).fetchone()[0] == old[0]
+    assert (web["data"] / "media" / digest[:2] / digest[2:4] / digest).read_bytes() == PNG
+
+
+@pytest.mark.asyncio
+async def test_atomic_composition_over_existing_duplicate_message(client, web):
+    await login(client, web)
+    first = await client.post("/api/v1/uploads", files={"text": (None, "复用旧消息的组合")})
+    assert first.status_code == 200, first.text
+    with db.open_db(web["path"]) as conn:
+        before = conn.execute("SELECT count(*) FROM message").fetchone()[0]
+    response = await client.post("/api/v1/uploads", files={
+        "text": (None, "复用旧消息的组合"), "create_composition": (None, "true"),
+        "composition_name": (None, "只新增组合"),
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["duplicate"] is True
+    assert response.json()["message_id"] == first.json()["message_id"]
+    assert response.json()["content_ids"] == first.json()["content_ids"]
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT count(*) FROM message").fetchone()[0] == before
+        assert conn.execute("SELECT count(*) FROM composition WHERE composition_id=?",
+                            (response.json()["composition_id"],)).fetchone()[0] == 1
+        composition_count = conn.execute("SELECT count(*) FROM composition").fetchone()[0]
+    rejected = await client.post("/api/v1/uploads", files={
+        "text": (None, "复用旧消息的组合"), "create_composition": (None, "true"),
+        "composition_name": (None, "失败不能删旧消息"), "composition_tags": (None, "\u0001非法"),
+    })
+    assert rejected.status_code in {400, 422}, rejected.text
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT count(*) FROM message").fetchone()[0] == before
+        assert conn.execute("SELECT count(*) FROM composition").fetchone()[0] == composition_count
+        assert conn.execute("SELECT count(*) FROM content_item WHERE message_id=?",
+                            (first.json()["message_id"],)).fetchone()[0] == len(first.json()["content_ids"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordered", [False, True])
+async def test_ordinary_duplicate_after_atomic_upload_reports_success(client, web, ordered):
+    import json
+
+    await login(client, web)
+    payload = {"parts": (None, json.dumps([{"kind": "text", "text": "原子上传后重复"}]))} if ordered else {
+        "text": (None, "原子上传后重复"),
+    }
+    first = await client.post("/api/v1/uploads", files={
+        **payload, "create_composition": (None, "true"), "composition_name": (None, "原子组合"),
+    })
+    assert first.status_code == 200, first.text
+    saved = first.json()
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT 1 FROM job WHERE target_type='message' AND target_id=?",
+                            (saved["message_id"],)).fetchone() is None
+    for _ in range(2):
+        again = await client.post("/api/v1/uploads", files=payload)
+        assert again.status_code == 200, again.text
+        result = again.json()
+        assert result["duplicate"] is True
+        assert result["message_id"] == saved["message_id"]
+        assert result["content_ids"] == saved["content_ids"]
+        assert result["status"] == result["job_status"] == "succeeded"
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT count(*) FROM composition WHERE composition_id=?",
+                            (saved["composition_id"],)).fetchone()[0] == 1
+        # 没有任务且没有成功归档证据时，不能仅凭现存内容误报成功。
+        conn.execute("DELETE FROM audit_log WHERE action='upload.submit' AND target_type='message' AND target_id=?",
+                     (str(saved["message_id"]),))
+    unknown = await client.post("/api/v1/uploads", files=payload)
+    assert unknown.json()["status"] == unknown.json()["job_status"] == "dead"
+
+
+@pytest.mark.asyncio
+async def test_atomic_upload_permanent_worker_failure_returns_client_error(client, web, monkeypatch):
+    from pc.services.pipeline import PermanentError, Worker
+
+    await login(client, web)
+    monkeypatch.setattr(Worker, "_persist", lambda *args, **kwargs: (_ for _ in ()).throw(PermanentError("墓地拒绝")))
+    with db.open_db(web["path"]) as conn:
+        before = conn.execute("SELECT count(*) FROM message").fetchone()[0]
+    response = await client.post("/api/v1/uploads", files={
+        "text": (None, "永久拒绝的样本"), "create_composition": (None, "true"),
+        "composition_name": (None, "失败组合"),
+    })
+    assert response.status_code in {400, 422}, response.text
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT count(*) FROM message").fetchone()[0] == before
+
+
 @pytest.mark.asyncio
 async def test_upload_text_and_duplicate(client, web):
     await login(client, web)

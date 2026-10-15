@@ -120,14 +120,15 @@ def _ingest_one(
     trust_value: int | None,
     message: SourceMessage,
     origin_note: str | None = None,
+    enqueue: bool = True,
 ) -> IngestReport:
     payload_hash = raw_payload_hash(message.raw_payload)
     row = conn.execute(
         "INSERT INTO message ("
         "  uuid, source_id, platform_msg_id, platform_thread_id, sender_display_name,"
         "  sender_is_bot, sent_at, message_type, text_raw, reply_to_platform_id, permalink,"
-        "  forward_chain, media_refs, raw_payload_hash, source_trust, origin_note"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "  forward_chain, media_refs, raw_payload_hash, source_trust, origin_note, ordered_parts"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (source_id, platform_msg_id) DO NOTHING "
         "RETURNING message_id",
         (
@@ -147,6 +148,7 @@ def _ingest_one(
             payload_hash,
             trust_value,
             origin_note,
+            json.dumps(list(message.ordered_parts), ensure_ascii=False),
         ),
     ).fetchone()
 
@@ -155,6 +157,8 @@ def _ingest_one(
         return IngestReport(seen=1, duplicates=1)
 
     message_id = int(row[0])
+    if not enqueue:
+        return IngestReport(seen=1, inserted=1, message_ids=(message_id,))
     enqueued = conn.execute(
         "INSERT INTO job (job_type, target_type, target_id, status, priority, attempts,"
         " max_attempts, run_after, idem_key) "

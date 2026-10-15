@@ -47,6 +47,7 @@ from pc.domain import (
     search_tokens,
 )
 from pc.services.ingest import JOB_TYPE_PROCESS
+from pc.services.links import normalize_url
 from pc.services.sources import ensure_default_backend, load_authorizations
 
 #: 已被抢占但超过这么久没动静的任务，视为进程崩溃遗留，启动时重置为排队
@@ -105,6 +106,7 @@ class Collected:
     text_normalized: str | None = None
     text_hash: str | None = None
     blobs: tuple[MediaBlob, ...] = ()
+    ordered_parts: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,7 +382,7 @@ class Worker:
         row = self._conn.execute(f"SELECT * FROM {table} WHERE {column} = ?", (key,)).fetchone()
         return dict(row) if row is not None else None
 
-    def _collect(self, message: Mapping[str, Any], source: Mapping[str, Any]) -> Collected:
+    def _collect(self, message: Mapping[str, Any], source: Mapping[str, Any], *, defer_media: bool = False) -> Collected:
         """事务之外的全部慢活：取字节、扫描、哈希、落盘。
 
         落盘也在这里（不是写入阶段）：字节进对象存储与数据库行是两件事，先落盘再写行，
@@ -388,7 +390,13 @@ class Worker:
         悬空引用。
         """
         self._require_authorized(int(source["source_id"]))
-        text_raw = message.get("text_raw") or ""
+        try:
+            ordered = json.loads(message.get("ordered_parts") or "[]")
+        except json.JSONDecodeError as exc:
+            raise PermanentError("有序信封损坏") from exc
+        if not isinstance(ordered, list):
+            raise PermanentError("有序信封须为数组")
+        text_raw = (message.get("text_raw") or "") if not ordered else ""
         text_normalized = normalize_text(text_raw) if text_raw.strip() else ""
         text_hash = (
             hashlib.sha256(text_normalized.encode("utf-8")).hexdigest() if text_normalized else None
@@ -397,6 +405,30 @@ class Worker:
         refs = self._refs(message)
         if text_hash and self._tombstoned(text_hash, alg="content_hash"):
             raise PermanentError("文本命中哈希墓地，拒绝重新导入")
+        used_refs: set[str] = set()
+        for part in ordered:
+            if not isinstance(part, dict) or part.get("kind") not in {"text", "image", "link"}:
+                raise PermanentError("有序信封条目无效")
+            if part["kind"] == "text":
+                if not isinstance(part.get("text"), str):
+                    raise PermanentError("有序文本须为字符串")
+                value = normalize_text(part["text"])
+                if not value or self._tombstoned(hashlib.sha256(value.encode()).hexdigest(), alg="content_hash"):
+                    raise PermanentError("有序文本为空或命中哈希墓地")
+            if part["kind"] == "image":
+                ref = part.get("ref")
+                if not isinstance(ref, str) or ref not in refs or ref in used_refs:
+                    raise PermanentError("有序图片引用缺失或重复")
+                used_refs.add(ref)
+            if part["kind"] == "link":
+                if not isinstance(part.get("description"), str):
+                    raise PermanentError("有序链接说明无效")
+                try:
+                    normalize_url(part["url"])
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise PermanentError("有序链接无效") from exc
+        if ordered and len(used_refs) != len(refs):
+            raise PermanentError("有序信封未包含所有图片")
         blobs: list[MediaBlob] = []
         if refs:
             connector = connector_for(
@@ -415,16 +447,18 @@ class Worker:
                     "但这条消息带媒体引用"
                 )
             for ref in refs:
-                blobs.append(self._collect_one(connector, ref))
+                blobs.append(self._collect_one(connector, ref, defer_media=True) if defer_media
+                             else self._collect_one(connector, ref))
 
         return Collected(
             text_raw=text_raw or None,
             text_normalized=text_normalized or None,
             text_hash=text_hash,
             blobs=tuple(blobs),
+            ordered_parts=tuple(ordered),
         )
 
-    def _collect_one(self, connector: Any, ref: str) -> MediaBlob:
+    def _collect_one(self, connector: Any, ref: str, *, defer_media: bool = False) -> MediaBlob:
         name = _ref_name(ref)
         declared = declared_mime_for_name(name)
         data = connector.fetch_media(ref)
@@ -444,7 +478,7 @@ class Worker:
             )
         # 扫描不通过的字节进隔离区（物理分离），不通过的也照存——丢掉就没法复核了
         target = self._quarantine if not verdict.passed else self._storage
-        key = target.put(data)
+        key = ObjectKey(digest) if defer_media and verdict.passed else target.put(data)
         return MediaBlob(
             ref=ref,
             key=key,
@@ -484,7 +518,7 @@ class Worker:
         return row is not None
 
     def _persist(
-        self, message: Mapping[str, Any], source: Mapping[str, Any], collected: Collected
+        self, message: Mapping[str, Any], source: Mapping[str, Any], collected: Collected, *, nested: bool = False
     ) -> tuple[str, str]:
         """一个短事务写下全部结果（DESIGN §2.3 的单写者纪律）。"""
         message_id = int(message["message_id"])
@@ -512,7 +546,7 @@ class Worker:
                 self._quarantine.root if blob.quarantined else self._storage.root,
             )
 
-        with transaction(self._conn):
+        with transaction(self._conn, nested=nested):
             self._require_authorized(int(source["source_id"]))
             if collected.text_hash and self._tombstoned(collected.text_hash, alg="content_hash"):
                 raise PermanentError("文本命中哈希墓地，拒绝重新导入")
@@ -528,22 +562,43 @@ class Worker:
 
             ordinal = 0
             part_types: list[str] = []
-            if collected.text_raw is not None and collected.text_normalized is not None:
-                self._insert_text_item(
-                    message_id, collected, shared_parts, origin_note, sent_at, ordinal, source
-                )
-                part_types.append("text")
-                ordinal += 1
-
-            for blob in collected.blobs:
-                _, is_quarantined = self._insert_media_item(
-                    message_id, blob, shared_parts, origin_note, sent_at, ordinal, source
-                )
-                part_types.append(item_type_for(blob.mime_detected))
-                ordinal += 1
-                linked += 1
-                if is_quarantined:
-                    quarantined += 1
+            if collected.ordered_parts:
+                by_ref = {blob.ref: blob for blob in collected.blobs}
+                for part in collected.ordered_parts:
+                    kind = part["kind"]
+                    if kind == "text":
+                        raw = part["text"]
+                        normalized = normalize_text(raw)
+                        digest = hashlib.sha256(normalized.encode()).hexdigest()
+                        if self._tombstoned(digest, alg="content_hash"):
+                            raise PermanentError("有序文本命中哈希墓地")
+                        self._insert_text_item(message_id, Collected(raw, normalized, digest), shared_parts, origin_note, sent_at, ordinal, source)
+                    elif kind == "link":
+                        self._insert_link_item(message_id, part, shared_parts, origin_note, sent_at, ordinal)
+                    else:
+                        blob = by_ref.get(part.get("ref"))
+                        if blob is None:
+                            raise PermanentError("有序图片缺少可用媒体引用")
+                        _, is_quarantined = self._insert_media_item(message_id, blob, shared_parts, origin_note, sent_at, ordinal, source)
+                        linked += 1
+                        quarantined += int(is_quarantined)
+                    part_types.append(item_type_for(blob.mime_detected) if kind == "image" else kind)
+                    ordinal += 1
+            else:
+                if collected.text_raw is not None and collected.text_normalized is not None:
+                    self._insert_text_item(
+                        message_id, collected, shared_parts, origin_note, sent_at, ordinal, source
+                    )
+                    part_types.append("text")
+                    ordinal += 1
+                for blob in collected.blobs:
+                    _, is_quarantined = self._insert_media_item(
+                        message_id, blob, shared_parts, origin_note, sent_at, ordinal, source
+                    )
+                    part_types.append(item_type_for(blob.mime_detected))
+                    ordinal += 1
+                    linked += 1
+                    quarantined += int(is_quarantined)
 
             # 帖行是检索的结果单位（migrations/0007 的文件头），与内容项同一个事务写：
             # 两者不一致时，检索会给出"有帖无部件"或"有部件无帖"的错页。
@@ -667,6 +722,34 @@ class Worker:
                 ),
             ).fetchone()[0]
         )
+
+    def _insert_link_item(self, message_id, part, shared_parts, origin_note, sent_at, ordinal):
+        """独立链接保留人工说明，URL 索引与规范键不触发任何网络访问。"""
+        url = normalize_url(part["url"])
+        description = part["description"]
+        normalized = normalize_text(description)
+        canonical = url.split("#", 1)[0]
+        digest = hashlib.sha256(json.dumps([canonical, normalized], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        if self._tombstoned(digest, alg="content_hash"):
+            raise PermanentError("链接命中哈希墓地")
+        extra = search_extra_value(*shared_parts, "link", ITEM_TYPE_LABELS["link"], canonical, origin_note)
+        content_id = self._conn.execute(
+            "INSERT INTO content_item(uuid,message_id,item_type,ordinal,text_content,text_search,"
+            "search_extra,content_hash,char_count,byte_size,sent_at,first_seen_at) "
+            "VALUES (?,?,'link',?,?,?,?,?,?,?,?,?) RETURNING content_id",
+            (str(uuid.uuid4()), message_id, ordinal, description,
+             search_tokens(description, None, None, extra), extra, digest,
+             len(normalized), len(description.encode()), sent_at, now_iso()),
+        ).fetchone()[0]
+        scheme, authority_path = url.split("://", 1)
+        authority = authority_path.split("/", 1)[0]
+        domain = authority.rsplit(":", 1)[0] if not authority.startswith("[") and ":" in authority else authority
+        self._conn.execute(
+            "INSERT INTO link(content_id,url_raw,url_normalized,url_canonical,domain,scheme,description) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (content_id, part["url"], url, canonical, domain, scheme, description),
+        )
+        return int(content_id)
 
     def _insert_media_item(
         self,
