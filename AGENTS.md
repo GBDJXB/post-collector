@@ -85,7 +85,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 - roots 和媒体引用保存绝对路径，使用 abspath 保留链接证据；旧相对路径明确报错。读取经 `safe_files.open_scoped` 限定 roots、拒绝链接/junction/reparse、验证实际句柄。文件根仅发现该文件及同目录同名文本侧车；媒体先检查大小，再读取上限 + 1 字节。
 - 扫描 fail closed：未通过字节进入独立隔离后端并建立复核。media 后端由 storage_backend_id/quarantine_key 判断；scan_status 是字节属性，本次扫描判定落在内容项上。
 - source.config 持久化来源路径，dry-run 保持只读。空批次且游标前进时继续；非空且不前进报错，空且不前进结束。
-- normalize_text 为幂等 NFKC 与空白折叠；文本墓地用 content_hash，媒体墓地用 sha256，任一有效命中阻止整帖落库。media.sha256 唯一，content_media 为多对多。
+- normalize_text 为幂等 NFKC 与空白折叠；旧 hash_tombstone 表保留但不参与导入拒绝。相同内容可以重新导入，来源消息身份保持幂等；media.sha256 唯一，content_media 为多对多。
 - worker 抢占时 attempts +1，完成经 `_finalize` 落账。超时 running 尚有次数则 queued，耗尽则 dead；写原因、finished_at、审计并清锁。确定性失败死信，偶发异常退避。
 - message.origin_note 是调用方注解，raw_payload 保存原载荷；search_extra 与文本索引在落库和重算时保持同值。
 

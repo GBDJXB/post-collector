@@ -5,8 +5,8 @@
 
 * **事务之外不写、事务之内不做慢活**：下载、扫描、哈希、落盘全在事务外，最后用一个
   短事务把所有结果写下去。SQLite 是单写者，把磁盘读进事务里等于让所有写者排队。
-* **确定性失败进死信，不重试**：文件不存在、类型不放行、命中哈希墓地都是"重试一次
-  也不会变"的错误（DESIGN §2.3 的重试策略）。退避重试只留给真正的偶发错误。
+* **确定性失败进死信，不重试**：文件不存在、类型不放行等"重试一次也不会变"的
+  错误按 DESIGN §2.3 的重试策略处理。退避重试只留给真正的偶发错误。
 * **幂等护栏**：处理前先看这条消息有没有内容项，有就直接成功返回。崩溃恢复把
   ``running`` 重置为 ``queued`` 之后，重新执行不会产生第二份内容。
 
@@ -403,8 +403,6 @@ class Worker:
         )
 
         refs = self._refs(message)
-        if text_hash and self._tombstoned(text_hash, alg="content_hash"):
-            raise PermanentError("文本命中哈希墓地，拒绝重新导入")
         used_refs: set[str] = set()
         for part in ordered:
             if not isinstance(part, dict) or part.get("kind") not in {"text", "image", "link"}:
@@ -413,8 +411,8 @@ class Worker:
                 if not isinstance(part.get("text"), str):
                     raise PermanentError("有序文本须为字符串")
                 value = normalize_text(part["text"])
-                if not value or self._tombstoned(hashlib.sha256(value.encode()).hexdigest(), alg="content_hash"):
-                    raise PermanentError("有序文本为空或命中哈希墓地")
+                if not value:
+                    raise PermanentError("有序文本为空")
             if part["kind"] == "image":
                 ref = part.get("ref")
                 if not isinstance(ref, str) or ref not in refs or ref in used_refs:
@@ -472,10 +470,6 @@ class Worker:
             }:
                 verdict = replace(verdict, passed=False, reasons=(*verdict.reasons, "浏览器上传仅支持指定图片格式"))
         digest = hashlib.sha256(data).hexdigest()
-        if self._tombstoned(digest):
-            raise PermanentError(
-                f"该内容曾被硬删（哈希墓地里已有 {digest[:12]}…），按设计拒绝重新导入：{ref}"
-            )
         # 扫描不通过的字节进隔离区（物理分离），不通过的也照存——丢掉就没法复核了
         target = self._quarantine if not verdict.passed else self._storage
         key = ObjectKey(digest) if defer_media and verdict.passed else target.put(data)
@@ -509,14 +503,6 @@ class Worker:
         if source is None or not local_source_authorized(source, load_authorizations(self._conn, source_id), now_iso()):
             raise PermanentError("来源停用、已删除或授权失效，拒绝处理")
 
-    def _tombstoned(self, digest: str, *, alg: str = "sha256") -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM hash_tombstone WHERE hash = ? AND alg = ? "
-            "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
-            (digest, alg, now_iso()),
-        ).fetchone()
-        return row is not None
-
     def _persist(
         self, message: Mapping[str, Any], source: Mapping[str, Any], collected: Collected, *, nested: bool = False
     ) -> tuple[str, str]:
@@ -548,10 +534,6 @@ class Worker:
 
         with transaction(self._conn, nested=nested):
             self._require_authorized(int(source["source_id"]))
-            if collected.text_hash and self._tombstoned(collected.text_hash, alg="content_hash"):
-                raise PermanentError("文本命中哈希墓地，拒绝重新导入")
-            if any(self._tombstoned(blob.sha256) for blob in collected.blobs):
-                raise PermanentError("媒体命中哈希墓地，拒绝重新导入")
             existing = self._conn.execute(
                 "SELECT count(*) FROM content_item WHERE message_id = ? AND deleted_at IS NULL",
                 (message_id,),
@@ -570,8 +552,6 @@ class Worker:
                         raw = part["text"]
                         normalized = normalize_text(raw)
                         digest = hashlib.sha256(normalized.encode()).hexdigest()
-                        if self._tombstoned(digest, alg="content_hash"):
-                            raise PermanentError("有序文本命中哈希墓地")
                         self._insert_text_item(message_id, Collected(raw, normalized, digest), shared_parts, origin_note, sent_at, ordinal, source)
                     elif kind == "link":
                         self._insert_link_item(message_id, part, shared_parts, origin_note, sent_at, ordinal)
@@ -730,8 +710,6 @@ class Worker:
         normalized = normalize_text(description)
         canonical = url.split("#", 1)[0]
         digest = hashlib.sha256(json.dumps([canonical, normalized], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-        if self._tombstoned(digest, alg="content_hash"):
-            raise PermanentError("链接命中哈希墓地")
         extra = search_extra_value(*shared_parts, "link", ITEM_TYPE_LABELS["link"], canonical, origin_note)
         content_id = self._conn.execute(
             "INSERT INTO content_item(uuid,message_id,item_type,ordinal,text_content,text_search,"

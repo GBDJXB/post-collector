@@ -557,10 +557,10 @@ class TestPermanentFailures:
         assert row["status"] == "dead"
         assert "不存在" in row["dead_reason"]
 
-    def test_tombstoned_content_is_refused_and_nothing_is_stored(
+    def test_existing_media_tombstone_does_not_block_reimport_or_media_sharing(
         self, env: SimpleNamespace
     ) -> None:
-        """硬删之后哈希墓地要能拦住重复导入，而且不该再把字节写回盘上。"""
+        """旧墓地记录不阻止不同消息各自归档同一张图片。"""
         source = _source(env.conn, env.tmp)
         ref = _write(env.tmp / "cat.jpg", JPEG)
         digest = hashlib.sha256(JPEG).hexdigest()
@@ -568,11 +568,17 @@ class TestPermanentFailures:
             "INSERT INTO hash_tombstone (hash, alg, deleted_at) VALUES (?, 'sha256', ?)",
             (digest, db.now_iso()),
         )
-        _, job_id = _seed(env.conn, source_id=source["source_id"], refs=(ref,))
-        assert env.worker.run_once().dead == 1
-        assert "哈希墓地" in _job(env.conn, job_id)["dead_reason"]
-        assert env.conn.execute("SELECT count(*) FROM media").fetchone()[0] == 0
-        assert not env.media.exists() or not any(env.media.rglob("*.*"))
+        _seed(env.conn, source_id=source["source_id"], refs=(ref,))
+        assert env.worker.run_once().succeeded == 1
+        _seed(env.conn, source_id=source["source_id"], refs=(ref,), msg_id="m2")
+        assert env.worker.run_once().succeeded == 1
+        assert env.conn.execute("SELECT count(*) FROM content_item").fetchone()[0] == 2
+        assert env.conn.execute("SELECT count(*) FROM content_media").fetchone()[0] == 2
+        media = env.conn.execute("SELECT sha256,object_key FROM media").fetchall()
+        assert len(media) == 1
+        assert media[0]["sha256"] == digest
+        assert (env.media / media[0]["object_key"]).read_bytes() == JPEG
+        assert env.conn.execute("SELECT count(*) FROM hash_tombstone").fetchone()[0] == 1
 
     def test_expired_tombstone_does_not_block(self, env: SimpleNamespace) -> None:
         source = _source(env.conn, env.tmp)

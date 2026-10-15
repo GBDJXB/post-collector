@@ -377,7 +377,7 @@ def test_malformed_persisted_ordered_parts_are_permanent_failures(part):
     from pc.services.pipeline import PermanentError, Worker
 
     fake = SimpleNamespace(_require_authorized=lambda source_id: None,
-                           _refs=lambda message: [], _tombstoned=lambda *args, **kwargs: False)
+                           _refs=lambda message: [])
     with pytest.raises(PermanentError, match="有序"):
         Worker._collect(fake, {"ordered_parts": json.dumps([part]), "media_refs": "[]"}, {"source_id": 1})
 
@@ -432,6 +432,47 @@ async def test_ordered_upload_interleaves_text_image_and_link(client, web):
                                 (link_id,)).fetchone()
         assert repaired["original_name"] is None
         assert "ordered.png" not in repaired["search_extra"]
+
+
+@pytest.mark.parametrize("kind", ["text", "link"])
+@pytest.mark.parametrize("create_composition", [False, True])
+@pytest.mark.asyncio
+async def test_ordered_upload_ignores_existing_content_tombstone(client, web, kind, create_composition):
+    import hashlib
+    import json
+
+    await login(client, web)
+    if kind == "text":
+        part = {"kind": "text", "text": "旧墓地正文"}
+        digest = hashlib.sha256("旧墓地正文".encode()).hexdigest()
+    else:
+        part = {"kind": "link", "url": "https://example.org/archive#one", "description": "旧墓地说明"}
+        digest = hashlib.sha256(json.dumps(
+            ["https://example.org/archive", "旧墓地说明"], ensure_ascii=False, separators=(",", ":")
+        ).encode()).hexdigest()
+    with db.open_db(web["path"]) as conn:
+        conn.execute(
+            "INSERT INTO hash_tombstone(hash,alg,deleted_at) VALUES (?,'content_hash',?)",
+            (digest, db.now_iso()),
+        )
+    fields = [("parts", (None, json.dumps([part])))]
+    if create_composition:
+        fields.extend([
+            ("create_composition", (None, "true")),
+            ("composition_name", (None, "重导入组合")),
+        ])
+    response = await client.post("/api/v1/uploads", files=fields)
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["status"] == "succeeded"
+    detail = (await client.get("/api/v1/detail", params={"message_id": saved["message_id"]})).json()
+    assert len(detail["parts"]) == 1
+    assert detail["parts"][0]["item_type"] == kind
+    assert detail["parts"][0]["text"] == part.get("text", part.get("description"))
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT count(*) FROM hash_tombstone WHERE hash=?", (digest,)).fetchone()[0] == 1
+        if create_composition:
+            assert conn.execute("SELECT count(*) FROM composition WHERE composition_id=?", (saved["composition_id"],)).fetchone()[0] == 1
 
 
 @pytest.mark.asyncio
@@ -847,7 +888,7 @@ async def test_atomic_upload_permanent_worker_failure_returns_client_error(clien
     from pc.services.pipeline import PermanentError, Worker
 
     await login(client, web)
-    monkeypatch.setattr(Worker, "_persist", lambda *args, **kwargs: (_ for _ in ()).throw(PermanentError("墓地拒绝")))
+    monkeypatch.setattr(Worker, "_persist", lambda *args, **kwargs: (_ for _ in ()).throw(PermanentError("归档数据无效")))
     with db.open_db(web["path"]) as conn:
         before = conn.execute("SELECT count(*) FROM message").fetchone()[0]
     response = await client.post("/api/v1/uploads", files={

@@ -90,7 +90,7 @@ def test_authorization_changed_during_collection_is_rechecked(setup: Any, monkey
 
 @pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_text_tombstone_blocks_whole_message(setup: Any, expired: bool, mixed: bool) -> None:
+def test_old_text_tombstone_does_not_block_message(setup: Any, expired: bool, mixed: bool) -> None:
     conn, _source, worker, root = setup
     digest = hashlib.sha256(normalize_text("caption").encode()).hexdigest()
     conn.execute(
@@ -101,11 +101,11 @@ def test_text_tombstone_blocks_whole_message(setup: Any, expired: bool, mixed: b
     image.write_bytes(b"\xff\xd8\xff" + b"x" * 32)
     enqueue(setup, refs=(str(image),) if mixed else ())
     report = worker.run_once()
-    assert report.succeeded == int(expired)
-    assert report.dead == int(not expired)
-    assert conn.execute("SELECT count(*) FROM content_media").fetchone()[0] == int(
-        expired and mixed
-    )
+    assert report.succeeded == 1
+    assert report.dead == 0
+    assert conn.execute("SELECT count(*) FROM content_item").fetchone()[0] == (2 if mixed else 1)
+    assert conn.execute("SELECT count(*) FROM content_media").fetchone()[0] == int(mixed)
+    assert conn.execute("SELECT count(*) FROM hash_tombstone").fetchone()[0] == 1
 
 
 def test_last_attempt_crash_recovery_is_terminal_and_idempotent(setup: Any) -> None:
