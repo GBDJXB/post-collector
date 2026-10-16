@@ -303,6 +303,7 @@ test("统一检索同页展示内容项和组合并可筛选查看顺序", async
   expect(screen.getByText("正文")).toBeTruthy();
   expect(screen.getByRole("columnheader", { name: "结果 ID" })).toBeTruthy();
   expect(screen.queryByRole("option", { name: "结果中勾选的消息" })).toBeNull();
+  expect(screen.getByRole("link", { name: "管理组合 12" }).getAttribute("href")).toBe("/compositions/12");
   await user.click(screen.getByRole("button", { name: "查看组合 12" }));
   await screen.findByText("先读");
   expect(Array.from(document.querySelectorAll("#parts article")).map(item => item.textContent)).toEqual(["内容项 7 (text) 先读", "内容项 8 (text) 后读"]);
@@ -634,4 +635,175 @@ test("关闭模型总闸提交明确关闭并清空页面授权", async () => {
 test("拒绝浏览器无法精确表示的 ID", () => {
   expect(() => safeId("9007199254740993")).toThrow();
   expect(safeId("42")).toBe(42);
+});
+
+function stubComposition(initialMembers) {
+  const original = globalThis.fetch;
+  const state = { composition_id: 12, name: "已有组合", description: "旧说明", updated_at: "revision-1", tags: [{ name: "旧标签", namespace: "general" }], members: initialMembers, deleted: false };
+  let revision = 1;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions/12") && options?.method === "GET") {
+      calls.push({ url, options });
+      return { ok: !state.deleted, status: state.deleted ? 400 : 200, json: async () => state.deleted ? { detail: "组合不存在或已删除" } : { ...state, members: [...state.members], tags: [...state.tags] } };
+    }
+    if (url.startsWith("/api/v1/compositions/12/") && options?.method === "POST") {
+      calls.push({ url, options });
+      const body = JSON.parse(options.body);
+      if (url.endsWith("/members/remove")) state.members.splice(body.position, 1);
+      if (url.endsWith("/members/move")) state.members.splice(body.to_position, 0, state.members.splice(body.position, 1)[0]);
+      if (url.endsWith("/members/add")) state.members.push({ content_id: body.content_id, available: true, item_type: "text", text: "新成员", media: [] });
+      if (url.endsWith("/update")) { state.name = body.name; state.description = body.description; }
+      if (url.endsWith("/tags/add")) state.tags.push({ name: body.names[0], namespace: "general" });
+      if (url.endsWith("/tags/remove")) state.tags = state.tags.filter(tag => !body.names.includes(tag.name));
+      if (url.endsWith("/delete")) state.deleted = true;
+      state.members.forEach((member, position) => { member.position = position; });
+      state.updated_at = `revision-${++revision}`;
+      return { ok: true, status: 200, json: async () => ({ result_version: 1, composition_id: 12 }) };
+    }
+    if (url.includes("/search?sort=time&limit=40&page=1")) return { ok: true, status: 200, json: async () => ({ hits: [{ message_id: 3, parts: [{ content_id: 8, available: true, item_type: "text", text: "新成员", media: { items: [] } }] }], page: 1, has_more: false }) };
+    return original(url, options);
+  }));
+  return state;
+}
+
+test("单组合直达页仅按选中位置移除重复成员并保留隐藏位置", async () => {
+  stubComposition([
+    { position: 0, content_id: 7, available: true, item_type: "text", text: "旧正文", media: [] },
+    { position: 1, available: false },
+    { position: 2, content_id: 7, available: true, item_type: "text", text: "旧正文", media: [] },
+  ]);
+  const user = await open("/compositions/12");
+  expect(await screen.findByRole("heading", { name: "管理组合 12" })).toBeTruthy();
+  expect(screen.getByText("位置 2：不可用")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "移除位置 3" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "移除位置 3" })).toBeNull());
+  const removed = calls.find(call => call.url.endsWith("/compositions/12/members/remove"));
+  expect(JSON.parse(removed.options.body)).toEqual({ position: 2, force_empty: false, expected_updated_at: "revision-1" });
+  expect(screen.getByText("位置 2：不可用")).toBeTruthy();
+  expect(screen.queryByText("内容项 7（text）") !== null).toBe(true);
+});
+
+test("最后成员需要二次明确确认才强制留空并可重新加入", async () => {
+  stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "旧正文", media: [] }]);
+  const user = await open("/compositions/12");
+  await screen.findByRole("heading", { name: "管理组合 12" });
+  await user.click(screen.getByRole("button", { name: "移除位置 1" }));
+  expect(calls.some(call => call.url.endsWith("/members/remove"))).toBe(false);
+  await user.click(screen.getByRole("button", { name: "确认强制移除最后成员" }));
+  await screen.findByText("这个组合目前没有成员。");
+  const removed = calls.find(call => call.url.endsWith("/members/remove"));
+  expect(JSON.parse(removed.options.body)).toEqual({ position: 0, force_empty: true, expected_updated_at: "revision-1" });
+  await user.click(screen.getByRole("button", { name: "检索可加入内容" }));
+  await user.click(await screen.findByRole("button", { name: "加入内容项 8" }));
+  await waitFor(() => expect(calls.some(call => call.url.endsWith("/members/add"))).toBe(true));
+  expect(JSON.parse(calls.find(call => call.url.endsWith("/members/add")).options.body)).toEqual({ content_id: 8, expected_updated_at: "revision-2" });
+});
+
+test("单组合页面可以排序、修改属性、自身标签与软删", async () => {
+  stubComposition([
+    { position: 0, content_id: 7, available: true, item_type: "text", text: "第一段", media: [] },
+    { position: 1, content_id: 8, available: true, item_type: "text", text: "第二段", media: [] },
+  ]);
+  const user = await open("/compositions/12");
+  await screen.findByRole("heading", { name: "管理组合 12" });
+  await user.click(screen.getByRole("button", { name: "上移位置 2" }));
+  await waitFor(() => expect(JSON.parse(calls.find(call => call.url.endsWith("/members/move")).options.body)).toEqual({ position: 1, to_position: 0, expected_updated_at: "revision-1" }));
+  await user.clear(screen.getByLabelText("组合名称"));
+  await user.type(screen.getByLabelText("组合名称"), "新名称");
+  await user.clear(screen.getByLabelText("组合说明"));
+  await user.type(screen.getByLabelText("组合说明"), "新说明");
+  await user.click(screen.getByRole("button", { name: "保存组合属性" }));
+  await waitFor(() => expect(JSON.parse(calls.find(call => call.url.endsWith("/update")).options.body)).toEqual({ name: "新名称", description: "新说明", expected_updated_at: "revision-2" }));
+  await user.type(screen.getByLabelText("新增自身标签"), "新标签");
+  await user.click(screen.getByRole("button", { name: "添加组合标签" }));
+  await waitFor(() => expect(calls.some(call => call.url.endsWith("/tags/add"))).toBe(true));
+  await user.click(screen.getByRole("button", { name: "撤销组合标签 旧标签" }));
+  expect(JSON.parse(calls.find(call => call.url.endsWith("/tags/remove")).options.body)).toEqual({ names: ["旧标签"], namespace: "general" });
+  await user.click(screen.getByRole("button", { name: "软删除组合" }));
+  expect(calls.some(call => call.url.endsWith("/compositions/12/delete"))).toBe(false);
+  await user.click(screen.getByRole("button", { name: "确认删除组合" }));
+  await waitFor(() => expect(calls.some(call => call.url.endsWith("/compositions/12/delete"))).toBe(true));
+  expect(screen.getByRole("link", { name: "返回组合目录" })).toBeTruthy();
+});
+
+test("既有组合的候选内容翻页沿用已提交关键词", async () => {
+  stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "正文", media: [] }]);
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.startsWith("/api/v1/search?sort=time&limit=40")) {
+      calls.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ page: url.includes("page=2") ? 2 : 1, hits: [], has_more: true, next_cursor: "next" }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/compositions/12");
+  await screen.findByRole("button", { name: "检索可加入内容" });
+  await user.type(screen.getByLabelText("内容项关键词"), "旧词");
+  await user.click(screen.getByRole("button", { name: "检索可加入内容" }));
+  await screen.findByRole("button", { name: "下一页内容" });
+  await user.clear(screen.getByLabelText("内容项关键词"));
+  await user.type(screen.getByLabelText("内容项关键词"), "新词");
+  await user.click(screen.getByRole("button", { name: "下一页内容" }));
+  const last = new URL(calls.filter(call => call.url.includes("/search?sort=time&limit=40")).at(-1).url, "http://localhost");
+  expect(last.searchParams.get("q")).toBe("旧词");
+  expect(last.searchParams.get("cursor")).toBe("next");
+});
+
+test("长组合成员列表可聚焦并在页面内滚动", async () => {
+  stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "正文", media: [] }]);
+  await open("/compositions/12");
+  const members = await screen.findByRole("list", { name: "组合成员顺序" });
+  const style = document.createElement("style");
+  style.textContent = webCss;
+  document.head.append(style);
+  try {
+    expect(members.tabIndex).toBe(0);
+    expect(getComputedStyle(members).overflowY).toBe("auto");
+    expect(getComputedStyle(members).maxHeight).toBe("24rem");
+  } finally { style.remove(); }
+});
+
+test("强制移除遇到页面过期后刷新会撤销旧确认", async () => {
+  const state = stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "正文", media: [] }]);
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions/12/members/remove") && options?.method === "POST") return { ok: false, status: 400, json: async () => ({ detail: "组合已变化，请刷新后重试" }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions/12");
+  await screen.findByRole("button", { name: "移除位置 1" });
+  await user.click(screen.getByRole("button", { name: "移除位置 1" }));
+  state.members.push({ position: 1, available: false });
+  state.updated_at = "revision-external";
+  await user.click(screen.getByRole("button", { name: "确认强制移除最后成员" }));
+  await screen.findByRole("alert");
+  await user.click(screen.getByRole("button", { name: "刷新组合详情" }));
+  await screen.findByText("位置 2：不可用");
+  expect(screen.queryByRole("button", { name: "确认强制移除最后成员" })).toBeNull();
+});
+
+test("组合软删冲突保留当前页面并提示刷新", async () => {
+  stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "正文", media: [] }]);
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions/12/delete")) return { ok: false, status: 400, json: async () => ({ detail: "组合已变化，请刷新后重试" }) };
+    return original(url, options);
+  }));
+  const user = await open("/compositions/12");
+  await screen.findByRole("button", { name: "软删除组合" });
+  await user.click(screen.getByRole("button", { name: "软删除组合" }));
+  await user.click(screen.getByRole("button", { name: "确认删除组合" }));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "刷新组合详情" })).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "管理组合 12" })).toBeTruthy();
+});
+
+test("组合目录提供单组合入口", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.includes("/compositions?")) return { ok: true, status: 200, json: async () => ({ compositions: [{ composition_id: 12, name: "已有组合", tags: [], members: [] }], has_more: false, total: 1 }) };
+    return original(url, options);
+  }));
+  await open("/compositions");
+  expect((await screen.findByRole("link", { name: "管理组合 12" })).getAttribute("href")).toBe("/compositions/12");
 });

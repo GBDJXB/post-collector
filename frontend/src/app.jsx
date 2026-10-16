@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router";
 import { ModelPage, proposalProofs } from "./model.jsx";
 import { CompositionsPage } from "./compositions.jsx";
+import { CompositionDetailPage } from "./composition_detail.jsx";
 import { LinkedText, safeWebUrl } from "./links.jsx";
 
 const lines = value => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
@@ -137,6 +138,7 @@ export function Shell() {
         </section>} />
         <Route path="/manage" element={<Manage state={manage} run={run} api={api} />} />
         <Route path="/compositions" element={<CompositionsPage api={api} run={run} parseId={safeId} />} />
+        <Route path="/compositions/:composition_id" element={<CompositionDetailPage api={api} run={run} parseId={safeId} />} />
         <Route path="/model" element={<ModelPage api={api} run={run} parseId={safeId} />} />
         <Route path="*" element={<p>页面不存在。<Link to="/">返回入口</Link></p>} />
       </Routes></fieldset></main>}
@@ -205,7 +207,7 @@ function Manage({ state: m, run, api }) {
       <td>{hit.kind === "composition" ? `组合 ${hit.composition_id}` : `内容项 ${hit.content_id}`}</td>
       <td>{hit.item_type}</td><td className="summary"><span className="summary-clamp">{hit.kind === "composition" ? hit.name : (hit.text || hit.original_name || "").slice(0, 180)}</span></td>
       <td>{(hit.tags || []).map(tag => tag.name || tag).join(" ")}</td><td>{hit.source_name || ""}</td><td>{hit.sort_time || ""}</td>
-      <td><button aria-label={hit.kind === "composition" ? `查看组合 ${hit.composition_id}` : `查看内容项 ${hit.content_id}`} onClick={() => run(() => hit.kind === "composition" ? m.showComposition(hit.composition_id) : m.show({ content_id: hit.content_id }))}>查看</button></td>
+      <td><button aria-label={hit.kind === "composition" ? `查看组合 ${hit.composition_id}` : `查看内容项 ${hit.content_id}`} onClick={() => run(() => hit.kind === "composition" ? m.showComposition(hit.composition_id) : m.show({ content_id: hit.content_id }))}>查看</button>{hit.kind === "composition" && <Link to={`/compositions/${hit.composition_id}`}>管理组合 {hit.composition_id}</Link>}</td>
     </tr>) : (m.result?.hits || []).map(hit => <tr key={hit.message_id}>
       <td><Selection ids={m.messages} setIds={m.setMessages} id={hit.message_id} label={`选择消息 ${hit.message_id}`} /></td><td>{hit.message_id}</td><td>{hit.item_type}</td><td className="summary"><span className="summary-clamp">{(hit.snippet || hit.text || hit.original_name || "").slice(0, 180)}</span></td><td>{[...new Set(hit.tags.map(t => typeof t === "string" ? t : t.name))].join(" ")}</td><td>{hit.source_name || hit.source || hit.source_id}</td><td>{hit.first_seen_at}</td><td><button onClick={() => run(() => m.show({ message_id: hit.message_id }))}>查看</button></td></tr>)}</tbody></table></div>
     <button id="next" disabled={!m.result?.has_more} onClick={() => run(() => m.find(true))}>下一页</button></section>
@@ -213,7 +215,7 @@ function Manage({ state: m, run, api }) {
       {select("detailKind", "目标", [["message_id", "消息 ID"], ["content_id", "内容项 ID"]])}{field("detailId", "ID", "number", { min: 1, required: true })}<button type="submit">查看</button></form>
       {m.detail && <><p id="detail-summary">消息 {m.detail.message_id}；来源 {m.detail.source}；{m.detail.origin_note || ""}</p><div id="parts">{m.detail.parts.map(part => <article key={part.content_id}><label><Selection ids={m.parts} setIds={m.setParts} id={part.content_id} label={`选择内容项 ${part.content_id}`} />内容项 {part.content_id} ({part.item_type}) {part.original_name || ""}</label>
         {part.url && safeWebUrl(part.url) && <a href={safeWebUrl(part.url)} target="_blank" rel="noopener noreferrer">{part.url}</a>}{part.text && <pre><LinkedText text={part.text} /></pre>}{part.media.map(media => <Media key={media.media_id} part={part} media={media} />)}</article>)}</div></>}
-      {m.compositionDetail && <><p>{m.compositionDetail.name}：{m.compositionDetail.description}</p><div id="parts">{m.compositionDetail.members.map(member => <article key={member.position}>
+      {m.compositionDetail && <><p>{m.compositionDetail.name}：{m.compositionDetail.description} <Link to={`/compositions/${m.compositionDetail.composition_id}`}>管理组合 {m.compositionDetail.composition_id}</Link></p><div id="parts">{m.compositionDetail.members.map(member => <article key={member.position}>
         {member.available ? <>内容项 {member.content_id} ({member.item_type}) {member.text && <pre><LinkedText text={member.text} /></pre>}{member.url && safeWebUrl(member.url) && <a href={safeWebUrl(member.url)} target="_blank" rel="noopener noreferrer">{member.url}</a>}{(member.media || []).map(media => <Media key={media.media_id} part={member} media={media} />)}</> : `位置 ${member.position}：不可用`}
       </article>)}</div></>}
       {select("actionTarget", "系统操作目标", [["current", "当前查看目标"], ["parts", "详情中勾选的一个内容项"]])}<label><input type="checkbox" checked={m.fields.copy} onChange={e => m.setFields({ ...m.fields, copy: e.target.checked })} />打开 / 定位时同时复制</label>

@@ -257,6 +257,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
     @app.get("/model", include_in_schema=False)
+    @app.get("/compositions/{composition_id}", include_in_schema=False)
     @app.get("/compositions", include_in_schema=False)
     @app.get("/add", include_in_schema=False)
     @app.get("/manage", include_in_schema=False)

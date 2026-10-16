@@ -90,6 +90,97 @@ async def test_web_composition_requires_session_origin_and_csrf(client, web):
         assert conn.execute('SELECT count(*) FROM composition').fetchone()[0] == 0
 
 
+@pytest.mark.asyncio
+async def test_web_member_remove_is_position_specific_and_search_stops_matching(client, web):
+    await login(client, web)
+    text = web['targets']['text']['content_id']
+    image = web['targets']['image']['content_id']
+    created = await client.post('/api/v1/compositions', json={'name': '资料册', 'content_ids': [text, image, text]})
+    ident = created.json()['composition_id']
+    other = (await client.post('/api/v1/compositions', json={'name': '另一个', 'content_ids': [text]})).json()['composition_id']
+    path = f'/api/v1/compositions/{ident}'
+    stamp = (await client.get(path)).json()['updated_at']
+    removed = await client.post(f'{path}/members/remove', json={'position': 0, 'expected_updated_at': stamp})
+    assert removed.status_code == 200, removed.text
+    detail = (await client.get(path)).json()
+    assert [(m['position'], m['content_id']) for m in detail['members']] == [(0, image), (1, text)]
+    removed = await client.post(f'{path}/members/remove', json={'position': 1, 'expected_updated_at': detail['updated_at']})
+    assert removed.status_code == 200, removed.text
+    detail = (await client.get(path)).json()
+    assert [m['content_id'] for m in detail['members']] == [image]
+    found = (await client.get('/api/v1/search', params={'result_version': 2, 'q': '网页测试中文'})).json()['hits']
+    assert ident not in [r['composition_id'] for r in found if r['kind'] == 'composition']
+    assert other in [r['composition_id'] for r in found if r['kind'] == 'composition']
+    assert text in [r['content_id'] for r in found if r['kind'] == 'content']
+    with db.open_db(web['path']) as conn:
+        assert conn.execute('SELECT count(*) FROM content_item').fetchone()[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_web_member_force_empty_stale_edit_and_soft_delete(client, web):
+    await login(client, web)
+    text = web['targets']['text']['content_id']
+    image = web['targets']['image']['content_id']
+    ident = (await client.post('/api/v1/compositions', json={'name': '待编辑', 'content_ids': [text]})).json()['composition_id']
+    path = f'/api/v1/compositions/{ident}'
+    first = (await client.get(path)).json()['updated_at']
+    reject = await client.post(f'{path}/members/remove', json={'position': 0, 'expected_updated_at': first})
+    assert reject.status_code == 400
+    assert (await client.get(path)).json()['members'][0]['content_id'] == text
+    allowed = await client.post(f'{path}/members/remove', json={'position': 0, 'force_empty': True, 'expected_updated_at': first})
+    assert allowed.status_code == 200, allowed.text
+    empty = (await client.get(path)).json()
+    assert empty['members'] == [] and empty['updated_at'] != first
+    stale = await client.post(f'{path}/members/add', json={'content_id': image, 'expected_updated_at': first})
+    assert stale.status_code == 400
+    assert (await client.get(path)).json()['members'] == []
+    added = await client.post(f'{path}/members/add', json={'content_id': image, 'expected_updated_at': empty['updated_at']})
+    assert added.status_code == 200, added.text
+    detail = (await client.get(path)).json()
+    appended = await client.post(f'{path}/members/add', json={'content_id': text, 'expected_updated_at': detail['updated_at']})
+    assert appended.status_code == 200, appended.text
+    detail = (await client.get(path)).json()
+    moved = await client.post(f'{path}/members/move', json={'position': 1, 'to_position': 0, 'expected_updated_at': detail['updated_at']})
+    assert moved.status_code == 200, moved.text
+    detail = (await client.get(path)).json()
+    assert [m['content_id'] for m in detail['members']] == [text, image]
+    updated = await client.post(f'{path}/update', json={'name': '已编辑', 'description': '新说明', 'expected_updated_at': detail['updated_at']})
+    assert updated.status_code == 200, updated.text
+    detail = (await client.get(path)).json()
+    assert (detail['name'], detail['description']) == ('已编辑', '新说明')
+    deleted = await client.post(f'{path}/delete', json={'expected_updated_at': detail['updated_at']})
+    assert deleted.status_code == 200, deleted.text
+    assert (await client.get(path)).status_code == 400
+    with db.open_db(web['path']) as conn:
+        assert conn.execute('SELECT count(*) FROM content_item WHERE content_id=?', (text,)).fetchone()[0] == 1
+        assert conn.execute('SELECT count(*) FROM composition_member WHERE composition_id=?', (ident,)).fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_web_member_mutations_reject_invalid_inputs_and_unauthorized(client, web):
+    text = web['targets']['text']['content_id']
+    missing = await client.post('/api/v1/compositions/1/members/remove', json={'position': 0, 'expected_updated_at': 'x'})
+    assert missing.status_code == 401
+    await login(client, web)
+    ident = (await client.post('/api/v1/compositions', json={'name': '受保护', 'content_ids': [text]})).json()['composition_id']
+    path = f'/api/v1/compositions/{ident}'
+    stamp = (await client.get(path)).json()['updated_at']
+    body = {'position': 0, 'expected_updated_at': stamp}
+    assert (await client.post(f'{path}/members/remove', json=body, headers={'Origin': 'http://evil.example'})).status_code == 403
+    assert (await client.post(f'{path}/members/remove', json=body, headers={'Host': 'evil.example'})).status_code == 403
+    assert (await client.post(f'{path}/members/remove', json=body, headers={'X-CSRF-Token': 'invalid'})).status_code == 403
+    for invalid in ({**body, 'position': True}, {**body, 'position': -1}, {**body, 'actor_id': 1}, {'position': 0}):
+        assert (await client.post(f'{path}/members/remove', json=invalid)).status_code == 422
+    assert (await client.post(f'{path}/members/add', json={'content_id': 999999, 'expected_updated_at': stamp})).status_code == 400
+    assert (await client.get(path)).json()['members'][0]['content_id'] == text
+    with db.open_db(web['path']) as conn:
+        compositions.write(conn, 'set-members', ident=ident, contents=[text] * 500)
+    stamp = (await client.get(path)).json()['updated_at']
+    over = await client.post(f'{path}/members/add', json={'content_id': text, 'expected_updated_at': stamp})
+    assert over.status_code == 400
+    assert len((await client.get(path)).json()['members']) == 500
+
+
 async def setup_model(client, web):
     await login(client, web)
     response = await client.post('/api/v1/tags/add', json={'content_ids': [web['targets']['text']['content_id']], 'names': ['已有']})

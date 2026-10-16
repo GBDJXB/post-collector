@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 
 from pc.adapters import sqlite as db
 from pc.adapters.tag_normalizer import SqliteTagNormalizer, effective_assignment
@@ -36,6 +37,20 @@ def _get(conn, ident):
     return dict(row)
 
 
+def _next_stamp(previous: str) -> str:
+    now = db.now_iso()
+    if now > previous:
+        return now
+    later = datetime.fromisoformat(previous.replace("Z", "+00:00")) + timedelta(milliseconds=1)
+    return f"{later:%Y-%m-%dT%H:%M:%S}.{later.microsecond // 1000:03d}Z"
+
+
+def _position(value: int, size: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value >= size:
+        raise ValueError("成员位置不存在")
+    return value
+
+
 def _members(conn, ids: Sequence[int]):
     if not ids:
         raise ValueError("组合至少需要一个成员")
@@ -61,9 +76,15 @@ def write(
     actor_id=None,
     max_text_chars=100000,
     nested=False,
+    position=None,
+    to_position=None,
+    content_id=None,
+    force_empty=False,
+    expected_updated_at=None,
+    max_members=None,
 ):
     """编辑与审计同事务；成员列表保持重复及参数顺序。"""
-    if operation not in {"create", "update", "set-members", "delete"}:
+    if operation not in {"create", "update", "set-members", "delete", "add-member", "move-member", "remove-member"}:
         raise ValueError("未知组合操作")
     if name is not None:
         name = _text(name, 255, name=True)
@@ -72,7 +93,10 @@ def write(
     with db.transaction(conn, nested=nested):
         tagging._root(conn, actor_id)
         before = None if operation == "create" else _get(conn, ident)
-        now = db.now_iso()
+        if before is not None and expected_updated_at is not None and before["updated_at"] != expected_updated_at:
+            raise ValueError("组合已变化，请刷新后重试")
+        now = db.now_iso() if before is None else _next_stamp(before["updated_at"])
+        changed = True
         if operation == "create":
             if name is None:
                 raise ValueError("请提供组合名称")
@@ -98,9 +122,7 @@ def write(
                 "UPDATE composition SET deleted_at=?,updated_at=? WHERE composition_id=?",
                 (now, now, ident),
             )
-        if operation in {"create", "set-members"}:
-            if operation == "set-members":
-                _members(conn, contents)
+        if operation in {"create", "set-members", "add-member", "move-member", "remove-member"}:
             before_members = [
                 r[0]
                 for r in conn.execute(
@@ -108,21 +130,45 @@ def write(
                     (ident,),
                 )
             ]
-            conn.execute("DELETE FROM composition_member WHERE composition_id=?", (ident,))
-            conn.executemany(
-                "INSERT INTO composition_member VALUES (?,?,?)",
-                [(ident, position, item) for position, item in enumerate(contents)],
-            )
-            conn.execute("UPDATE composition SET updated_at=? WHERE composition_id=?", (now, ident))
+            if operation == "set-members":
+                _members(conn, contents)
+                next_members = list(contents)
+            elif operation == "create":
+                next_members = list(contents)
+            else:
+                next_members = list(before_members)
+                if operation == "add-member":
+                    if max_members is not None and len(next_members) >= max_members:
+                        raise ValueError(f"网页组合最多允许 {max_members} 个成员")
+                    _members(conn, [content_id])
+                    next_members.append(content_id)
+                elif operation == "remove-member":
+                    next_members.pop(_position(position, len(next_members)))
+                    if not next_members and not force_empty:
+                        raise ValueError("移除最后一个成员需要 -f 强制确认")
+                else:
+                    source = _position(position, len(next_members))
+                    destination = _position(to_position, len(next_members))
+                    changed = source != destination
+                    if changed:
+                        next_members.insert(destination, next_members.pop(source))
+            if changed:
+                conn.execute("DELETE FROM composition_member WHERE composition_id=?", (ident,))
+                conn.executemany(
+                    "INSERT INTO composition_member VALUES (?,?,?)",
+                    [(ident, index, item) for index, item in enumerate(next_members)],
+                )
+                conn.execute("UPDATE composition SET updated_at=? WHERE composition_id=?", (now, ident))
             before = {"composition": before, "members": before_members}
-        after = dict(
-            conn.execute("SELECT * FROM composition WHERE composition_id=?", (ident,)).fetchone()
-        )
-        if operation in {"create", "set-members"}:
-            after = {"composition": after, "members": list(contents)}
-        tagging._audit(
-            conn, f"composition.{operation}", "composition", ident, before, after, actor_id
-        )
+        if changed:
+            after = dict(
+                conn.execute("SELECT * FROM composition WHERE composition_id=?", (ident,)).fetchone()
+            )
+            if operation in {"create", "set-members", "add-member", "move-member", "remove-member"}:
+                after = {"composition": after, "members": next_members}
+            tagging._audit(
+                conn, f"composition.{operation}", "composition", ident, before, after, actor_id
+            )
     return {
         "result_type": "composition_operation",
         "result_version": 1,

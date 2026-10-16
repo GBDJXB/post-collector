@@ -76,7 +76,9 @@ Windows PowerShell 使用 `uv run pc ...`。WSL 使用其自身的 Python 与 uv
 
 进入“整理组合”（`/compositions`）：左侧用关键词查现有消息，分别勾选要加入的文本/图片内容项；右侧按加入顺序显示内容项，可重复加入、移除、拖动调整，或用“上移”“下移”按钮排序。填写组合名称、可选说明和逐行填写的组合标签，确认后展示组合 ID；点击“用此组合测试模型建议”预选模型目标。提交前若有成员失去可见性，服务端会拒绝整个创建操作。
 
-页面上方“已有组合”会自动列出最近 50 个组合，不必填写标签；创建后目录会刷新到未筛选的最近组合并清空目录筛选条件，显示组合 ID、名称和每个成员的位置，可重新进入此页核对已保存的顺序。目录结果可滚动，也可点击“跳到创建新组合”直达编辑区；读取失败时可在目录内重试。输入组合 ID 可精确查找，输入组合名称可按字面子串查找（ASCII 字母不区分大小写，`%`、`_` 不作为通配符）；还能按组合自身标签筛选，或勾选同时匹配可见成员标签。检索条件取交集，在筛选后分页。主“检索内容项与组合”在同一结果中列出两类实体；页面的“整理已有组合”进入目录以便继续编辑。组合自身人工标签不传播给成员；标签目录的 `usage_count` 与 `composition_usage_count` 分别统计内容项和组合。Web 支持组合创建和自身标签关联；CLI 继续负责组合更新及成员替换等管理操作。标签关联单独提交；如果创建成功但标签关联失败，页面保留组合 ID，可在原页面重试标签关联，避免再次创建。
+页面上方“已有组合”会自动列出最近 50 个组合，不必填写标签；创建后目录会刷新到未筛选的最近组合并清空目录筛选条件，显示组合 ID、名称和每个成员的位置，可重新进入此页核对已保存的顺序。目录结果可滚动，也可点击“跳到创建新组合”直达编辑区；读取失败时可在目录内重试。输入组合 ID 可精确查找，输入组合名称可按字面子串查找（ASCII 字母不区分大小写，`%`、`_` 不作为通配符）；还能按组合自身标签筛选，或勾选同时匹配可见成员标签。检索条件取交集，在筛选后分页。主“检索内容项与组合”在同一结果中列出两类实体；页面的“整理已有组合”进入目录以便继续编辑。组合自身人工标签不传播给成员；标签目录的 `usage_count` 与 `composition_usage_count` 分别统计内容项和组合。Web 支持组合创建及既有组合的逐项管理；CLI 仍可使用整体成员替换命令。标签关联单独提交；如果创建成功但标签关联失败，页面保留组合 ID，可在原页面重试标签关联，避免再次创建。
+
+从“已有组合”、新建成功提示或 `/manage` 组合结果进入 `/compositions/{id}`：可修改名称/说明，检索并追加可见内容项（可重复），按位置上移/下移或移除**一次**引用，添加/撤销组合自身标签，以及经确认软删除整个组合。移除最后一个成员需要在页面再次明确确认，才会留下空组合；删除组合或解除成员引用都不会删除原内容、媒体或其他组合里的引用。旧成员不可用时仅显示位置，可调整或解除而不会泄露内容 ID；新增成员必须仍然可见。页面过期写入会被拒绝，刷新详情后再操作。空组合保留名称和自身标签，也可重新加入成员；创建组合及 CLI 整体替换成员仍要求至少一个。
 
 ### 模型 API 建议标签
 
@@ -361,7 +363,7 @@ uv run pytest
 
 ### 前端
 
-前端是 React 单入口 SPA，路径为 `/`、`/add`、`/manage` 和 `/model`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
+前端是 React 单入口 SPA，路径为 `/`、`/add`、`/manage`、`/compositions`、`/compositions/{id}` 和 `/model`。JS/CSS 为同源静态资源。使用 Node.js 22.12 以上版本，在 `frontend` 目录执行：
 
 ```powershell
 npm ci
@@ -381,6 +383,9 @@ uv run pc composition list --json
 uv run pc composition show 1 --json
 uv run pc composition update 1 --name "教程修订"
 uv run pc composition set-members 1 --content 7 --content 3
+uv run pc composition remove-member 1 --position 0
+# 若只剩最后一位，显式 -f 可解除并保留空组合
+uv run pc composition remove-member 1 --position 0 -f
 uv run pc tag add --composition 1 --tag "教程"
 uv run pc tag show --composition 1
 uv run pc tag remove --composition 1 --tag "教程"
@@ -388,9 +393,9 @@ uv run pc composition list --tag "教程" --tag "截图" --match-member-tags --j
 uv run pc composition delete 1
 ```
 
-名称最多 255 字符、单行且非空；说明遵守 ingest.max_text_chars（默认 100000 字符）。成员至少一个，写入须当前 active、未删除且 safe。失去可见性的成员只显示位置与不可用状态。删除组合保留原内容和文件。以上命令支持 --path/--root；list 使用 --limit（默认 50，最大 100）及 --offset 分页。组合 JSON 保留完整值，人工展示过滤终端控制字符。
+名称最多 255 字符、单行且非空；说明遵守 ingest.max_text_chars（默认 100000 字符）。创建及 `set-members` 至少一个成员，新增须当前 active、未删除且 safe。`remove-member --position N` 的 N 是 `show` 中从零起算的位置；只解除此位置一次引用，默认不能移除最后成员，显式 `-f` 才能保留空组合。失去可见性的旧成员只显示位置与不可用状态，可解除或移动而不影响其他位置。删除组合保留原内容和文件。以上命令支持 --path/--root；list 使用 --limit（默认 50，最大 100）及 --offset 分页。组合 JSON 保留完整值，人工展示过滤终端控制字符。
 
-组合标签默认只用于自身；--match-member-tags 允许组合与可见成员共同满足标签 AND 条件，JSON 返回命中目标及成员位置。pc tag --message 仍给各部件分别打标。pc tag list --json 的 usage_count 仍计内容项，composition_usage_count 独立统计组合。组合不自动生成；本机 Web 可通过帖级检索选取内容项并创建组合、对组合自身打人工标签及按组合标签筛选。Web v2 可按组合名称、说明与可见成员关键词搜索；组合下载尚未提供。
+组合标签默认只用于自身；--match-member-tags 允许组合与可见成员共同满足标签 AND 条件，JSON 返回命中目标及成员位置。pc tag --message 仍给各部件分别打标。pc tag list --json 的 usage_count 仍计内容项，composition_usage_count 独立统计组合。组合不自动生成；本机 Web 可通过帖级检索选取内容项创建组合，并在 `/compositions/{id}` 管理成员、属性和自身标签或软删组合；组合目录可按自身标签筛选。Web v2 可按组合名称、说明与可见成员关键词搜索；组合下载尚未提供。
 
 ### 升级至 0011
 

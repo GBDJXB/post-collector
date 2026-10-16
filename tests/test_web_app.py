@@ -76,6 +76,9 @@ def target(web, kind="text"):
 async def test_authorization_and_public_page(client, web):
     assert (await client.get("/")).status_code == 200
     assert (await client.get("/compositions")).status_code == 200
+    detail_page = await client.get("/compositions/12")
+    assert detail_page.status_code == 200
+    assert "text/html" in detail_page.headers["content-type"]
     assert (await client.get("/assets/app.js")).status_code == 200
     assert (await client.get("/healthz")).json()["status"] == "ok"
     for url in [

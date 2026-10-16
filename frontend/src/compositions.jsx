@@ -115,7 +115,7 @@ export function CompositionsPage({ api, run, parseId }) {
       {directoryError && <p role="alert">{directoryError} <button type="button" onClick={() => run(refreshDirectory)}>重试读取组合</button></p>}
       {existing ? <><p>共 {existing.total} 个组合</p>{existing.total === 0 && <p>未找到符合条件的组合。</p>}<ul className="composition-results" tabIndex="0" aria-label="组合检索结果">{existing.compositions.map(item => <li key={item.composition_id}><strong>{item.name}（组合 {item.composition_id}）</strong>：{item.tags.map(tag => tag.name).join("、") || "无自身标签"}
         <ol>{item.members.map(member => <li key={member.position}>位置 {member.position}：{member.available ? `内容项 ${member.content_id}（${member.item_type}）` : "不可用"}</li>)}</ol>
-        <Link to={`/model?composition_id=${item.composition_id}`}>用此组合测试模型建议</Link></li>)}</ul><button disabled={!existing.has_more} onClick={() => run(() => browse(existing.offset + existing.limit))}>下一页组合</button></> : !directoryError && <p>正在读取组合…</p>}
+        <Link to={`/compositions/${item.composition_id}`}>管理组合 {item.composition_id}</Link> · <Link to={`/model?composition_id=${item.composition_id}`}>用此组合测试模型建议</Link></li>)}</ul><button disabled={!existing.has_more} onClick={() => run(() => browse(existing.offset + existing.limit))}>下一页组合</button></> : !directoryError && <p>正在读取组合…</p>}
     </section>
     <h3 id="create-composition">创建新组合</h3><p>从左侧选择内容项，右侧按阅读顺序排列；一个消息中的正文和图片可以分别选择。</p>
     <div className="composition-layout"><section aria-label="检索和勾选区"><h3>检索和勾选</h3>
@@ -136,7 +136,7 @@ export function CompositionsPage({ api, run, parseId }) {
       <label>组合说明 <textarea value={description} onChange={event => setDescription(event.target.value)} /></label>
       <label>组合标签（每行一个）<textarea value={tags} onChange={event => setTags(event.target.value)} /></label>
       <button disabled={!name.trim() || !queue.length || Boolean(created)} onClick={() => run(create)}>确认构建组合</button>
-      {created && <p>组合 {created} 已创建。<Link to={`/model?composition_id=${created}`}>用此组合测试模型建议</Link></p>}
+      {created && <p>组合 {created} 已创建。<Link to={`/compositions/${created}`}>管理组合 {created}</Link> · <Link to={`/model?composition_id=${created}`}>用此组合测试模型建议</Link></p>}
       {savedDetail && <p>保存顺序：{savedDetail.members.map(member => member.available ? `内容项 ${member.content_id}` : `位置 ${member.position} 不可用`).join(" → ")}；自身标签：{savedDetail.tags.map(tag => tag.name).join("、") || "无"}</p>}
       {warning && <p role="alert">{warning}{created && names(tags).length > 0 && <button onClick={() => run(retryTags)}>重试关联标签</button>}</p>}
     </section></div></section>;

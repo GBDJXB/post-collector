@@ -79,7 +79,7 @@ worker 以 `BEGIN IMMEDIATE` 原子抢占，抢占时 attempts +1，正常经 `_
 
 source 与授权描述来源，message 保存信封，content_item 保存部件，content_media 为内容和媒体多对多，media 描述字节，post 保存稳定构成、时间及整帖签名。标签、任务、审计、用户和设置分别落表。
 
-来源消息与用户组合独立。composition 保存名称、说明与软删除状态；composition_member 按 position 引用已有 content_id，可跨消息、跨来源及重复引用。成员写入要求 active、未删除、safe，读取使用同一快照重新检查；隐藏成员只返回位置与不可用状态。删除组合不删除原内容或媒体。
+来源消息与用户组合独立。composition 保存名称、说明与软删除状态；composition_member 按 position 引用已有 content_id，可跨消息、跨来源及重复引用。新成员写入要求 active、未删除、safe；按位置编辑可保留组合内原有的隐藏成员引用，读取使用同一快照重新检查；隐藏成员只返回位置与不可用状态。按位置解除成员只删除所选位置的一次组合关系并紧凑重编号，不删除内容、其他组合关系或媒体；软删除整个组合也不删除原内容或媒体。
 
 ### 3.2 schema 权威
 
@@ -151,7 +151,7 @@ EXIF 清理、解码隔离、OCR、感知哈希及缩略图不能凭旧设计或
 
 ### 4.4 组合
 
-组合由本机 root 手动创建；上传者可明确勾选“同时创建组合”，不为其他上传或历史消息自动生成。CLI 提供 create/list/show/update/set-members/delete；成员替换在同一事务保留参数顺序与重复次数，至少一个成员。名称为 1~255 字符单行文本，说明遵守 ingest.max_text_chars（默认 100000 字符）并保留原文；更新及删除写审计。本机 Web root 还可在 `/compositions` 使用现有帖级关键词检索逐个选取可见内容项、排列/重复成员并创建组合；右栏支持拖放及上移/下移。`POST /api/v1/compositions` 请求名称、说明和有序 content_ids，服务端调用共用事务及长度/可见性校验；`POST /api/v1/compositions/{id}/tags/add|remove` 只操作组合自身的人工关联。`GET /api/v1/compositions` 支持组合 ID 精确匹配、名称字面子串匹配（ASCII 不区分大小写，不把 `%`、`_` 当通配符）、标签 AND、可选成员标签匹配及 limit/offset；各条件交集后统计总数并分页，默认按创建时间/ID 倒序取最近 50 条，列表和详情仍为 result_version=1。`/compositions` 页面进入即展示最近组合，创建后更新目录并可核对成员顺序；`/manage` 使用单一 v2 检索，在同一列表显示内容项与组合；类型“混合组合”表示符合其他成员条件的可见成员中至少有两种类型。组合目录仍用于整理和按 ID/名称浏览。Web 不提供组合更新/成员替换/删除、嵌套、组合下载或远程操作。
+组合由本机 root 手动创建；上传者可明确勾选“同时创建组合”，不为其他上传或历史消息自动生成。CLI 提供 create/list/show/update/set-members/remove-member/delete；成员替换在同一事务保留参数顺序与重复次数，至少一个成员。名称为 1~255 字符单行文本，说明遵守 ingest.max_text_chars（默认 100000 字符）并保留原文；更新及删除写审计。本机 Web root 还可在 `/compositions` 使用现有帖级关键词检索逐个选取可见内容项、排列/重复成员并创建组合；右栏支持拖放及上移/下移。`POST /api/v1/compositions` 请求名称、说明和有序 content_ids，服务端调用共用事务及长度/可见性校验；`POST /api/v1/compositions/{id}/tags/add|remove` 只操作组合自身的人工关联。`GET /api/v1/compositions` 支持组合 ID 精确匹配、名称字面子串匹配（ASCII 不区分大小写，不把 `%`、`_` 当通配符）、标签 AND、可选成员标签匹配及 limit/offset；各条件交集后统计总数并分页，默认按创建时间/ID 倒序取最近 50 条，列表和详情仍为 result_version=1。`/compositions` 页面进入即展示最近组合，创建后更新目录并可核对成员顺序；`/manage` 使用单一 v2 检索，在同一列表显示内容项与组合；类型“混合组合”表示符合其他成员条件的可见成员中至少有两种类型。组合目录仍用于整理和按 ID/名称浏览。本机 Web root 在 `/compositions/{id}` 可追加成员、按位置上移/下移及移除一次成员引用、修改组合名称/说明与自身标签、软删组合；从组合目录、创建结果与统一检索可进入该页。成员操作事务内按当前位置重排并审计，保留已有隐藏成员；新增成员仍需可见且 Web 最多 500 个成员。默认拒绝移除最后成员，仅 Web 二次确认发送 `force_empty=true` 或 CLI `pc composition remove-member ID --position N -f` 可以留空组合（零成员行，不产生悬空外键），其名称和标签仍保留；CLI create/set-members 继续要求非空。Web 修改与删除提交详情的 `updated_at`，过期拒绝并提示刷新；组合自身标签操作仍使用现有独立接口。组合不嵌套，不提供下载或远程操作。
 
 组合标签保存于 composition_tag_assignment，复用名称/别名及 root 校验，人工关联支持撤销与恢复且审计；不传播到成员，不生成内容项 classification_run。pc tag --message 保留展开成员的旧语义，--composition 是互斥独立目标。tag.usage_count 继续只计内容项，composition_usage_count 动态计未删除组合中的有效关联。
 
@@ -235,7 +235,7 @@ Web `/api/v1/search?result_version=2` 单次查询返回平级的 `kind=content|
 
 #### 本机 Web 和上传
 
-React `/`、`/add`、`/manage`、`/compositions`、`/model` 共用 HTML，可刷新访问；交换会话清 fragment 保留路径查询。正文用文本节点，已验证的 HTTP(S) URL 才生成带 noopener/noreferrer 的可点击链接；图片用内容/媒体 ID 地址，CSP 限制同源资源。
+React `/`、`/add`、`/manage`、`/compositions`、`/compositions/{id}`、`/model` 共用 HTML，可刷新访问；交换会话清 fragment 保留路径查询。组合更新、追加/移动/移除成员与软删使用本机受保护的 POST `/api/v1/compositions/{id}/update|members/add|members/move|members/remove|delete`；按位置移除最后成员仅显式 `force_empty=true` 可执行。正文用文本节点，已验证的 HTTP(S) URL 才生成带 noopener/noreferrer 的可点击链接；图片用内容/媒体 ID 地址，CSP 限制同源资源。
 
 POST /api/v1/uploads 接受传统 text/note/images multipart，或与 text 互斥的 parts JSON 有序条目（text、image 的索引、link 的 URL/说明）；同一图片仅引用一次，空白文本和无效 URL 拒绝。可选 create_composition、composition_name/description/tags（标签逐行）明确请求原子创建。组合路径先同步扫描；归档消息、部件、组合和自身标签同一写事务，失败撤销所有本次新增归档行及组合/标签，不删除已存在重复消息或共享媒体；可留隔离证据。会话 root、manual 来源；鉴权先于请求体读取。最多19张，媒体总量256 MiB，请求258 MiB，单图/文本按配置，备注4096字符，校验实际字节。
 
@@ -435,6 +435,8 @@ serve解析配置路径、验证库后单Uvicorn进程启动。上传同步线�
 实现以src/pc、frontend、config、migrations/sqlite、锁文件和测试为准。历史数据及撤回方案不替代当前契约。
 
 ## 附录 C：变更记录
+
+2026-10-15 单组合管理：本机 Web 新增可直达的单组合页及受保护的名称/说明、成员追加/移动/逐位置解除、自身标签和软删操作；CLI 新增 `composition remove-member --position N [-f]`。移除最后成员默认拒绝，仅显式强制可保留空组合；旧隐藏引用可保留，新增成员仍复查可见性，解除组合引用不删原内容或媒体。内容软删后的回收站与恢复位置机制未在本轮实现。
 
 2026-10-15 同内容重导入：移除文本、链接和媒体命中旧 hash_tombstone 时的导入拒绝，旧表及记录保留但不再参与导入判断；来源消息幂等、媒体字节复用与扫描边界不变。回收站、恢复提示及完整删除入口留待后续确定。
 

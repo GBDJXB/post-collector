@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from pc.services import compositions, tagging
 
 ID = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
+Position = Annotated[int, Field(strict=True, ge=0, le=2**63 - 1)]
 
 
 class Input(BaseModel):
@@ -45,6 +46,29 @@ class CreateComposition(Input):
     name: str = Field(min_length=1, max_length=255)
     description: str = ''
     content_ids: list[ID] = Field(min_length=1, max_length=500)
+
+
+class CompositionRevision(Input):
+    expected_updated_at: str = Field(min_length=1, max_length=64)
+
+
+class UpdateComposition(CompositionRevision):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+
+
+class AddMember(CompositionRevision):
+    content_id: ID
+
+
+class MoveMember(CompositionRevision):
+    position: Position
+    to_position: Position
+
+
+class RemoveMember(CompositionRevision):
+    position: Position
+    force_empty: StrictBool = False
 
 
 class CompositionTags(Input):
@@ -92,6 +116,31 @@ def register(app, *, connect, protected, access, gateway, max_text_chars=100000)
     def create_composition(body: CreateComposition):
         with connect() as conn:
             return compositions.write(conn, 'create', name=body.name, description=body.description, contents=body.content_ids, max_text_chars=max_text_chars)
+
+    @app.post('/api/v1/compositions/{composition_id}/update', dependencies=protected)
+    def update_composition(composition_id: int, body: UpdateComposition):
+        with connect() as conn:
+            return compositions.write(conn, 'update', ident=composition_id, name=body.name, description=body.description, max_text_chars=max_text_chars, expected_updated_at=body.expected_updated_at)
+
+    @app.post('/api/v1/compositions/{composition_id}/members/add', dependencies=protected)
+    def add_member(composition_id: int, body: AddMember):
+        with connect() as conn:
+            return compositions.write(conn, 'add-member', ident=composition_id, content_id=body.content_id, expected_updated_at=body.expected_updated_at, max_members=500)
+
+    @app.post('/api/v1/compositions/{composition_id}/members/move', dependencies=protected)
+    def move_member(composition_id: int, body: MoveMember):
+        with connect() as conn:
+            return compositions.write(conn, 'move-member', ident=composition_id, position=body.position, to_position=body.to_position, expected_updated_at=body.expected_updated_at)
+
+    @app.post('/api/v1/compositions/{composition_id}/members/remove', dependencies=protected)
+    def remove_member(composition_id: int, body: RemoveMember):
+        with connect() as conn:
+            return compositions.write(conn, 'remove-member', ident=composition_id, position=body.position, force_empty=body.force_empty, expected_updated_at=body.expected_updated_at)
+
+    @app.post('/api/v1/compositions/{composition_id}/delete', dependencies=protected)
+    def delete_composition(composition_id: int, body: CompositionRevision):
+        with connect() as conn:
+            return compositions.write(conn, 'delete', ident=composition_id, expected_updated_at=body.expected_updated_at)
 
     @app.post('/api/v1/compositions/{composition_id}/tags/{operation}', dependencies=protected)
     def change_composition_tags(composition_id: int, operation: Literal['add', 'remove'], body: CompositionTags):

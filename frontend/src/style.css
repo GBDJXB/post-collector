@@ -32,4 +32,10 @@ article {border: 1px solid #bbb; padding: .6rem; margin: .5rem 0;}
 .composition-image {max-width:10rem;max-height:8rem}
 .composition-queue {padding-left:1.6rem}.composition-queue li {padding:.5rem;border-bottom:1px solid #bbb;cursor:grab}
 .composition-queue li:focus-within {outline:2px solid #345b95}
+.composition-editor {max-width:70rem}
+.composition-editor label {max-width:calc(100% - .8rem)}
+.composition-editor input, .composition-editor textarea {box-sizing:border-box;max-width:100%}
+.composition-members {max-height:24rem;overflow-y:auto;overscroll-behavior:contain;border:1px solid #bbb;padding:.5rem .5rem .5rem 2rem}
+.composition-members li {padding:.5rem;border-bottom:1px solid #ddd;overflow-wrap:anywhere}
+.composition-members:focus-visible {outline:2px solid #345b95;outline-offset:2px}
 @media (max-width:750px) {.composition-layout {grid-template-columns:minmax(0,1fr)}}

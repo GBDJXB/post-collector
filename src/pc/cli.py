@@ -1458,7 +1458,7 @@ def cmd_composition(args: argparse.Namespace) -> int:
             elif operation == "show":
                 output = compositions.show(conn, args.id)
             else:
-                output = compositions.write(conn, operation, ident=getattr(args, "id", None), name=getattr(args, "name", None), description=getattr(args, "description", None), contents=getattr(args, "content", ()) or (), max_text_chars=ingest_limits(_load_app_config(_project_root(args))).max_text_chars)
+                output = compositions.write(conn, operation, ident=getattr(args, "id", None), name=getattr(args, "name", None), description=getattr(args, "description", None), contents=getattr(args, "content", ()) or (), position=getattr(args, "position", None), force_empty=getattr(args, "force_empty", False), max_text_chars=ingest_limits(_load_app_config(_project_root(args))).max_text_chars)
         if args.json:
             print(cfg_dump_json(output))
         elif operation == "list":
@@ -1944,7 +1944,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_composition = sub.add_parser("composition", help="root 独立有序组合管理")
     p_composition_sub = p_composition.add_subparsers(dest="composition_command", required=True)
-    for operation in ("create", "list", "show", "update", "set-members", "delete"):
+    for operation in ("create", "list", "show", "update", "set-members", "remove-member", "delete"):
         p = p_composition_sub.add_parser(operation)
         p.add_argument("--path", help=db_path_help)
         p.add_argument("--root", help=root_help)
@@ -1956,6 +1956,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--description")
         if operation in {"create", "set-members"}:
             p.add_argument("--content", type=int, action="append", required=True, help="成员 ID，顺序保留，允许重复")
+        if operation == "remove-member":
+            p.add_argument("--position", type=int, required=True, help="要解除的一次引用的零基位置")
+            p.add_argument("-f", "--force", action="store_true", dest="force_empty", help="允许移除最后成员，保留空组合")
         if operation == "list":
             p.add_argument("--tag", action="append")
             p.add_argument("--match-member-tags", action="store_true")

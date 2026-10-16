@@ -333,3 +333,84 @@ def test_audit_failure_rolls_back_create_and_tag(items, monkeypatch):
         co.tag_change(conn, ident, ["失败标签"])
     assert conn.execute("SELECT count(*) FROM tag").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM composition_tag_assignment").fetchone()[0] == 0
+
+
+def test_remove_member_unlinks_one_occurrence_only(items):
+    conn, ids = items
+    ident = make(conn, [ids[0], ids[1], ids[0]])
+    other = make(conn, [ids[0]])
+    before_audits = conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
+    co.write(conn, "remove-member", ident=ident, position=0)
+    assert [(m["position"], m["content_id"]) for m in co.show(conn, ident)["members"]] == [
+        (0, ids[1]), (1, ids[0])
+    ]
+    assert co.show(conn, other)["members"][0]["content_id"] == ids[0]
+    assert conn.execute("SELECT count(*) FROM content_item").fetchone()[0] == 3
+    assert conn.execute("SELECT count(*) FROM audit_log").fetchone()[0] == before_audits + 1
+
+
+def test_member_moves_and_addition_preserve_hidden_positions(items):
+    conn, ids = items
+    ident = make(conn, [ids[0], ids[1], ids[0]])
+    conn.execute("UPDATE content_item SET deleted_at='now' WHERE content_id=?", (ids[1],))
+    co.write(conn, "move-member", ident=ident, position=1, to_position=0)
+    assert co.show(conn, ident)["members"][0] == {"position": 0, "available": False}
+    co.write(conn, "remove-member", ident=ident, position=1)
+    co.write(conn, "add-member", ident=ident, content_id=ids[0])
+    members = co.show(conn, ident)["members"]
+    assert members[0] == {"position": 0, "available": False}
+    assert [(m["position"], m["content_id"]) for m in members[1:]] == [
+        (1, ids[0]), (2, ids[0])
+    ]
+    assert [r["content_id"] for r in conn.execute(
+        "SELECT content_id FROM composition_member WHERE composition_id=? ORDER BY position", (ident,)
+    )] == [ids[1], ids[0], ids[0]]
+    with pytest.raises(ValueError, match="不可见"):
+        co.write(conn, "add-member", ident=ident, content_id=ids[1])
+
+
+def test_last_member_requires_force_then_can_be_added_again(items):
+    conn, ids = items
+    ident = make(conn, [ids[0]])
+    before = co.show(conn, ident)
+    count = conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
+    with pytest.raises(ValueError, match="最后"):
+        co.write(conn, "remove-member", ident=ident, position=0)
+    assert co.show(conn, ident) == before
+    assert conn.execute("SELECT count(*) FROM audit_log").fetchone()[0] == count
+    co.write(conn, "remove-member", ident=ident, position=0, force_empty=True)
+    assert co.show(conn, ident)["members"] == []
+    co.write(conn, "add-member", ident=ident, content_id=ids[1])
+    assert co.show(conn, ident)["members"][0]["content_id"] == ids[1]
+
+
+def test_member_position_validation_stale_revision_and_audit_rollback(items, monkeypatch):
+    conn, ids = items
+    ident = make(conn, [ids[0], ids[1]])
+    initial = co.show(conn, ident)
+    for position in (-1, 2, True):
+        with pytest.raises(ValueError):
+            co.write(conn, "remove-member", ident=ident, position=position)
+    co.write(conn, "move-member", ident=ident, position=0, to_position=1)
+    assert co.show(conn, ident)["updated_at"] != initial["updated_at"]
+    with pytest.raises(ValueError, match="变化"):
+        co.write(conn, "remove-member", ident=ident, position=0, expected_updated_at=initial["updated_at"])
+    after = co.show(conn, ident)
+    count = conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
+    monkeypatch.setattr(tagging, "_audit", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("审计失败")))
+    with pytest.raises(RuntimeError, match="审计失败"):
+        co.write(conn, "remove-member", ident=ident, position=0)
+    assert co.show(conn, ident) == after
+    assert conn.execute("SELECT count(*) FROM audit_log").fetchone()[0] == count
+
+
+def test_cli_remove_member_force_empty(items, capsys):
+    conn, ids = items
+    ident = make(conn, [ids[0]])
+    path = conn.execute("PRAGMA database_list").fetchone()[2]
+    args = ["composition", "remove-member", str(ident), "--position", "0", "--path", path]
+    assert cli.main(args) == 2
+    capsys.readouterr()
+    assert cli.main([*args, "-f", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["operation"] == "remove-member"
+    assert co.show(conn, ident)["members"] == []
