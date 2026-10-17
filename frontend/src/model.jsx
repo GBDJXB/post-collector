@@ -44,8 +44,13 @@ export function ModelPage({ api, run, parseId }) {
   async function send() {
     const ident = preview.preview_id;
     setPreview(null); setSendConsent(false); setOutcome("等待结果；请勿重复发送");
-    try { const result = await api("model/send", { preview_id: ident, confirmed: true }); setOutcome(`${result.status}（请求 ${result.request_id}）${result.error_class ? `：${result.error_class}` : ""}`); }
-    catch (error) { setOutcome("结果未知，可能计费；不会自动重试。请检查服务记录"); throw error; }
+    try { const result = await api("model/send", { preview_id: ident, confirmed: true }); setOutcome(`${result.status}（请求 ${result.request_id}）${result.detail ? `：${result.detail}` : result.error_class ? `：${result.error_class}` : ""}`); }
+    catch (error) {
+      setOutcome(error.status >= 400 && error.status < 500
+        ? "未外发：请求在预留前被拒绝，本次不会计费"
+        : "结果未知，可能计费；不会自动重试。请检查服务记录");
+      throw error;
+    }
   }
   return <><section><h2>模型标签建议</h2><p>只选择已有标签，至少一个；不会创建标签，不提供自然语言检索。建议不生效，须由 root 确认。</p>
     <p>密钥仅保存在服务进程内，不写入数据库、日志或浏览器存储。替换、删除、退出、会话失效或重启后须重新设置并开启。不能保证物理擦除。</p>

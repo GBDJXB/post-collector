@@ -361,6 +361,25 @@ class TestContentIdentity:
         expected = _sha(normalize_text("一只猫").encode("utf-8"))
         assert messages[0].platform_msg_id == f"{CONTENT_ID_PREFIX}{expected}"
 
+    def test_long_text_identity_includes_tail_not_stored_in_message(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "first.txt").write_text("x" * 100 + "A", encoding="utf-8")
+        (root / "second.txt").write_text("x" * 100 + "B", encoding="utf-8")
+        messages, _ = _content_connector(root, max_text_chars=100).list_new(None)
+        assert len(messages) == 2
+        assert {message.text_raw for message in messages} == {"x" * 100}
+        assert len({message.platform_msg_id for message in messages}) == 2
+
+    def test_long_sidecar_identity_includes_tail(self, tmp_path: Path) -> None:
+        root = _upload_dir(tmp_path)
+        for name, tail in (("first", "A"), ("second", "B")):
+            (root / f"{name}.jpg").write_bytes(JPEG)
+            (root / f"{name}.txt").write_text("x" * 100 + tail, encoding="utf-8")
+        messages, _ = _content_connector(root, max_text_chars=100).list_new(None)
+        mixed = [message for message in messages if message.media_refs]
+        assert len(mixed) == 2
+        assert len({message.platform_msg_id for message in mixed}) == 2
+
     def test_media_with_sidecar_uses_both_components(self, tmp_path: Path) -> None:
         root = _upload_dir(tmp_path)
         (root / "cat.jpg").write_bytes(JPEG)
@@ -485,6 +504,46 @@ class TestContentIdentitySkips:
 
 
 class TestContentIdentityMechanics:
+    def test_vanished_file_during_hash_skips_only_that_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = _upload_dir(tmp_path)
+        (root / "missing.jpg").write_bytes(JPEG)
+        (root / "present.jpg").write_bytes(JPEG)
+        connector = _content_connector(root)
+        original = connector._hash_file
+
+        def vanish(path: Path) -> str:
+            if path.name == "missing.jpg":
+                raise FileNotFoundError(path)
+            return original(path)
+
+        monkeypatch.setattr(connector, "_hash_file", vanish)
+        messages, _ = connector.list_new(None)
+        assert len(messages) == 1
+        assert messages[0].media_refs[0].endswith("present.jpg")
+        assert len(connector.skipped) == 1
+        assert connector.skipped[0][0].endswith("missing.jpg")
+
+    def test_unreadable_text_is_not_an_empty_message(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pc.adapters import local_files
+
+        root = _upload_dir(tmp_path)
+        (root / "bad.txt").write_text("重要正文", encoding="utf-8")
+        (root / "good.txt").write_text("可用正文", encoding="utf-8")
+        real_open = local_files.open_scoped
+
+        def fail_one(path, roots, **kwargs):
+            if path.name == "bad.txt":
+                raise PermissionError("文件当前不可读")
+            return real_open(path, roots, **kwargs)
+
+        monkeypatch.setattr(local_files, "open_scoped", fail_one)
+        connector = _connector(root)
+        messages, _ = connector.list_new(None)
+        assert len(messages) == 1 and messages[0].text_raw == "可用正文"
+        assert len(connector.skipped) == 1
+        assert connector.skipped[0][0].endswith("bad.txt")
+        assert "读取失败" in connector.skipped[0][1]
+
     def test_unknown_identity_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="未知的身份策略"):
             LocalFilesConnector(_source(), [_authz()], roots=[tmp_path], identity="vibes")

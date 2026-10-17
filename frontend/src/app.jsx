@@ -51,7 +51,9 @@ export function Shell() {
     const data = await response.json();
     if (!response.ok) {
       if (response.status === 401) { setCsrf(""); csrfRef.current = ""; setSession("会话失效，请使用服务终端中的新授权链接。"); }
-      throw new Error((typeof data.detail === "string" ? data.detail : "参数无效，请检查输入") + (data.copied ? "；剪贴板复制已完成" : ""));
+      const error = new Error((typeof data.detail === "string" ? data.detail : "参数无效，请检查输入") + (data.copied ? "；剪贴板复制已完成" : ""));
+      error.status = response.status;
+      throw error;
     }
     return data;
   }, []);

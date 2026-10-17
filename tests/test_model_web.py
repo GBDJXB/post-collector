@@ -227,6 +227,31 @@ async def test_key_validation_errors_never_echo_credentials(client, web):
 
 
 @pytest.mark.asyncio
+async def test_reserved_authorization_revocation_returns_transient_readable_detail(client, web):
+    calls = await setup_model(client, web)
+    ident = web['targets']['text']['content_id']
+    response = await client.post('/api/v1/model/preview', json={'content_id': ident})
+    assert response.status_code == 200, response.text
+    gateway = web['app'].state.model_gateway
+    original = gateway.provider_factory
+
+    def revoke_access(key):
+        with db.open_db(web['path']) as conn:
+            gateway.access.set_access(conn, client.cookies.get('pc_session'), False, confirmed=True)
+        return original(key)
+
+    gateway.provider_factory = revoke_access
+    result = await client.post('/api/v1/model/send', json={'preview_id': response.json()['preview_id'], 'confirmed': True})
+    assert result.status_code == 200, result.text
+    assert result.json()['status'] == 'stale' and '放行' in result.json()['detail']
+    assert calls == []
+    with db.open_db(web['path']) as conn:
+        row = dict(conn.execute('SELECT * FROM egress_log').fetchone())
+    assert row['status'] == 'stale' and row['dispatched_at'] is None
+    assert 'detail' not in row and 'TEST-ONLY-WEB-KEY' not in result.text
+
+
+@pytest.mark.asyncio
 async def test_content_preview_send_then_client_bound_confirmation(client, web):
     calls = await setup_model(client, web)
     ident = web['targets']['text']['content_id']

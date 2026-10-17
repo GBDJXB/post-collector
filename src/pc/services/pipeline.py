@@ -88,6 +88,7 @@ class MediaBlob:
     gray: bool
     scan_engine: str
     scan_reasons: tuple[str, ...]
+    scan_rejected: bool  # 扫描器自身拒绝；渠道白名单不构成共享字节的新风险结论
 
     @property
     def scan_status(self) -> str:
@@ -461,6 +462,7 @@ class Worker:
         declared = declared_mime_for_name(name)
         data = connector.fetch_media(ref)
         verdict = self._scanner.scan(data, declared_mime=declared)
+        scan_rejected = not verdict.passed
         if self._upload_root is not None:
             from pc.adapters.safe_files import absolute_path
 
@@ -470,7 +472,14 @@ class Worker:
             }:
                 verdict = replace(verdict, passed=False, reasons=(*verdict.reasons, "浏览器上传仅支持指定图片格式"))
         digest = hashlib.sha256(data).hexdigest()
-        # 扫描不通过的字节进隔离区（物理分离），不通过的也照存——丢掉就没法复核了
+        previous = self._conn.execute(
+            "SELECT m.quarantine_key, sb.name AS backend FROM media m "
+            "JOIN storage_backend sb ON sb.backend_id=m.storage_backend_id WHERE m.sha256=?",
+            (digest,),
+        ).fetchone()
+        if previous is not None and (previous["quarantine_key"] or previous["backend"] == "local-quarantine"):
+            verdict = replace(verdict, passed=False, reasons=(*verdict.reasons, "相同字节已隔离，不自动恢复放行"))
+        # 扫描不通过的字节进隔离区；已隔离的同一字节也不能再写回正常后端。
         target = self._quarantine if not verdict.passed else self._storage
         key = ObjectKey(digest) if defer_media and verdict.passed else target.put(data)
         return MediaBlob(
@@ -486,6 +495,7 @@ class Worker:
             gray=verdict.gray,
             scan_engine=verdict.engine,
             scan_reasons=tuple(verdict.reasons),
+            scan_rejected=scan_rejected,
         )
 
     def _refs(self, message: Mapping[str, Any]) -> tuple[str, ...]:
@@ -526,11 +536,11 @@ class Worker:
 
         # 先把存储后端行准备好。它自己是一个短事务，**不能**放进下面那个事务里：
         # SQLite 不支持嵌套 BEGIN（db.transaction 会报"事务里不能开事务"）。
-        for blob in collected.blobs:
-            self._backend_id(
-                "local-quarantine" if blob.quarantined else "local",
-                self._quarantine.root if blob.quarantined else self._storage.root,
-            )
+        if collected.blobs:
+            self._backend_id("local", self._storage.root)
+            if any(blob.quarantined for blob in collected.blobs):
+                self._backend_id("local-quarantine", self._quarantine.root)
+            # 并发隔离后的 clean blob 只复用已存在的媒体行，无需新建隔离后端。
 
         with transaction(self._conn, nested=nested):
             self._require_authorized(int(source["source_id"]))
@@ -768,55 +778,72 @@ class Worker:
                 ),
             ).fetchone()[0]
         )
-        media_id = self._reuse_or_insert_media(blob, content_id)
+        media_id, quarantined = self._reuse_or_insert_media(blob, content_id)
+        if quarantined and not blob.quarantined:
+            self._conn.execute("UPDATE content_item SET status='quarantined', updated_at=? WHERE content_id=?", (now_iso(), content_id))
         self._conn.execute(
             "INSERT INTO content_media (content_id, media_id, role, ordinal) VALUES (?, ?, 'primary', 0) "
             "ON CONFLICT (content_id, media_id, role) DO NOTHING",
             (content_id, media_id),
         )
-        if blob.quarantined or blob.gray:
-            self._enqueue_review(content_id, blob)
-        return content_id, blob.quarantined
+        if quarantined or blob.gray:
+            evidence = blob if blob.quarantined else replace(
+                blob, passed=False, scan_reasons=(*blob.scan_reasons, "相同字节已隔离，不自动恢复放行")
+            )
+            self._enqueue_review(content_id, evidence)
+        return content_id, quarantined
 
-    def _reuse_or_insert_media(self, blob: MediaBlob, content_id: int) -> int:
-        """按 ``media.sha256`` 去重：同一份字节只有一行 media，多个内容项各自引用它。
-
-        复用时不改已有行：``scan_status`` 是**字节**的属性，同一份字节先前的判定仍然
-        成立；本次的判定落在内容项的状态上（一次"扩展名骗人"的重复出现不该把已经放行
-        的行改回可疑）。
-        """
+    def _reuse_or_insert_media(self, blob: MediaBlob, content_id: int) -> tuple[int, bool]:
+        """同字节只占一行；任何新的拒绝结论会隔离所有共享引用。"""
         row = self._conn.execute(
-            "SELECT media_id FROM media WHERE sha256 = ?", (blob.sha256,)
+            "SELECT m.media_id, m.quarantine_key, sb.name AS backend FROM media m "
+            "JOIN storage_backend sb ON sb.backend_id=m.storage_backend_id WHERE m.sha256=?",
+            (blob.sha256,),
         ).fetchone()
         if row is not None:
-            return int(row[0])
-        backend_name = "local-quarantine" if blob.quarantined else "local"
-        backend_root = self._quarantine.root if blob.quarantined else self._storage.root
-        backend_id = self._backend_id(backend_name, backend_root)
-        return int(
+            media_id = int(row["media_id"])
+            if row["quarantine_key"] or row["backend"] == "local-quarantine":
+                return media_id, True
+            if not blob.quarantined:
+                return media_id, False
+            if not blob.scan_rejected:
+                # 浏览器格式限制仅拒本次内容，不重判其它来源已放行的字节。
+                return media_id, True
+            old_ids = [int(record[0]) for record in self._conn.execute(
+                "SELECT DISTINCT c.content_id FROM content_media cm "
+                "JOIN content_item c ON c.content_id=cm.content_id "
+                "WHERE cm.media_id=? AND c.status='active'", (media_id,)
+            )]
             self._conn.execute(
-                "INSERT INTO media ("
-                "  uuid, first_seen_content_id, sha256, size_bytes, mime_detected, mime_declared,"
-                "  extension, storage_backend_id, object_key, storage_class, scan_status,"
-                "  scan_engine, scan_at, quarantine_key"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'hot', ?, ?, ?, ?) RETURNING media_id",
-                (
-                    str(uuid.uuid4()),
-                    content_id,
-                    blob.sha256,
-                    blob.size_bytes,
-                    blob.mime_detected,
-                    blob.mime_declared,
-                    blob.extension,
-                    backend_id,
-                    blob.key.value,
-                    blob.scan_status,
-                    blob.scan_engine,
-                    now_iso(),
-                    blob.key.value if blob.quarantined else None,
-                ),
-            ).fetchone()[0]
-        )
+                "UPDATE media SET storage_backend_id=?, object_key=?, quarantine_key=?, "
+                "scan_status='suspicious', scan_engine=?, scan_at=?, mime_detected=COALESCE(?, mime_detected), updated_at=? "
+                "WHERE media_id=?",
+                (self._backend_ids["local-quarantine"], blob.key.value, blob.key.value,
+                 blob.scan_engine, now_iso(), blob.mime_detected, now_iso(), media_id),
+            )
+            self._conn.execute(
+                "UPDATE content_item SET status='quarantined', updated_at=? WHERE content_id IN "
+                "(SELECT content_id FROM content_media WHERE media_id=?) AND status='active'",
+                (now_iso(), media_id),
+            )
+            for old_id in old_ids:
+                self._enqueue_review(old_id, replace(blob, scan_reasons=(
+                    *blob.scan_reasons, "共享媒体新扫描未通过，原有内容已隔离"
+                )))
+            return media_id, True
+        backend_name = "local-quarantine" if blob.quarantined else "local"
+        backend_id = self._backend_ids[backend_name]
+        media_id = int(self._conn.execute(
+            "INSERT INTO media ("
+            "  uuid, first_seen_content_id, sha256, size_bytes, mime_detected, mime_declared,"
+            "  extension, storage_backend_id, object_key, storage_class, scan_status,"
+            "  scan_engine, scan_at, quarantine_key"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'hot', ?, ?, ?, ?) RETURNING media_id",
+            (str(uuid.uuid4()), content_id, blob.sha256, blob.size_bytes, blob.mime_detected,
+             blob.mime_declared, blob.extension, backend_id, blob.key.value, blob.scan_status,
+             blob.scan_engine, now_iso(), blob.key.value if blob.quarantined else None),
+        ).fetchone()[0])
+        return media_id, blob.quarantined
 
     def _enqueue_review(self, content_id: int, blob: MediaBlob) -> None:
         self._conn.execute(
@@ -828,6 +855,8 @@ class Worker:
                 json.dumps(
                     {
                         "ref": blob.ref,
+                        "ref_role": "triggering_scan",
+                        "sha256": blob.sha256,
                         "passed": blob.passed,
                         "gray": blob.gray,
                         "reasons": list(blob.scan_reasons),

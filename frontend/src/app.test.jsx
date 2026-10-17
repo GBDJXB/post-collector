@@ -621,6 +621,50 @@ test("模型预览展示正文及完整目录，逐次同意后只发送一次",
   expect(JSON.parse(calls.find(x => x.url.endsWith("/suggestions/confirm")).options.body).expected_runs[9].run_id).toBe(12);
 });
 
+test("模型派发前授权变化显示可读原因而非结果未知", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/model/send")) {
+      calls.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({ status: "stale", request_id: "preview-one", error_class: "stale", detail: "模型外发未放行，请重新预览并开启" }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型目标 ID"), "7");
+  await user.click(screen.getByRole("button", { name: "生成外发预览" }));
+  await screen.findByText(body, { selector: "pre" });
+  await user.click(screen.getByLabelText("我同意将本次预览发送给模型"));
+  await user.click(screen.getByRole("button", { name: "发送本次预览" }));
+  expect(await screen.findByText(/模型结果：stale.*模型外发未放行/)).toBeTruthy();
+  expect(screen.queryByText(/结果未知，可能计费/)).toBeNull();
+});
+
+test.each([400, 422, 503])("模型发送 HTTP %i 保留预留前失败与结果未知的区别", async (status) => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/model/send")) {
+      calls.push({ url, options });
+      return { ok: false, status, json: async () => ({ detail: "模型外发未放行" }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型目标 ID"), "7");
+  await user.click(screen.getByRole("button", { name: "生成外发预览" }));
+  await screen.findByText(body, { selector: "pre" });
+  await user.click(screen.getByLabelText("我同意将本次预览发送给模型"));
+  await user.click(screen.getByRole("button", { name: "发送本次预览" }));
+  const outcome = await screen.findByText(/模型结果：/);
+  if (status < 500) {
+    expect(outcome.textContent).toContain("未外发");
+    expect(outcome.textContent).not.toContain("可能计费");
+  } else {
+    expect(outcome.textContent).toContain("结果未知，可能计费");
+  }
+  expect(screen.getByRole("status").textContent).toContain("模型外发未放行");
+});
+
 test("关闭模型总闸提交明确关闭并清空页面授权", async () => {
   const user = await open("/model");
   await user.type(screen.getByLabelText("模型目标 ID"), "7");

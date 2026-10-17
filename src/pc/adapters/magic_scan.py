@@ -42,7 +42,7 @@ MIME_TO_ITEM_TYPE: dict[str, str] = {
 _REJECTED_BY_MAGIC: tuple[tuple[bytes, str, str], ...] = (
     (b"PK\x03\x04", "application/zip", "压缩包容器（zip / docx / apk 等，可藏嵌套炸弹）"),
     (b"7z\xbc\xaf\x27\x1c", "application/x-7z-compressed", "压缩包容器"),
-    (b"RAR!\x1a\x07", "application/vnd.rar", "压缩包容器"),
+    (b"Rar!\x1a\x07", "application/vnd.rar", "压缩包容器"),
     (b"\x1f\x8b", "application/gzip", "压缩文件（可藏压缩炸弹）"),
     (b"%PDF", "application/pdf", "PDF 文档（必须走隔离渲染，本阶段不接受）"),
     (b"\x7fELF", "application/x-elf", "可执行文件"),
@@ -80,6 +80,9 @@ def sniff_mime(data: bytes) -> str | None:
     而不是"这个文件是否完整"。
     """
     head = data[:64]
+    for magic, mime, _ in _REJECTED_BY_MAGIC:
+        if head.startswith(magic):
+            return mime
     if head.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -89,14 +92,11 @@ def sniff_mime(data: bytes) -> str | None:
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp"
     if head[4:8] == b"ftyp":
-        return _FTYP_BRANDS.get(head[8:12], "video/mp4")
+        return _FTYP_BRANDS.get(head[8:12])
     if head.startswith(b"\x1aE\xdf\xa3"):
         return "video/webm"
     if _looks_like_svg(data):
         return "image/svg+xml"
-    for magic, mime, _ in _REJECTED_BY_MAGIC:
-        if head.startswith(magic):
-            return mime
     return None
 
 

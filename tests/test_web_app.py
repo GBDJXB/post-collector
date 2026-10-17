@@ -820,6 +820,105 @@ async def test_atomic_failure_preserves_preexisting_shared_media(client, web):
 
 
 @pytest.mark.asyncio
+async def test_atomic_tag_failure_does_not_create_unused_quarantine_backend(client, web):
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        conn.execute("DELETE FROM storage_backend WHERE name='local-quarantine'")
+        assert conn.execute("SELECT 1 FROM storage_backend WHERE name='local-quarantine'").fetchone() is None
+    response = await client.post("/api/v1/uploads", files={
+        "text": (None, "新请求失败不留额外后端"),
+        "images": ("new.gif", b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 29),
+        "create_composition": (None, "true"), "composition_name": (None, "失败组合"),
+        "composition_tags": (None, "\u0001非法"),
+    })
+    assert response.status_code in {400, 422}, response.text
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT 1 FROM storage_backend WHERE name='local-quarantine'").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_atomic_first_image_succeeds_without_quarantine_backend_row(client, web):
+    await login(client, web)
+    with db.open_db(web["path"]) as conn:
+        conn.execute("DELETE FROM storage_backend WHERE name='local-quarantine'")
+        assert conn.execute("SELECT 1 FROM storage_backend WHERE name='local-quarantine'").fetchone() is None
+    response = await client.post("/api/v1/uploads", files={
+        "text": (None, "第一次原子组合"), "images": ("new.gif", b"GIF89a" + b"\x01\x00\x01\x00" + b"\x00" * 29),
+        "create_composition": (None, "true"), "composition_name": (None, "全新后端组合"),
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["composition_id"] > 0
+    with db.open_db(web["path"]) as conn:
+        assert conn.execute("SELECT status FROM content_item WHERE message_id=? ORDER BY ordinal DESC LIMIT 1", (response.json()["message_id"],)).fetchone()[0] == "active"
+
+
+@pytest.mark.asyncio
+async def test_atomic_scan_reject_preserves_existing_approved_references(client, web, monkeypatch):
+    from dataclasses import replace
+
+    from pc.adapters.magic_scan import MagicNumberScanner
+
+    await login(client, web)
+    original_scan = MagicNumberScanner.scan
+
+    def new_rejection(self, data, *, declared_mime=None):
+        verdict = original_scan(self, data, declared_mime=declared_mime)
+        if data == PNG:
+            return replace(verdict, passed=False, reasons=("新扫描规则拒绝图片",))
+        return verdict
+
+    monkeypatch.setattr(MagicNumberScanner, "scan", new_rejection)
+    with db.open_db(web["path"]) as conn:
+        media_id = conn.execute("SELECT media_id FROM media WHERE sha256=(SELECT sha256 FROM media LIMIT 1)").fetchone()[0]
+        original = [(row["content_id"], row["status"]) for row in conn.execute(
+            "SELECT c.content_id,c.status FROM content_item c JOIN content_media cm USING(content_id) WHERE cm.media_id=? ORDER BY c.content_id", (media_id,))]
+        before = tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition", "review_task"))
+    response = await client.post("/api/v1/uploads", files={
+        "images": ("same.png", PNG), "create_composition": (None, "true"),
+        "composition_name": (None, "拒绝不改变旧归档"),
+    })
+    assert response.status_code == 400, response.text
+    with db.open_db(web["path"]) as conn:
+        assert tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition", "review_task")) == before
+        assert [(row["content_id"], row["status"]) for row in conn.execute(
+            "SELECT c.content_id,c.status FROM content_item c JOIN content_media cm USING(content_id) WHERE cm.media_id=? ORDER BY c.content_id", (media_id,))] == original
+        assert conn.execute("SELECT quarantine_key FROM media WHERE media_id=?", (media_id,)).fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_atomic_upload_does_not_republish_previously_quarantined_bytes(client, web):
+    import hashlib
+
+    from pc.services.sources import ensure_default_backend
+
+    await login(client, web)
+    digest = hashlib.sha256(PNG).hexdigest()
+    key = f"{digest[:2]}/{digest[2:4]}/{digest}"
+    quarantine = web["data"] / "quarantine" / key
+    quarantine.parent.mkdir(parents=True, exist_ok=True)
+    quarantine.write_bytes(PNG)
+    # 在此临时库中布置已隔离的共享媒体，不触碰其他测试/用户数据。
+    with db.open_db(web["path"]) as conn:
+        backend = ensure_default_backend(conn, web["data"] / "quarantine", name="local-quarantine")["backend_id"]
+        media_id = conn.execute("SELECT media_id FROM media WHERE sha256=?", (digest,)).fetchone()[0]
+        conn.execute("UPDATE media SET storage_backend_id=?, quarantine_key=?, scan_status='suspicious' WHERE media_id=?", (backend, key, media_id))
+        conn.execute("UPDATE content_item SET status='quarantined' WHERE content_id IN (SELECT content_id FROM content_media WHERE media_id=?)", (media_id,))
+        before = tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition"))
+    normal = web["data"] / "media" / key
+    normal.unlink()
+    response = await client.post("/api/v1/uploads", files={
+        "images": ("again.png", PNG), "create_composition": (None, "true"),
+        "composition_name": (None, "不能复用隔离图片"),
+    })
+    assert response.status_code == 400, response.text
+    assert "隔离" in response.json()["detail"]
+    with db.open_db(web["path"]) as conn:
+        assert tuple(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("message", "content_item", "composition")) == before
+        assert conn.execute("SELECT quarantine_key FROM media WHERE media_id=?", (media_id,)).fetchone()[0] == key
+    assert not normal.exists() and quarantine.read_bytes() == PNG
+
+
+@pytest.mark.asyncio
 async def test_atomic_composition_over_existing_duplicate_message(client, web):
     await login(client, web)
     first = await client.post("/api/v1/uploads", files={"text": (None, "复用旧消息的组合")})

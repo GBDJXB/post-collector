@@ -29,9 +29,9 @@
 图 + 配文             ``upload:<媒体 sha256>:<文本 sha256>``
 ===================  ==========================================
 
-组件用的就是内容层已经在用的那两个哈希：媒体是 ``media.sha256``，文本是
-``content_item.content_hash``（``sha256(normalize_text(原文))``）的口径。**两处用同一套
-判据**，只差空白的文本文件因此会被认成同一条，而不是先分裂成两条再靠 dup_group 归组。
+媒体组件等于 ``media.sha256``；文本组件使用**完整**规范化原文，避免两个超长
+文本仅截断后的前缀相同就互相顶掉。正文超过字符上限时只保存前缀，身份哈希不再
+等于该内容项的 ``content_hash``；未超限时仍采用相同的规范化口径。
 
 **内容为空的文件不产生消息**（空文件、只剩空白的文本文件）：它们没有可用的身份组件，而
 "所有空文件的哈希都相同"会让它们互相顶掉——那是最难查的一类静默丢数据。跳过的文件记在
@@ -237,8 +237,8 @@ class LocalFilesConnector:
         for item in batch:
             try:
                 message = self._to_message(item)
-            except UnsafeLocalPathError as exc:
-                self._skipped.append((str(item.path), str(exc)))
+            except (UnsafeLocalPathError, OSError) as exc:
+                self._skipped.append((str(item.path), f"文件读取或哈希失败：{exc}"))
                 continue
             if message is not None:
                 messages.append(message)
@@ -323,12 +323,15 @@ class LocalFilesConnector:
 
     def _to_message(self, item: DiscoveredFile) -> SourceMessage | None:
         """把一个发现的文件变成信封；内容身份下无法成立身份时返回 ``None``（并记账跳过）。"""
-        text = self._read_text(item)
+        full_text = self._read_text(item)
         is_text_file = item.path.suffix.lower() in TEXT_SUFFIXES
+        if is_text_file and full_text is None:
+            return None  # 读取失败已记录；不能创建没有内容的文本消息
+        text = full_text[: self._max_text_chars] if full_text is not None else None
         media_refs: tuple[str, ...] = () if is_text_file else (str(item.path),)
 
         if self._identity == IDENTITY_CONTENT:
-            identity = self._content_identity(item, text=text, has_media=bool(media_refs))
+            identity = self._content_identity(item, text=full_text, has_media=bool(media_refs))
             if identity is None:
                 reason = (
                     "0 字节的文件：空字节无法构成内容身份"
@@ -379,8 +382,8 @@ class LocalFilesConnector:
     ) -> str | None:
         """按内容算出 ``platform_msg_id``；没有可用的身份组件时返回 ``None``。
 
-        组件的取法与内容层一致：媒体用字节的 sha256（等于 ``media.sha256``），文本用
-        ``sha256(normalize_text(原文))``（等于 ``content_item.content_hash``）。
+        媒体用字节的 sha256（等于 ``media.sha256``），文本用完整原文的
+        ``sha256(normalize_text(原文))``；超长正文落库截断后，内容项哈希可能不同。
 
         **0 字节的文件一律不产生消息**（文本或媒体都一样）：所有空文件的哈希都是同一个值，
         拿它当身份会让它们互相顶掉。这不会丢内容——媒体的同名侧车文本本身就是
@@ -425,20 +428,18 @@ class LocalFilesConnector:
         return None
 
     def _read_text_file(self, path: Path) -> str | None:
-        """读文本并截断到 ``ingest.max_text_chars``（按字节多读一点以容纳多字节字符）。"""
+        """内容身份需读完整原文；仅入库正文按字符上限截断。"""
         limit_bytes = self._max_text_chars * 4
         try:
             with open_scoped(path, self._roots, sidecar=True) as handle:
-                raw = handle.read(limit_bytes)
+                raw = handle.read() if self._identity == IDENTITY_CONTENT else handle.read(limit_bytes)
         except UnsafeLocalPathError as exc:
             self._skipped.append((str(path), str(exc)))
             return None
-        except OSError:
+        except OSError as exc:
+            self._skipped.append((str(path), f"文本读取失败：{exc}"))
             return None
-        text = raw.decode("utf-8", errors="replace")
-        if len(text) > self._max_text_chars:
-            text = text[: self._max_text_chars]
-        return text
+        return raw.decode("utf-8", errors="replace")
 
 
 __all__ = [

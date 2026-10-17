@@ -29,7 +29,8 @@ HEIC = b"\x00\x00\x00\x20ftypheic\x00\x00\x00\x00" + b"p" * 32
 
 ZIP = b"PK\x03\x04\x14\x00\x00\x00" + b"p" * 32
 SEVENZ = b"7z\xbc\xaf\x27\x1c\x00\x04" + b"p" * 32
-RAR = b"RAR!\x1a\x07\x01\x00" + b"p" * 32
+RAR = b"Rar!\x1a\x07\x01\x00" + b"p" * 32
+RAR4 = b"Rar!\x1a\x07\x00" + b"p" * 32
 GZIP = b"\x1f\x8b\x08\x00" + b"p" * 32
 PDF = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n" + b"p" * 32
 ELF = b"\x7fELF\x02\x01\x01\x00" + b"p" * 32
@@ -63,6 +64,7 @@ class TestSniffMime:
             (PE, "application/x-dosexec"),
             (GZIP, "application/gzip"),
             (RAR, "application/vnd.rar"),
+            (RAR4, "application/vnd.rar"),
             (SEVENZ, "application/x-7z-compressed"),
             (SCRIPT, "text/x-shellscript"),
             (SVG, "image/svg+xml"),
@@ -81,8 +83,24 @@ class TestSniffMime:
     def test_riff_without_webp_is_not_webp(self) -> None:
         assert sniff_mime(b"RIFF\x24\x00\x00\x00WAVEfmt ") is None
 
-    def test_ftyp_with_unknown_brand_falls_back_to_mp4(self) -> None:
-        assert sniff_mime(b"\x00\x00\x00\x20ftypqqqq") == "video/mp4"
+    @pytest.mark.parametrize("data", [b"\x00\x00\x00\x20ftypqqqq", b"\x00\x00\x00\x20ftyp"])
+    def test_ftyp_with_unknown_or_missing_brand_is_rejected(self, data: bytes) -> None:
+        assert sniff_mime(data) is None
+        verdict = MagicNumberScanner().scan(data)
+        assert verdict.passed is False
+        assert verdict.details["category"] == "unknown"
+
+    @pytest.mark.parametrize("data, expected", [
+        (b"PK\x03\x04ftypmp42", "application/zip"),
+        (b"\x1f\x8b\x08\x00ftypmp42", "application/gzip"),
+        (b"%PDFftypmp42", "application/pdf"),
+    ])
+    def test_rejected_header_wins_over_embedded_ftyp(self, data: bytes, expected: str) -> None:
+        assert sniff_mime(data) == expected
+        assert MagicNumberScanner().scan(data).passed is False
+
+    def test_uppercase_rar_is_not_a_real_rar_signature(self) -> None:
+        assert sniff_mime(b"RAR!\x1a\x07\x01\x00") is None
 
 
 class TestAcceptedTypes:
@@ -111,6 +129,7 @@ class TestRejections:
             (ZIP, "压缩包容器"),
             (SEVENZ, "压缩包容器"),
             (RAR, "压缩包容器"),
+            (RAR4, "压缩包容器"),
             (GZIP, "压缩炸弹"),
             (PDF, "隔离渲染"),
             (ELF, "可执行文件"),
@@ -126,6 +145,22 @@ class TestRejections:
         assert verdict.passed is False
         assert any(needle in reason for reason in verdict.reasons), verdict.reasons
         assert verdict.details["category"] in {"rejected", "svg"}
+
+    @pytest.mark.parametrize("header, expected", [
+        (ZIP, "application/zip"),
+        (PDF, "application/pdf"),
+        (ELF, "application/x-elf"),
+        (RAR, "application/vnd.rar"),
+    ])
+    def test_embedded_svg_cannot_override_rejected_container(
+        self, header: bytes, expected: str
+    ) -> None:
+        payload = header + b"<svg xmlns='http://www.w3.org/2000/svg'></svg>"
+        scanner = MagicNumberScanner(policy=SecurityPolicy(allow_svg=True))
+        verdict = scanner.scan(payload)
+        assert verdict.passed is False
+        assert verdict.details["mime_detected"] == expected
+        assert verdict.details["category"] == "rejected"
 
     def test_unknown_type_fails_closed(self, scanner: MagicNumberScanner) -> None:
         verdict = scanner.scan(UNKNOWN)

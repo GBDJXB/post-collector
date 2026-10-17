@@ -495,6 +495,68 @@ class TestMediaItems:
 
 
 class TestQuarantineAndReview:
+    def test_later_rejection_quarantines_all_shared_media_references(self, env: SimpleNamespace) -> None:
+        from pc.services import viewing
+
+        source = _source(env.conn, env.tmp)
+        first = _write(env.tmp / "first.png", PNG)
+        original_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(first,), msg_id="first")
+        assert env.worker.run_message(original_id).succeeded == 1
+        old_content = env.conn.execute("SELECT content_id FROM content_item WHERE message_id=?", (original_id,)).fetchone()[0]
+        assert viewing.detail(env.conn, content_id=old_content, message_id=None)["parts"]
+
+        env.worker._upload_root = env.tmp / "upload-staging"
+        staged = _write(env.worker._upload_root / "request" / "second.png", PNG)
+        second_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(staged,), msg_id="second")
+        # 独立扫描配置变化使这次 PNG 不放行；worker 的文件读取限额仍保持不变。
+        env.worker._scanner = MagicNumberScanner(limits=IngestLimits(max_media_bytes=16))
+        assert env.worker.run_message(second_id).succeeded == 1
+        media = env.conn.execute("SELECT m.*, b.name AS backend FROM media m JOIN storage_backend b ON b.backend_id=m.storage_backend_id").fetchone()
+        assert env.conn.execute("SELECT count(*) FROM media").fetchone()[0] == 1
+        assert media["backend"] == "local-quarantine"
+        assert media["quarantine_key"] == media["object_key"]
+        assert media["scan_status"] == "suspicious"
+        assert media["mime_detected"] == "image/png", "新扫描未嗅探类型时仍须保留已核实的字节类型"
+        assert [row[0] for row in env.conn.execute("SELECT status FROM content_item ORDER BY content_id")] == ["quarantined", "quarantined"]
+        evidence = json.loads(env.conn.execute("SELECT payload FROM review_task WHERE target_id=?", (old_content,)).fetchone()[0])
+        assert evidence["sha256"] == hashlib.sha256(PNG).hexdigest()
+        assert evidence["ref_role"] == "triggering_scan"
+        assert evidence["ref"].endswith("second.png")
+        assert (env.quarantine / media["object_key"]).read_bytes() == PNG
+        with pytest.raises(ValueError, match=r"不可见|可见"):
+            viewing.detail(env.conn, content_id=old_content, message_id=None)
+
+    def test_upload_channel_rejection_does_not_hide_valid_older_video(self, env: SimpleNamespace) -> None:
+        video = b"\x00\x00\x00\x18ftypisom" + b"x" * 30
+        source = _source(env.conn, env.tmp)
+        earlier = _write(env.tmp / "first.mp4", video)
+        old_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(earlier,), msg_id="old")
+        assert env.worker.run_message(old_id).succeeded == 1
+        env.worker._upload_root = env.tmp / "upload-staging"
+        staged = _write(env.worker._upload_root / "request" / "second.png", video)
+        new_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(staged,), msg_id="new")
+        assert env.worker.run_message(new_id).succeeded == 1
+        assert [row[0] for row in env.conn.execute("SELECT status FROM content_item ORDER BY content_id")] == ["active", "quarantined"]
+        media = env.conn.execute("SELECT m.quarantine_key, b.name FROM media m JOIN storage_backend b ON b.backend_id=m.storage_backend_id").fetchone()
+        assert media["quarantine_key"] is None and media["name"] == "local"
+        old_content = env.conn.execute("SELECT content_id FROM content_item WHERE message_id=?", (old_id,)).fetchone()[0]
+        assert env.conn.execute("SELECT count(*) FROM review_task WHERE target_id=?", (old_content,)).fetchone()[0] == 0
+
+    def test_later_pass_does_not_restore_shared_quarantined_bytes(self, env: SimpleNamespace) -> None:
+        source = _source(env.conn, env.tmp)
+        env.worker._upload_root = env.tmp / "upload-staging"
+        staged = _write(env.worker._upload_root / "request" / "first.mp4", b"\x00\x00\x00\x18ftypisom" + b"x" * 30)
+        first_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(staged,), msg_id="first")
+        assert env.worker.run_message(first_id).succeeded == 1
+        outside = _write(env.tmp / "second.mp4", b"\x00\x00\x00\x18ftypisom" + b"x" * 30)
+        second_id, _ = _seed(env.conn, source_id=source["source_id"], refs=(outside,), msg_id="second")
+        assert env.worker.run_message(second_id).succeeded == 1
+        assert env.conn.execute("SELECT count(*) FROM media").fetchone()[0] == 1
+        assert [row[0] for row in env.conn.execute("SELECT status FROM content_item ORDER BY content_id")] == ["quarantined", "quarantined"]
+        media = env.conn.execute("SELECT quarantine_key FROM media").fetchone()
+        assert media[0] is not None
+        assert not (env.media / media[0]).exists(), "再次放行不能偷偷写一份正常媒体"
+
     def test_rejected_type_is_quarantined_physically(self, env: SimpleNamespace) -> None:
         source = _source(env.conn, env.tmp)
         ref = _write(env.tmp / "tool.exe", EXE)

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, replace
@@ -101,6 +100,11 @@ class ModelGateway:
         conn.execute('UPDATE egress_log SET status=?,error_class=?,provider_request_id=?,usage=?,run_id=?,finished_at=? WHERE request_id=?',
                      (status, error_class, provider.provider_request_id if provider else None, mt.encoded(provider.usage).decode() if provider else None, run_id, db.now_iso(), ident))
 
+    def _fail_before_dispatch(self, conn, ident, error):
+        logging.getLogger(__name__).warning('模型派发前失败 request_id=%s class=%s', ident, type(error).__name__)
+        self._finish(conn, ident, 'failed', error_class='write_failure')
+        return '外发前本机检查失败，请核对服务日志；本次未发送'
+
     def send(self, conn, session, ident, *, confirmed=False, actor_id=None):
         if confirmed is not True:
             raise ValueError('必须对本次预览明确确认外发')
@@ -136,22 +140,36 @@ class ModelGateway:
                 with db.transaction(conn):
                     self._finish(conn, ident, 'failed', error_class='provider_failure')
                 return self._status(conn, ident)
+            detail = None
             with self.access.lock, db.transaction(conn):
                 try:
                     self._authorized(conn, session, actor_id)
-                    fresh = mt.build_input(conn, **preview.target, max_image_pixels=self.access.max_image_pixels)
-                    if (
-                        preview.generation != self.access.generation
-                        or self.access.config_digest(conn) != config_digest
-                        or fresh.fingerprint != prepared.fingerprint
-                        or fresh.authorization_digest != prepared.authorization_digest
-                        or mt.load_catalog(conn).fingerprint != catalog.fingerprint
-                    ):
-                        raise ValueError('模型放行状态或输入改变')
                 except ValueError:
                     self._finish(conn, ident, 'stale', error_class='stale')
-                    return self._status(conn, ident)
-                conn.execute("UPDATE egress_log SET status='dispatching',dispatched_at=? WHERE request_id=?", (db.now_iso(), ident))
+                    detail = ('会话已失效，请重新进入本机 Web' if not self.session_valid(session)
+                              else '模型外发未放行，请检查本机会话、总闸与密钥后重新预览')
+                except Exception as error:
+                    detail = self._fail_before_dispatch(conn, ident, error)
+                if detail is None:
+                    try:
+                        fresh = mt.build_input(conn, **preview.target, max_image_pixels=self.access.max_image_pixels)
+                        if (
+                            preview.generation != self.access.generation
+                            or self.access.config_digest(conn) != config_digest
+                            or fresh.fingerprint != prepared.fingerprint
+                            or fresh.authorization_digest != prepared.authorization_digest
+                            or mt.load_catalog(conn).fingerprint != catalog.fingerprint
+                        ):
+                            raise ValueError('模型放行状态或输入改变')
+                    except ValueError:
+                        self._finish(conn, ident, 'stale', error_class='stale')
+                        detail = '放行状态或输入已改变，请重新预览并确认'
+                    except Exception as error:
+                        detail = self._fail_before_dispatch(conn, ident, error)
+                if detail is None:
+                    conn.execute("UPDATE egress_log SET status='dispatching',dispatched_at=? WHERE request_id=?", (db.now_iso(), ident))
+            if detail is not None:
+                return self._status(conn, ident) | {'detail': detail}
             try:
                 result = provider.classify({'request': wire, 'catalog': catalog.records})
                 if result is None:
@@ -167,7 +185,18 @@ class ModelGateway:
                 with db.transaction(conn):
                     self._finish(conn, ident, 'outcome_unknown', error_class='network')
                 return self._status(conn, ident)
-            snapshot = mt.make_snapshot(prepared, catalog, provider.selected_ids, config_digest)
+            try:
+                snapshot = mt.make_snapshot(prepared, catalog, provider.selected_ids, config_digest)
+            except (KeyError, TypeError, ValueError, IndexError):
+                with db.transaction(conn):
+                    self._finish(conn, ident, 'failed', error_class='invalid_output', provider=provider)
+                return self._status(conn, ident)
+            except Exception as error:
+                logging.getLogger(__name__).warning('模型外发失败 request_id=%s class=%s', ident, type(error).__name__)
+                with db.transaction(conn):
+                    self._finish(conn, ident, 'failed', error_class='write_failure', provider=provider)
+                return self._status(conn, ident)
+            post_stale = False
             try:
                 with self.access.lock, db.transaction(conn):
                     try:
@@ -177,17 +206,21 @@ class ModelGateway:
                         mt.validate_snapshot(conn, snapshot, target=preview.target, selected_ids=provider.selected_ids, max_image_pixels=self.access.max_image_pixels)
                     except ValueError:
                         self._finish(conn, ident, 'stale', error_class='stale', provider=provider)
-                        return self._status(conn, ident)
-                    version = provider.model_version()
-                    model = conn.execute('SELECT model_version_id FROM model_version WHERE capability=? AND model_name=? AND revision=? AND prompt_version=?', (version['capability'], version['model_name'], version['revision'], version['prompt_version'])).fetchone()
-                    model_id = model[0] if model else conn.execute('INSERT INTO model_version(capability,model_name,revision,prompt_version) VALUES (?,?,?,?) RETURNING model_version_id', (version['capability'], version['model_name'], version['revision'], version['prompt_version'])).fetchone()[0]
-                    applied = tagging.apply_classification(conn, replace(result, model_version_id=model_id), actor_id=actor_id, existing_tag_ids=provider.selected_ids, input_ref=mt.encoded(snapshot).decode(), **{'composition_ids' if 'composition_id' in preview.target else 'content_ids': list(preview.target.values())})
-                    self._finish(conn, ident, 'succeeded', provider=provider, run_id=applied['run_ids'][0])
-                return self._status(conn, ident) | {'run_id': applied['run_ids'][0]}
-            except (sqlite3.Error, db.DatabaseError, ValueError) as error:
+                        post_stale = True
+                    if not post_stale:
+                        version = provider.model_version()
+                        model = conn.execute('SELECT model_version_id FROM model_version WHERE capability=? AND model_name=? AND revision=? AND prompt_version=?', (version['capability'], version['model_name'], version['revision'], version['prompt_version'])).fetchone()
+                        model_id = model[0] if model else conn.execute('INSERT INTO model_version(capability,model_name,revision,prompt_version) VALUES (?,?,?,?) RETURNING model_version_id', (version['capability'], version['model_name'], version['revision'], version['prompt_version'])).fetchone()[0]
+                        applied = tagging.apply_classification(conn, replace(result, model_version_id=model_id), actor_id=actor_id, existing_tag_ids=provider.selected_ids, input_ref=mt.encoded(snapshot).decode(), **{'composition_ids' if 'composition_id' in preview.target else 'content_ids': list(preview.target.values())})
+                        self._finish(conn, ident, 'succeeded', provider=provider, run_id=applied['run_ids'][0])
+            except Exception as error:
                 logging.getLogger(__name__).warning('模型外发失败 request_id=%s class=%s', ident, type(error).__name__)
                 with db.transaction(conn):
                     self._finish(conn, ident, 'failed', error_class='write_failure', provider=provider)
                 return self._status(conn, ident)
+            # 终态已提交；结果读取异常不能反写已成功/过期/无效的结果。
+            if post_stale:
+                return self._status(conn, ident)
+            return self._status(conn, ident) | {'run_id': applied['run_ids'][0]}
         finally:
             _FLIGHT.release()

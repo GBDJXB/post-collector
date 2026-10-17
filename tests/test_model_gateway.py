@@ -129,6 +129,156 @@ def test_invalidated_inflight_response_is_not_confirmable(gateway_data, change):
     assert conn.execute('SELECT status FROM egress_log').fetchone()[0] == 'stale'
 
 
+@pytest.mark.parametrize('change', ['session', 'access'])
+def test_reserved_attempt_reports_reason_when_authorization_fails_before_dispatch(gateway_data, change):
+    conn, _, _, _, access, gateway, calls, _, _, sessions = gateway_data
+    p = preview(gateway_data)
+    original_factory = gateway.provider_factory
+
+    def invalidate(key):
+        if change == 'session':
+            sessions.clear()
+        else:
+            access.set_access(conn, 'session', False, confirmed=True)
+        return original_factory(key)
+
+    gateway.provider_factory = invalidate
+    result = gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    assert result['status'] == 'stale' and result['error_class'] == 'stale'
+    assert 'detail' in result and ('会话' in result['detail'] if change == 'session' else '放行' in result['detail'])
+    assert calls == [] and gateway._remaining(conn) == 19
+    assert conn.execute('SELECT dispatched_at FROM egress_log').fetchone()[0] is None
+    assert conn.execute('SELECT count(*) FROM classification_run').fetchone()[0] == 0
+
+
+def test_invalid_selected_tag_after_response_records_terminal_failure(gateway_data):
+    conn, _, _, _, _, gateway, calls, *_ = gateway_data
+    p = preview(gateway_data)
+    provider = gateway.provider_factory('TEST-ONLY-GATEWAY-KEY')
+    original = provider.classify
+
+    def invalid_selection(content):
+        answer = original(content)
+        provider.selected_ids = [999]
+        return answer
+
+    provider.classify = invalid_selection
+    gateway.provider_factory = lambda _key: provider
+    result = gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    assert result['status'] == 'failed' and result['error_class'] == 'invalid_output'
+    log = conn.execute('SELECT status, finished_at, error_class FROM egress_log').fetchone()
+    assert log['status'] == 'failed' and log['finished_at'] and log['error_class'] == 'invalid_output'
+    assert conn.execute('SELECT count(*) FROM classification_run').fetchone()[0] == 0
+    assert conn.execute('SELECT count(*) FROM tag_assignment').fetchone()[0] == 0
+    assert gateway._remaining(conn) == 19
+    assert gateway.send(conn, 'session', p['preview_id'], confirmed=True) == result
+    assert len(calls) == 1
+
+
+def test_reserved_local_check_failure_does_not_leave_prepared_attempt(gateway_data, monkeypatch):
+    from pc.services import model_tagging as mt
+
+    conn, _, _, _, _, gateway, calls, *_ = gateway_data
+    p = preview(gateway_data)
+    original = mt.build_input
+    count = 0
+
+    def fail_after_reservation(*args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise OSError('TEST-ONLY-LOCAL-SECRET')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mt, 'build_input', fail_after_reservation)
+    result = gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    assert count == 2 and calls == []
+    assert result['status'] == 'failed' and result['error_class'] == 'write_failure'
+    assert 'detail' in result and '未发送' in result['detail']
+    assert 'TEST-ONLY-LOCAL-SECRET' not in json.dumps(result, ensure_ascii=False)
+    row = conn.execute('SELECT status,error_class,finished_at,dispatched_at FROM egress_log').fetchone()
+    assert row['status'] == 'failed' and row['error_class'] == 'write_failure'
+    assert row['finished_at'] and row['dispatched_at'] is None
+    assert gateway._remaining(conn) == 19
+
+
+def test_status_read_failure_does_not_rollback_reserved_stale(gateway_data):
+    conn, _, _, _, access, gateway, calls, *_ = gateway_data
+    p = preview(gateway_data)
+    original_factory = gateway.provider_factory
+
+    def revoke(key):
+        access.set_access(conn, 'session', False, confirmed=True)
+        return original_factory(key)
+
+    gateway.provider_factory = revoke
+    gateway._status = lambda *_: (_ for _ in ()).throw(RuntimeError('response-read-failed'))
+    with pytest.raises(RuntimeError, match='response-read-failed'):
+        gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    row = conn.execute('SELECT status,finished_at,dispatched_at FROM egress_log').fetchone()
+    assert row['status'] == 'stale' and row['finished_at'] and row['dispatched_at'] is None
+    assert calls == []
+
+
+def test_status_read_failure_does_not_overwrite_invalid_output(gateway_data):
+    conn, _, _, _, _, gateway, calls, *_ = gateway_data
+    p = preview(gateway_data)
+    provider = gateway.provider_factory('TEST-ONLY-GATEWAY-KEY')
+    original = provider.classify
+
+    def invalid_selection(content):
+        answer = original(content)
+        provider.selected_ids = [999]
+        return answer
+
+    provider.classify = invalid_selection
+    gateway.provider_factory = lambda _key: provider
+    gateway._status = lambda *_: (_ for _ in ()).throw(RuntimeError('response-read-failed'))
+    with pytest.raises(RuntimeError, match='response-read-failed'):
+        gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    row = conn.execute('SELECT status,error_class,finished_at FROM egress_log').fetchone()
+    assert row['status'] == 'failed' and row['error_class'] == 'invalid_output' and row['finished_at']
+    assert len(calls) == 1
+
+
+def test_status_read_failure_does_not_overwrite_post_dispatch_stale(gateway_data):
+    conn, _, _, _, access, gateway, calls, behavior, *_ = gateway_data
+    p = preview(gateway_data)
+
+    def revoke(_request):
+        access.set_access(conn, 'session', False, confirmed=True)
+        return httpx.Response(200, json=envelope())
+
+    behavior[0] = revoke
+    gateway._status = lambda *_: (_ for _ in ()).throw(RuntimeError('response-read-failed'))
+    with pytest.raises(RuntimeError, match='response-read-failed'):
+        gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    row = conn.execute('SELECT status,error_class,finished_at FROM egress_log').fetchone()
+    assert row['status'] == 'stale' and row['error_class'] == 'stale' and row['finished_at']
+    assert len(calls) == 1
+    assert conn.execute('SELECT count(*) FROM classification_run').fetchone()[0] == 0
+
+
+def test_status_read_after_success_cannot_overwrite_committed_result(gateway_data):
+    conn, _, _, _, _, gateway, calls, *_ = gateway_data
+    p = preview(gateway_data)
+    original = gateway._status
+
+    def fail_once_after_success(conn, ident):
+        row = conn.execute('SELECT status FROM egress_log WHERE request_id=?', (ident,)).fetchone()
+        if row['status'] == 'succeeded':
+            raise RuntimeError('response-read-failed')
+        return original(conn, ident)
+
+    gateway._status = fail_once_after_success
+    with pytest.raises(RuntimeError, match='response-read-failed'):
+        gateway.send(conn, 'session', p['preview_id'], confirmed=True)
+    assert len(calls) == 1
+    row = conn.execute('SELECT status,error_class,finished_at FROM egress_log').fetchone()
+    assert row['status'] == 'succeeded' and row['error_class'] is None and row['finished_at']
+    assert conn.execute('SELECT count(*) FROM classification_run').fetchone()[0] == 1
+
+
 def test_budget_counts_unknown_failures_and_rolls_after_24_hours(gateway_data):
     conn, _, _, _, _, gateway, calls, behavior, now, _ = gateway_data
     def timeout(request):

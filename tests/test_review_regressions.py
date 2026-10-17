@@ -122,6 +122,19 @@ def test_last_attempt_crash_recovery_is_terminal_and_idempotent(setup: Any) -> N
     assert conn.execute("SELECT count(*) FROM audit_log WHERE result='dead'").fetchone()[0] == 1
 
 
+def test_manual_long_texts_with_same_stored_prefix_are_distinct_messages(setup: Any) -> None:
+    conn, source, _worker, root = setup
+    folder = root / "long-texts"
+    folder.mkdir()
+    (folder / "a.txt").write_text("x" * 100 + "A", encoding="utf-8")
+    (folder / "b.txt").write_text("x" * 100 + "B", encoding="utf-8")
+    connector = LocalFilesConnector(source, roots=[folder], identity="content", max_text_chars=100)
+    report, _ = cli._ingest_loop(conn, source, connector, dry_run=False, limit=None)
+    assert report.inserted == 2
+    assert conn.execute("SELECT count(*) FROM message").fetchone()[0] == 2
+    assert {row[0] for row in conn.execute("SELECT text_raw FROM message")} == {"x" * 100}
+
+
 def test_empty_batch_does_not_hide_later_files(setup: Any) -> None:
     conn, source, _worker, root = setup
     root = root / "files"
