@@ -1,8 +1,8 @@
 """pytest 公共夹具。
 
 数据库测试**不再依赖任何外部服务**：每个测试模块用自己的临时 SQLite 文件，
-跑完随临时目录一起销毁。因此这些测试不需要 ``integration`` marker，也不会因为
-「Docker 没开」而跳过或报错——这是从 PostgreSQL 换到 SQLite 之后最直接的一处收益。
+跑完随临时目录一起销毁。因此这些测试不需要 ``integration`` marker，
+也不依赖外部数据库服务。
 
 ``integration`` marker 仍然保留在 ``pyproject.toml`` 里，留给将来真正需要外部
 服务的测试（平台接口、模型下载、对象存储等）。
@@ -68,7 +68,7 @@ def fresh_db(tmp_path: Path) -> Iterator[Any]:
 def isolate_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """把 ``PC_DATA_ROOT`` / ``PC__PATHS__*`` 从环境里摘掉。
 
-    CI 与开发机上可能残留部署变量（例如容器时代留下的 ``PC__PATHS__MEDIA_ROOT=/data/media``）。
+    CI 与开发机上可能残留部署变量（例如 ``PC__PATHS__MEDIA_ROOT=/data/media``）。
     它们是**最高优先级**，留着会让"媒体落到哪里"的断言在不同机器上给出不同结果——
     测试必须只依赖自己显式传进去的东西。
     """

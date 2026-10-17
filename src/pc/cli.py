@@ -76,8 +76,6 @@ _EXPECTED_FILES: tuple[str, ...] = (
     "AGENTS.md",
     "README.md",
     "pyproject.toml",
-    "docker-compose.yml",
-    "Dockerfile",
     ".env.example",
     ".gitignore",
     "config/app.yaml",
@@ -381,11 +379,11 @@ def _doctor_runtime_dirs(root: Path) -> None:
         mark = "✓" if path.is_dir() else "·"
         detail = f"/ → {path}（来源 {source}）" if explicit else "/"
         print(f"    {mark} {name}{detail}")
-        # 容器里写 /data/media 是对的；在本机（Windows）却会落到当前盘符下的 \data\media，
+        # Unix 风格的 /data/media 在 Windows 上会落到当前盘符下的 \data\media，
         # 这是个静默的落点错误，值得点名——路径本身没错，错的是它出现的环境。
         if os.name == "nt" and explicit and not path.drive:
             print(
-                "      ! 这个值看起来是容器/Unix 风格的路径，在 Windows 上会落到当前盘符；"
+                "      ! 这个值看起来是 Unix 风格的路径，在 Windows 上会落到当前盘符；"
                 "本机运行请写成绝对路径（如 D:\\pc\\media）或留空让它从数据根目录派生"
             )
     if resolved.data_root != (root / "data"):
@@ -666,7 +664,7 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
     """用 ``VACUUM INTO`` 生成事务一致的快照，并校验它能打开、结构自洽（DESIGN §7.1）。"""
     from pc.adapters import sqlite as db
 
-    resolved, _ = _db_and_paths(args)
+    resolved, paths = _db_and_paths(args)
     if not resolved.path.is_file():
         print(f"  ✗ 数据库文件还不存在：{resolved.path}", file=sys.stderr)
         return 2
@@ -674,7 +672,7 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
     target = (
         Path(args.to).expanduser()
         if args.to
-        else resolved.path.parent / "backup" / db.backup_filename()
+        else paths.backup_root / db.backup_filename()
     )
 
     try:
@@ -1768,7 +1766,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_db_backup.add_argument("--root", help=root_help)
     p_db_backup.add_argument(
         "--to",
-        help="快照输出路径（默认 <data_root>/backup/pc-<UTC 时间戳>.sqlite3）；已存在则拒绝覆盖",
+        help="快照输出路径（默认已解析的 paths.backup_root 下时间戳文件，"
+             "未配置时为 <data_root>/backup）；已存在则拒绝覆盖",
     )
     p_db_backup.set_defaults(func=cmd_db_backup)
 

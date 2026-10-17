@@ -311,7 +311,7 @@ uv run pc config seed
 uv run pc db backup --to "E:\备份\pc-2026-10-08.sqlite3"
 ```
 
-命令用 `VACUUM INTO` 生成一致快照并校验完整性，目标已存在时报错。媒体和隔离区字节另用文件备份工具同步。备份恢复需要同时匹配数据库与对应媒体文件。
+命令用 `VACUUM INTO` 生成一致快照并校验完整性，目标已存在时报错。省略 `--to` 时按已解析的 `PC__PATHS__BACKUP_ROOT`（或 `config/app.yaml` 的 `paths.backup_root`）写入，未配置时为 `<data_root>/backup`，通常与数据库同盘，不可直接当作异盘备份。媒体、隔离区字节和配置另用文件备份工具同步。备份恢复需要同时匹配数据库与对应媒体文件。
 
 升级现有实例时，停止 Web 服务与 worker，备份库文件和媒体，再更新代码与依赖并执行：
 

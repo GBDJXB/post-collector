@@ -129,6 +129,79 @@ class TestExplicitOverrides:
         assert "app.yaml:db.data_root" in out, "来源要能被解释，否则无法判断它读没读到配置"
 
 
+class TestBackupDestination:
+    def test_default_backup_uses_configured_backup_root_not_database_parent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _fake_repo(tmp_path / "repo")
+        database = tmp_path / "database-disk" / "pc.sqlite3"
+        backup_root = tmp_path / "backup-disk"
+        monkeypatch.setenv("PC_DATA_ROOT", str(tmp_path / "data-root"))
+        monkeypatch.setenv("PC__PATHS__BACKUP_ROOT", str(backup_root))
+        code, out = _run(["db", "apply", "--root", str(repo), "--path", str(database)], capsys)
+        assert code == 0, out
+
+        code, out = _run(["db", "backup", "--root", str(repo), "--path", str(database)], capsys)
+        assert code == 0, out
+        snapshots = list(backup_root.glob("pc-*.sqlite3"))
+        assert len(snapshots) == 1
+        assert not (database.parent / "backup").exists()
+        conn = sqlite3.connect(snapshots[0])
+        try:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert conn.execute("SELECT name FROM sqlite_master WHERE name='probe'").fetchone()[0] == "probe"
+        finally:
+            conn.close()
+
+    def test_explicit_backup_target_still_wins_and_refuses_overwrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _fake_repo(tmp_path / "repo")
+        database = tmp_path / "database-disk" / "pc.sqlite3"
+        backup_root = tmp_path / "backup-disk"
+        destination = tmp_path / "chosen-disk" / "snapshot.sqlite3"
+        monkeypatch.setenv("PC_DATA_ROOT", str(tmp_path / "data-root"))
+        monkeypatch.setenv("PC__PATHS__BACKUP_ROOT", str(backup_root))
+        code, out = _run(["db", "apply", "--root", str(repo), "--path", str(database)], capsys)
+        assert code == 0, out
+
+        args = ["db", "backup", "--root", str(repo), "--path", str(database), "--to", str(destination)]
+        code, out = _run(args, capsys)
+        assert code == 0, out
+        assert destination.is_file() and not backup_root.exists()
+        original = destination.read_bytes()
+        code, out = _run(args, capsys)
+        assert code == 2 and "已存在" in out
+        assert destination.read_bytes() == original
+
+
+class TestDoctorRequiredFiles:
+    def test_doctor_accepts_repo_with_required_files_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _fake_repo(tmp_path / "repo", data_root=tmp_path / "state")
+        for relative in (
+            "AGENTS.md",
+            "README.md",
+            ".env.example",
+            ".gitignore",
+            "config/settings-registry.yaml",
+            "migrations/sqlite/0001_init.sql",
+        ):
+            target = repo / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# fixture\n", encoding="utf-8")
+
+        code, out = _run(["doctor", "--root", str(repo)], capsys)
+        assert code == 0, out
+        assert "仓库文件不完整" not in out
+
+        (repo / "README.md").unlink()
+        code, out = _run(["doctor", "--root", str(repo)], capsys)
+        assert code == 2, out
+        assert "✗ README.md" in out
+
+
 class TestErrorsAreActionable:
     def test_missing_migrations_dir_lists_the_ways_out(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

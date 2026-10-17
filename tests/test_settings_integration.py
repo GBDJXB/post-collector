@@ -1,8 +1,8 @@
 """设置层集成测试：在临时 SQLite 库里验证播种、审计与回滚（DESIGN §6.2.2）。
 
 库由 ``tests/conftest.py`` 的 ``applied_schema`` 夹具提供：模块专属的临时文件
-加上已应用的 0001。因此本文件**不需要** ``integration`` marker，也不依赖
-Docker / PostgreSQL——这是换到 SQLite 之后最直接的一处收益。
+加上已应用的 0001。因此本文件**不需要** ``integration`` marker，
+也不依赖外部数据库服务。
 这里守的是三条容易被实现悄悄破坏的契约：
 
 * 播种**只插不改**——重复运行不会覆盖任何已经初始化的实例；

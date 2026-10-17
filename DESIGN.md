@@ -353,7 +353,7 @@ view-cache独立复制、原子替换并验证链接/reparse和硬链接，缓�
 
 ### 7.1 完整备份
 
-当前库备份为SQLite一致快照。完整备份同时需要媒体和配置，库备份命令不自动完成媒体备份。放不同物理介质，恢复校验结构/外键/对象哈希/索引/可见性，完整演练为发布验证。日程、保留天数、目标由管理员选，不承诺自动分层保留。
+当前库备份为SQLite一致快照。`pc db backup` 不传 `--to` 时取已解析的 `paths.backup_root`（可由 `PC__PATHS__BACKUP_ROOT` 覆盖），显式 `--to` 优先；默认 `<data_root>/backup` 并不保证与库异盘，不能冒充异盘备份。完整备份同时需要媒体和配置，库备份命令不自动完成媒体备份。放不同物理介质，恢复校验结构/外键/对象哈希/索引/可见性，完整演练为发布验证。日程、保留天数、目标由管理员选，不承诺自动分层保留。
 
 ### 7.2 维护
 
@@ -403,13 +403,13 @@ view-cache独立复制、原子替换并验证链接/reparse和硬链接，缓�
 
 ### 10.1 安装基线
 
-当前源码uv sync、uv run pc。uv tool/wheel的迁移资源打包待交付验证，不能写成当前可用。可移植发布形式另行确认，三平台打包/签名和模型下载不阻塞核心。已有Docker文件也不能当作已验证部署。
+当前源码uv sync、uv run pc。uv tool/wheel的迁移资源打包待交付验证，不能写成当前可用。可移植发布形式另行确认，三平台打包/签名和模型下载不阻塞核心。
 
 ### 10.2 数据目录
 
 PC_DATA_ROOT指定根；默认Windows为%LOCALAPPDATA%\post-collector，Linux为$XDG_DATA_HOME/post-collector或~/.local/share/post-collector，macOS为~/Library/Application Support/post-collector。
 
-默认pc.sqlite3位于数据根，PC__DB__PATH只移动库文件，媒体/运行时按根或paths解析。派生media/thumbs/cold/quarantine/backup/models；目录存在不表示缩略图、冷热或模型管理实现。
+默认pc.sqlite3位于数据根，PC__DB__PATH只移动库文件，媒体/运行时按根或paths解析。派生media/thumbs/cold/quarantine/backup/models；`backup_root`可独立指向另一物理介质的绝对路径，默认目录不保证与库异盘，须核实实际落点与写入权限。目录存在不表示缩略图、冷热或模型管理实现。
 
 upload-staging/UUID用于上传，view-cache用于查看；quarantine是扫描失败媒体隔离，不是投稿入口。运行产物不放安装目录，路径来源由doctor解释。
 
@@ -435,6 +435,8 @@ serve解析配置路径、验证库后单Uvicorn进程启动。上传同步线�
 实现以src/pc、frontend、config、migrations/sqlite、锁文件和测试为准。历史数据及撤回方案不替代当前契约。
 
 ## 附录 C：变更记录
+
+2026-10-16 本机备份路径修复：`pc db backup`省略`--to`时使用解析后的`paths.backup_root`，显式目标仍优先。默认目录不保证异盘；需由管理员核实物理介质，另行备份媒体与配置。
 
 2026-10-16 第一梯队缺陷修复：扫描优先拒绝容器魔数、纠正 RAR 签名并拒绝未知 ftyp brand；manual 本地文本身份改用完整规范化原文，仍按既有上限保存正文，读取失败按文件报告跳过。非原子归档的共享媒体遇新扫描拒绝结论会隔离全部旧 active 引用，后续放行不自动恢复；浏览器渠道格式拒绝不降级旧引用，原子组合失败不改旧归档且不能把已隔离字节重发成正常图片。已预留外发的授权失效返回可读 stale，模型输出/本地建议写入异常尽量记稳定终态；未引入迁移、自动清理旧正常媒体对象或跨请求扫描缓存。
 

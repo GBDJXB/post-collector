@@ -471,7 +471,7 @@ def resolve_paths(
     也挪走，一次「把库放到别处」的操作就会静默改变对象存储的位置——对象键虽然不变，
     落盘位置变了同样意味着老内容找不到。
 
-    容器与多盘部署用 ``paths.*`` / ``PC__PATHS__*`` 显式指定每一项。
+    多盘存储用 ``paths.*`` / ``PC__PATHS__*`` 显式指定每一项。
     """
     environ = os.environ if env is None else env
     from_file = read_env_file(env_file)

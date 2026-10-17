@@ -59,14 +59,14 @@ db:
   data_root: ""     # 数据根目录；留空则用平台默认（%LOCALAPPDATA% / XDG / Application Support）
 
 # ---------------------------------------------------------------------------
-# paths —— 留空 = 从数据根目录派生（DESIGN §10.2）。容器与多盘部署可显式指定。
+# paths —— 留空 = 从数据根目录派生（DESIGN §10.2）。多盘存储可显式指定。
 # ---------------------------------------------------------------------------
 paths:
   media_root: ""      # 留空 = <data_root>/media  内容寻址媒体本体 ab/cd/<sha256>
   thumb_root: ""      # 留空 = <data_root>/thumbs 派生缩略图，建议留在 SSD（检索热路径）
   cold_root: ""       # 留空 = <data_root>/cold   冷层，可指向 NAS 挂载
   quarantine_root: "" # 留空 = <data_root>/quarantine  L2 提报隔离区，必须与 media 物理分离
-  backup_root: ""     # 留空 = <data_root>/backup 备份落点，**必须与库文件不同物理介质**
+  backup_root: ""     # 留空 = <data_root>/backup；默认不保证异盘，备份目标须另设物理介质
   models_root: ""     # 留空 = <data_root>/models 本地模型权重（阶段 2 起使用）
 
 # ---------------------------------------------------------------------------

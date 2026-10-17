@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 # 开发依赖使用 PEP 735 的 dependency-groups：`uv sync` 会默认装上它们，
-# 而 Dockerfile 用的 `uv sync --no-dev` 只装运行时依赖。
+# `uv sync --no-dev` 仅安装运行时依赖。
 [dependency-groups]
 dev = [
   "pytest>=8.3",
