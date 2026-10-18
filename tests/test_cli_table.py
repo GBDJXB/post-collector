@@ -21,6 +21,12 @@ def _width(text: str) -> int:
     return cli._display_width(text)
 
 
+def test_cli_binary_size_uses_iec_units() -> None:
+    assert cli._human_size(1024) == "1.0 KiB"
+    assert cli._human_size(1024**2) == "1.0 MiB"
+    assert cli._human_size(1024**4) == "1024.0 GiB"
+
+
 class TestDisplayWidth:
     def test_empty_is_zero(self) -> None:
         assert _width("") == 0

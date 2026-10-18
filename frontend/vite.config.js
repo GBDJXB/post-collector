@@ -7,5 +7,5 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: { output: { entryFileNames: "app.js", assetFileNames: "[name][extname]" } },
   },
-  test: { environment: "jsdom", clearMocks: true },
+  test: { environment: "jsdom", clearMocks: true, css: true },
 });

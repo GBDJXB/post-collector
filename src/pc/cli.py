@@ -1403,11 +1403,11 @@ def _human_size(size: Any) -> str:
         value = float(size or 0)
     except (TypeError, ValueError):  # pragma: no cover - 列是整数
         return "-"
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
-    return f"{value:.1f} GB"  # pragma: no cover - 上一步已覆盖
+    return f"{value:.1f} GiB"  # pragma: no cover - 上一步已覆盖
 
 
 def cfg_dump_json(payload: Any, *, ensure_ascii: bool = True) -> str:

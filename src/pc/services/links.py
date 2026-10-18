@@ -51,7 +51,7 @@ def normalize_url(raw: str) -> str:
             raise ValueError("URL 主机无效")
     port = None
     if port_text or (authority.endswith(":") and not authority.startswith("[")):
-        if not port_text.isdecimal() or not 0 < int(port_text) <= 65535:
+        if not (port_text.isascii() and port_text.isdecimal()) or not 0 < int(port_text) <= 65535:
             raise ValueError("端口无效")
         port = int(port_text)
     lower_scheme = scheme.lower()

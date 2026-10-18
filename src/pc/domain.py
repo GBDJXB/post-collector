@@ -12,6 +12,7 @@ import json
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -365,8 +366,10 @@ class ObjectKey:
     sha256: str
 
     def __post_init__(self) -> None:
-        if len(self.sha256) != 64 or not all(c in "0123456789abcdef" for c in self.sha256.lower()):
+        lowered = self.sha256.lower()
+        if len(lowered) != 64 or not all(c in "0123456789abcdef" for c in lowered):
             raise ValueError("sha256 必须是 64 位十六进制字符串")
+        object.__setattr__(self, "sha256", lowered)
 
     @property
     def value(self) -> str:
@@ -415,13 +418,33 @@ class SourceNotAuthorizedError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _authorization_expiry(value: str) -> datetime:
+    """授权时间必须带时区；比较前统一成 UTC，不能用字符串排序。"""
+    if not isinstance(value, str) or "T" not in value:
+        raise ValueError("授权到期时间须为带时区的 ISO-8601 日期时间")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("授权到期时间须包含明确时区")
+    return parsed.astimezone(UTC)
+
+
 def local_source_authorized(source: Mapping[str, Any], authorizations: Sequence[Mapping[str, Any]], moment: str) -> bool:
-    """本地采集与处理共用的授权闸门。"""
-    return bool(source.get("enabled", 1)) and not source.get("deleted_at") and any(
-        not row.get("revoked_at")
-        and (not row.get("expires_at") or str(row["expires_at"]) > moment)
-        for row in authorizations
-    )
+    """本地采集与处理共用的授权闸门；moment 须为 now_iso 格式，历史无效到期时间失效。"""
+    if not source.get("enabled", 1) or source.get("deleted_at"):
+        return False
+    current = _authorization_expiry(moment)
+    for row in authorizations:
+        if row.get("revoked_at"):
+            continue
+        expires_at = row.get("expires_at")
+        if expires_at is None:
+            return True
+        try:
+            if _authorization_expiry(expires_at) > current:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def normalize_text(text: str) -> str:

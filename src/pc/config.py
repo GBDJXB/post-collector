@@ -224,7 +224,7 @@ class SettingSpec:
             raise SettingsRegistryError(f"设置项 {key} 的 requires 必须是列表（没有依赖就写 []）。")
         requires = tuple(str(item) for item in requires_raw)
 
-        setting_range = _parse_range(key, raw.get("range"))
+        setting_range = _parse_range(key, type_name, raw.get("range"))
         values = _parse_values(key, type_name, raw.get("values"))
         value_labels = _parse_value_labels(key, raw.get("value_labels"), values)
 
@@ -268,10 +268,12 @@ class SettingSpec:
         return humanize_value(self, value)
 
 
-def _parse_range(key: str, raw: Any) -> tuple[Any, Any] | None:
-    """解析 ``range: [min, max]``；任一端为 null 表示该方向不设限。"""
+def _parse_range(key: str, type_name: str, raw: Any) -> tuple[Any, Any] | None:
+    """解析数值类型的 ``range: [min, max]``；null 表示该方向不设限。"""
     if raw is None:
         return None
+    if type_name not in {"int", "float", "bytes", "duration"}:
+        raise SettingsRegistryError(f"设置项 {key} 的 range 不支持 type={type_name}。")
     if isinstance(raw, str) or not isinstance(raw, Sequence) or len(raw) != 2:
         raise SettingsRegistryError(f"设置项 {key} 的 range 必须是 [最小值, 最大值]，任一端可写 null。")
     low, high = raw[0], raw[1]
@@ -619,7 +621,7 @@ def _bool_field(section: Mapping[str, Any], key: str, default: bool, *, where: s
 class IngestLimits:
     """摄入层限额（DESIGN §6.5 的硬上限，属安全基线而不是可调偏好）。"""
 
-    max_media_bytes: int = 52_428_800  # 单文件 50 MB
+    max_media_bytes: int = 52_428_800  # 单文件 50 MiB
     max_image_pixels: int = 100_000_000  # 1 亿像素（解码隔离的上限）
     max_text_chars: int = 100_000
     link_autofetch: bool = False  # 链接默认只记录不抓取（DESIGN §4.3）
@@ -893,6 +895,8 @@ def _check_shape(spec: SettingSpec, value: Any) -> tuple[Any | None, str | None]
     except SettingsValueError as exc:
         return None, str(exc)
 
+    if spec.range is not None and spec.type not in {"int", "float", "bytes", "duration"}:
+        return coerced, f"设置项 {spec.key} 的 range 不支持 type={spec.type}。"
     low, high = spec.range if spec.range else (None, None)
     if low is not None and coerced < low:
         return coerced, _range_reason(spec, coerced, low, high)
@@ -1413,7 +1417,8 @@ def humanize_value(spec: SettingSpec, value: Any) -> str:
 
 
 def _format_size(size: int) -> str:
-    for unit, factor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+    for unit, factor in (("TB", 1000**4), ("GB", 1000**3), ("MB", 1000**2), ("KB", 1000),
+                         ("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
         if size and size % factor == 0:
             return f"{size // factor} {unit}"
     return f"{size} 字节"

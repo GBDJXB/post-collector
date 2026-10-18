@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from pc.adapters.registry import source_config
+from pc.domain import local_source_authorized
 from pc.services import sources as svc
 
 
@@ -59,6 +60,13 @@ class TestCreateSource:
         row = svc.get_source(fresh_db, info["source_id"])
         assert row is not None
         assert source_config(row)["roots"] == ["/tmp/dump"]
+
+    @pytest.mark.parametrize("expires_at", ["tomorrow", "2099-01-01", "2099-01-01T00:00:00"])
+    def test_invalid_expiry_is_rejected_before_inserting_source(self, fresh_db: Any, expires_at: str) -> None:
+        with pytest.raises(svc.SourceError, match="到期时间"):
+            svc.create_source(fresh_db, name="bad-expiry", platform="local", kind="export", expires_at=expires_at)
+        assert fresh_db.execute("SELECT count(*) FROM source").fetchone()[0] == 0
+        assert fresh_db.execute("SELECT count(*) FROM source_authorization").fetchone()[0] == 0
 
     def test_evidence_and_expiry_are_recorded(self, fresh_db: Any) -> None:
         info = svc.create_source(
@@ -128,6 +136,31 @@ class TestAuthorizationState:
             ]
         )
         assert state["expires_at"] == "2030-01-01T00:00:00.000Z"
+
+
+    def test_offset_expiry_uses_instant_not_string_order(self) -> None:
+        source = {"enabled": 1, "deleted_at": None}
+        row = {"expires_at": "2026-01-01T01:00:00+02:00"}
+        assert not local_source_authorized(source, [row], "2025-12-31T23:00:00.000Z")
+        assert local_source_authorized(source, [row], "2025-12-31T22:59:59.999Z")
+
+    def test_invalid_legacy_expiry_fails_closed_without_hiding_valid_authorization(self) -> None:
+        source = {"enabled": 1, "deleted_at": None}
+        rows = [{"expires_at": "not-a-date"}, {"expires_at": "2099-01-01T00:00:00Z"}]
+        assert not local_source_authorized(source, rows[:1], "2026-01-01T00:00:00.000Z")
+        assert local_source_authorized(source, rows, "2026-01-01T00:00:00.000Z")
+        assert not svc.authorization_state(rows[:1])["ok"]
+        assert svc.authorization_state(rows)["ok"]
+
+    def test_state_selects_earliest_instant_and_preserves_original_text(self) -> None:
+        first = "2099-01-01T01:00:00+02:00"  # UTC 2098-12-31 23:00
+        second = "2098-12-31T23:30:00Z"
+        state = svc.authorization_state([
+            {"mode": "a", "expires_at": first},
+            {"mode": "b", "expires_at": second},
+        ])
+        assert state["ok"] is True
+        assert state["expires_at"] == first
 
 
 class TestMergeRoots:

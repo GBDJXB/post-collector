@@ -72,7 +72,7 @@ settings:
     dry_run_first: true
     recompute: retention
     requires: []
-    note: 默认 200 GB。有人工 tag 的内容默认豁免滚动删除，见 DESIGN §7.5。
+    note: 默认 200 GiB。有人工 tag 的内容默认豁免滚动删除，见 DESIGN §7.5。
 
   - key: search.default_page_size
     label: 检索结果每页条数

@@ -11,7 +11,7 @@ import pytest
 
 from pc import cli
 from pc.adapters import sqlite as db
-from pc.presentation import _display_width, render_result
+from pc.presentation import _display_width, _media_summary, render_result
 from pc.services import tagging
 
 
@@ -109,6 +109,19 @@ def test_invalid_pipeline_input(raw, monkeypatch, capsys):
     output = capsys.readouterr()
     assert not output.out
     assert "渲染失败" in output.err
+
+
+@pytest.mark.parametrize("media", [
+    {"count": 1, "width": 1920},
+    {"count": 1, "width": 1920, "height": None},
+])
+def test_media_summary_missing_height_shows_unknown_size(media):
+    assert "尺寸未知" in _media_summary(media)
+    assert "1920xNone" not in _media_summary(media)
+
+
+def test_media_summary_with_both_dimensions():
+    assert "1920x1080" in _media_summary({"count": 1, "width": 1920, "height": 1080})
 
 
 def test_json_warning_goes_to_stderr(workspace, monkeypatch, capsys):

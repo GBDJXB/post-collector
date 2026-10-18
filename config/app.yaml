@@ -34,7 +34,7 @@ defaults:
   # 骨架与 MVP 阶段建议先用 off（纯手动）跑通全流程，再切 local_only。
   ai.involvement: local_only
 
-  # 内容库最大占用（字节），默认 200 GB —— DESIGN §7.5
+  # 内容库最大占用（字节），默认 200 GiB —— DESIGN §7.5
   retention.max_total_bytes: 214748364800
 
   # 检索默认每页条数 —— DESIGN §6.2.1
@@ -83,7 +83,7 @@ jobs:
 # ingest —— 摄入层限额；媒体与文本的硬上限属于安全基线（DESIGN §6.5）
 # ---------------------------------------------------------------------------
 ingest:
-  max_media_bytes: 52428800       # 单文件 50 MB
+  max_media_bytes: 52428800       # 单文件 50 MiB
   max_image_pixels: 100000000     # 1 亿像素，解码隔离的上限
   max_text_chars: 100000
   link_autofetch: false           # 链接默认只记录不抓取 —— DESIGN §4.3

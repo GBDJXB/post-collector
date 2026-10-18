@@ -19,6 +19,7 @@ from typing import Any
 
 from pc.adapters.registry import SourceConfigError, source_config
 from pc.adapters.sqlite import now_iso, transaction
+from pc.domain import _authorization_expiry
 
 #: ``source.kind`` 的合法取值（与 ``source_kind_chk`` 一致）
 SOURCE_KINDS: tuple[str, ...] = ("bot_api", "webhook", "rss", "export", "user_api", "manual")
@@ -99,6 +100,11 @@ def create_source(
     """
     _require_kind(kind)
     mode = _require_mode(authorization_mode or default_authorization_mode(kind))
+    if expires_at is not None:
+        try:
+            _authorization_expiry(expires_at)
+        except ValueError as exc:
+            raise SourceError(f"授权到期时间无效：{exc}") from exc
     if trust_level not in (1, 2, 3):
         raise SourceError(f"trust_level={trust_level!r} 不合法；只能是 1 / 2 / 3。")
 
@@ -210,14 +216,21 @@ def load_authorizations(conn: sqlite3.Connection, source_id: int) -> list[dict[s
 
 def authorization_state(authorizations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """把授权行归纳成一句人话：是否有效、什么模式、什么时候过期。"""
-    moment = now_iso()
+    moment = _authorization_expiry(now_iso())
     live: list[Mapping[str, Any]] = []
+    deadlines: list[tuple[Any, str]] = []
     for row in authorizations:
         if row.get("revoked_at"):
             continue
         expires_at = row.get("expires_at")
-        if expires_at and str(expires_at) <= moment:
-            continue
+        if expires_at is not None:
+            try:
+                deadline = _authorization_expiry(expires_at)
+            except ValueError:
+                continue
+            if deadline <= moment:
+                continue
+            deadlines.append((deadline, expires_at))
         live.append(row)
     if not live:
         reason = "没有授权记录" if not authorizations else "授权已撤销或已过期"
@@ -226,9 +239,7 @@ def authorization_state(authorizations: Sequence[Mapping[str, Any]]) -> dict[str
         "ok": True,
         "reason": "授权有效",
         "modes": tuple(sorted({str(row.get("mode")) for row in live})),
-        "expires_at": min(
-            (str(row["expires_at"]) for row in live if row.get("expires_at")), default=None
-        ),
+        "expires_at": min(deadlines)[1] if deadlines else None,
     }
 
 

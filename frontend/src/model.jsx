@@ -1,10 +1,24 @@
 import React, { useEffect, useState } from "react";
 import { useLocation } from "react-router";
 
+// 两种 API 分别返回对象和 JSON 字符串；坏值不参与证明，也不影响列表渲染。
+function parseEvidence(value) {
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); }
+    catch { return null; }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function readableEvidence(value) {
+  const parsed = parseEvidence(value);
+  return parsed ? JSON.stringify(parsed) : "证据格式不可用";
+}
+
 // 只使用当前画面中已加载的证明；确认时不重新从服务端补齐版本。
 export function proposalProofs(rows, ids) {
   return Object.fromEntries(rows.filter(row => ids.includes(row.assign_id)).flatMap(row => {
-    const evidence = typeof row.evidence === "string" ? JSON.parse(row.evidence) : row.evidence;
+    const evidence = parseEvidence(row.evidence);
     return evidence?.model_proposal ? [[row.assign_id, evidence.model_proposal]] : [];
   }));
 }
@@ -71,7 +85,7 @@ export function ModelPage({ api, run, parseId }) {
       <h4>完整候选目录</h4><ol>{preview.candidate_catalog.map(tag => <li key={tag.candidate_id}>{tag.name} ({tag.namespace})</li>)}</ol>
       <label><input type="checkbox" checked={sendConsent} onChange={event => setSendConsent(event.target.checked)} />我同意将本次预览发送给模型</label><button disabled={!sendConsent} onClick={() => run(send)}>发送本次预览</button></article>}
     {outcome && <p>模型结果：{outcome}</p>}
-    <h3>待审核关联</h3><ul>{assignments.map(row => <li key={row.assign_id}>{row.source === "suggested" && !row.revoked_at && <input type="checkbox" aria-label={`模型选择建议 ${row.assign_id}`} checked={selected.includes(row.assign_id)} onChange={event => setSelected(event.target.checked ? [...selected, row.assign_id] : selected.filter(value => value !== row.assign_id))} />}{row.name}（{row.source}，置信度 {row.confidence}）{row.revoked_at ? "，已撤销" : ""}{row.evidence && <pre>{JSON.stringify(typeof row.evidence === "string" ? JSON.parse(row.evidence) : row.evidence)}</pre>}</li>)}</ul>
+    <h3>待审核关联</h3><ul>{assignments.map(row => <li key={row.assign_id}>{row.source === "suggested" && !row.revoked_at && <input type="checkbox" aria-label={`模型选择建议 ${row.assign_id}`} checked={selected.includes(row.assign_id)} onChange={event => setSelected(event.target.checked ? [...selected, row.assign_id] : selected.filter(value => value !== row.assign_id))} />}{row.name}（{row.source}，置信度 {row.confidence}）{row.revoked_at ? "，已撤销" : ""}{row.evidence && <pre>{readableEvidence(row.evidence)}</pre>}</li>)}</ul>
     <button onClick={() => run(() => review(true))}>确认模型建议</button><button onClick={() => run(() => review(false))}>拒绝模型建议</button>
   </section></>;
 }

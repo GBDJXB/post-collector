@@ -15,7 +15,9 @@ migrations/
 │   ├── 0008_search_visibility_indexes.sql ← 帖可见性与候选映射的覆盖索引，不改表结构
 │   ├── 0009_message_visibility_index.sql  ← 消息可见性与来源的部分索引，减少信封回读
 │   ├── 0010_compositions.sql              独立组合、有序成员及组合标签；使旧帖签名失效
-│   ├── 0011_model_tagging.sql             重建分类记录/组合关联约束，新增元数据 egress_log；共39张 STRICT 表
+│   ├── 0011_model_tagging.sql             ← 重建分类记录/组合关联约束，新增元数据 egress_log；共39张 STRICT 表
+│   ├── 0012_ordered_upload_search.sql     ← 有序消息条目与规范链接索引
+│   └── 0013_drop_redundant_content_item_indexes.sql ← 删除重复成员索引与无查询消费者的部件时间索引
 └── README.md                              本文件
 ```
 

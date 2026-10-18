@@ -17,7 +17,7 @@ def test_normalize_url_accepts_explicit_web_urls(raw, expected):
     assert normalize_url(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["javascript:alert(1)", "example.com", "https://u:p@example.com", "https://example.com:99999", "https://example.com/a b", "https://", "https://example.com/%zz", "https://[:::]/", "https://[::1]:/", "https://example.com/\u202eevil"])
+@pytest.mark.parametrize("raw", ["javascript:alert(1)", "example.com", "https://u:p@example.com", "https://example.com:99999", "https://example.com/a b", "https://", "https://example.com/%zz", "https://[:::]/", "https://[::1]:/", "https://example.com/\u202eevil", "http://example.com:８０", "http://[::1]:٨٠"])
 def test_normalize_url_rejects_unsafe_or_ambiguous_urls(raw):
     from pc.services.links import normalize_url
 

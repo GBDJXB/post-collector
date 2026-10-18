@@ -48,14 +48,24 @@ export function Shell() {
       headers: body === undefined ? {} : { ...(form ? {} : { "Content-Type": "application/json" }), "X-CSRF-Token": csrfRef.current },
       body: body === undefined ? undefined : form ? body : JSON.stringify(body),
     });
-    const data = await response.json();
+    let data, invalidJson = false;
+    try { data = await response.json(); }
+    catch { invalidJson = true; }
+    const payload = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+    if (response.status === 401) { setCsrf(""); csrfRef.current = ""; setSession("会话失效，请使用服务终端中的新授权链接。"); }
     if (!response.ok) {
-      if (response.status === 401) { setCsrf(""); csrfRef.current = ""; setSession("会话失效，请使用服务终端中的新授权链接。"); }
-      const error = new Error((typeof data.detail === "string" ? data.detail : "参数无效，请检查输入") + (data.copied ? "；剪贴板复制已完成" : ""));
+      const detail = invalidJson ? `服务请求失败（HTTP ${response.status}），请检查服务终端`
+        : typeof payload.detail === "string" ? payload.detail : "参数无效，请检查输入";
+      const error = new Error(detail + (payload.copied ? "；剪贴板复制已完成" : ""));
       error.status = response.status;
       throw error;
     }
-    return data;
+    if ((invalidJson && response.status !== 204) || (!invalidJson && (data === null || typeof data !== "object" || Array.isArray(data)))) {
+      const error = new Error(`服务响应格式无效（HTTP ${response.status}）`);
+      error.status = response.status;
+      throw error;
+    }
+    return payload;
   }, []);
   const run = async operation => {
     if (lock.current) return;
@@ -72,7 +82,7 @@ export function Shell() {
     api("session", token ? { token } : undefined).then(data => {
       csrfRef.current = data.csrf; setCsrf(data.csrf);
       setSession("本机临时 root；会话最长 8 小时，空闲 30 分钟失效。");
-    }).catch(error => { setSession(error.message); });
+    }).catch(error => { if (error.status !== 401) setSession(error.message); });
   }, [api]);
   const manage = useManage(api);
   useEffect(() => {

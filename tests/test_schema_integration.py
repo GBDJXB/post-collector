@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ EXPECTED_MIGRATION_NAMES = {
     10: "0010_compositions.sql",
     11: "0011_model_tagging.sql",
     12: "0012_ordered_upload_search.sql",
+    13: "0013_drop_redundant_content_item_indexes.sql",
 }
 
 
@@ -251,12 +253,46 @@ def test_content_hash_index_is_partial_but_not_unique(applied_schema: Any) -> No
     assert "(content_id, message_id, deleted_at, status, nsfw_level)" in indexes["content_item_lookup_idx"]
 
 
-def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
-    """0005/0006 的落点：文件名列 + 两个时间列上的索引（按消息时间排序必须走索引）。
+def test_redundant_indexes_dropped_without_losing_message_order_or_uniqueness(fresh_db: Any) -> None:
+    indexes = _index_sqls(fresh_db, "content_item")
+    assert "content_item_message_idx" not in indexes
+    assert "content_item_sent_idx" not in indexes
+    automatic = [str(row[1]) for row in fresh_db.execute("PRAGMA index_list(content_item)")
+                 if row[3] == "u" and [part[2] for part in fresh_db.execute(f"PRAGMA index_info({row[1]})")]
+                 == ["message_id", "ordinal"]]
+    assert len(automatic) == 1
+    plan = [row[3] for row in fresh_db.execute(
+        "EXPLAIN QUERY PLAN SELECT content_id FROM content_item WHERE message_id=1 ORDER BY ordinal,content_id"
+    )]
+    assert any(automatic[0] in detail for detail in plan)
+    source = fresh_db.execute(
+        "INSERT INTO source(uuid,name,platform,kind) VALUES (?,'index-test','local','manual') RETURNING source_id",
+        (str(uuid.uuid4()),),
+    ).fetchone()[0]
+    message = fresh_db.execute(
+        "INSERT INTO message(uuid,source_id,platform_msg_id) VALUES (?,?,'index-message') RETURNING message_id",
+        (str(uuid.uuid4()), source),
+    ).fetchone()[0]
+    for ordinal in (0, 1):
+        fresh_db.execute(
+            "INSERT INTO content_item(uuid,message_id,item_type,ordinal) VALUES (?,?,'text',?)",
+            (str(uuid.uuid4()), message, ordinal),
+        )
+    assert [row[0] for row in fresh_db.execute(
+        "SELECT ordinal FROM content_item WHERE message_id=? ORDER BY ordinal", (message,)
+    )] == [0, 1]
+    with pytest.raises(sqlite3.IntegrityError):
+        fresh_db.execute(
+            "INSERT INTO content_item(uuid,message_id,item_type,ordinal) VALUES (?,?,'text',0)",
+            (str(uuid.uuid4()), message),
+        )
 
-    0005 先给 ``message(sent_at)`` 加了单列索引，实测发现跨表的 ``ORDER BY m.sent_at,
-    c.content_id`` 用不上任何单表索引（十万条 P50 354 ms），0006 因此把 sent_at 复制到
-    ``content_item`` 并改成单表复合索引，同时删掉那条没人用的 message 索引。
+
+def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
+    """0005/0006 添加文件名与派生时间；0013 移除不再有消费者的部件时间索引。
+
+    历史上 0006 曾为按内容项排序建立索引，当前帖级使用 post.sent_at、Web v2 使用
+    message.sent_at；保留派生列供重算/体检，历史已应用迁移文件保持原样。
     """
     columns = {str(row[1]): row for row in applied_schema.execute("PRAGMA table_info(content_item)")}
     assert "original_name" in columns, "0005 应该给 content_item 加上 original_name"
@@ -265,12 +301,9 @@ def test_item_name_column_and_message_time_index(applied_schema: Any) -> None:
     assert "sent_at" in columns, "0006 应该给 content_item 加上 sent_at（派生的消息时间）"
     assert columns["sent_at"][3] == 0, "消息时间可空：手工上传就没有"
 
-    index_sql = _index_sqls(applied_schema, "content_item").get("content_item_sent_idx")
-    assert index_sql is not None, "0006 应该建 content_item_sent_idx"
-    assert index_sql == (
-        "CREATE INDEX content_item_sent_idx ON content_item (sent_at DESC, content_id DESC)"
-        " WHERE deleted_at IS NULL"
-    ), f"索引形状不符：{index_sql}"
+    assert "content_item_sent_idx" not in _index_sqls(applied_schema, "content_item"), (
+        "0013 后该派生时间索引没有当前查询消费者，但列仍用于重算及体检"
+    )
     assert "message_sent_idx" not in _index_sqls(applied_schema, "message"), (
         "0006 之后 message_sent_idx 应当已被删除（没有查询用它，只拖慢写入）"
     )

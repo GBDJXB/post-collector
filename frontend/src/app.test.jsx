@@ -1,11 +1,11 @@
 import React from "react";
-import { readFileSync } from "node:fs";
-const webCss = readFileSync("src/style.css", "utf8");
+import webCss from "./style.css?raw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Shell, safeId } from "./app.jsx";
+import { proposalProofs } from "./model.jsx";
 import { safeWebUrl } from "./links.jsx";
 
 const body = '<script>window.bad=true</script>中文正文';
@@ -577,6 +577,89 @@ test("管理页继续支持打标、建议、别名与系统动作", async () =>
   expect(JSON.parse(calls.find(x => x.url.endsWith("/suggestions/confirm")).options.body)).toEqual({ ids: [9], expected_runs: { 9: { run_id: 12, version: "b4d9551a-7876-4933-b52f-98b8bacde1e8" } } });
   expect(calls.some(x => x.url.endsWith("/aliases/add"))).toBe(true);
 });
+
+test("非 JSON 500 显示可读状态而非解析异常", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: false, status: 500, json: async () => { throw new SyntaxError("Unexpected token I"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/manage"]}><Shell /></MemoryRouter>);
+  await waitFor(() => expect(screen.getByRole("status").textContent).toContain("HTTP 500"));
+  expect(screen.getByRole("status").textContent).not.toContain("Unexpected token");
+});
+
+test("非 JSON 401 仍清除会话和操作区", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: false, status: 401, json: async () => { throw new SyntaxError("Unexpected token I"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/manage"]}><Shell /></MemoryRouter>);
+  expect(await screen.findByText(/会话失效，请使用服务终端/)).toBeTruthy();
+  expect(screen.queryByRole("main")).toBeNull();
+});
+
+test("畸形成功响应明确拒绝而不是伪装成空结果", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: true, status: 200, json: async () => { throw new SyntaxError("Unexpected token I"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/manage"]}><Shell /></MemoryRouter>);
+  await waitFor(() => expect(screen.getByRole("status").textContent).toContain("响应格式"));
+});
+
+test("畸形模型证明不会伪造审核版本", () => {
+  const rows = [
+    { assign_id: 1, evidence: '{bad' },
+    { assign_id: 2, evidence: '{"model_proposal":{"run_id":12,"version":"valid"}}' },
+    { assign_id: 3, evidence: { model_proposal: { run_id: 13, version: "other" } } },
+  ];
+  expect(proposalProofs(rows, [1, 2, 3])).toEqual({
+    2: { run_id: 12, version: "valid" }, 3: { run_id: 13, version: "other" },
+  });
+});
+
+test("畸形模型证据不会炸掉建议列表", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/assignments?")
+    ? { ok: true, status: 200, json: async () => ({ assignments: [{ assign_id: 9, name: "可检查的建议", source: "suggested", confidence: 0.8, revoked_at: null, evidence: "{bad" }] }) }
+    : original(url, options)));
+  const user = await open("/model");
+  await user.type(screen.getByLabelText("模型目标 ID"), "7");
+  await user.click(screen.getByRole("button", { name: "查看模型目标建议" }));
+  expect(await screen.findByText(/可检查的建议/)).toBeTruthy();
+  expect(screen.getByText("证据格式不可用")).toBeTruthy();
+});
+
+test("启动阶段非 JSON 401 保留重获授权链接的提示", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.endsWith("/session")
+    ? { ok: false, status: 401, json: async () => { throw new SyntaxError("bad response"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/"]}><Shell /></MemoryRouter>);
+  expect(await screen.findByText(/会话失效，请使用服务终端中的新授权链接/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "退出本机会话" })).toBeNull();
+});
+
+test("无正文的 204 退出响应可正常完成", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.endsWith("/logout")
+    ? { ok: true, status: 204, json: async () => { throw new SyntaxError("empty response"); } }
+    : original(url, options)));
+  const user = await open();
+  await user.click(screen.getByRole("button", { name: "退出本机会话" }));
+  expect(await screen.findByText(/已退出，请重启服务获取新授权链接/)).toBeTruthy();
+});
+
+for (const malformed of [null, [], "plain text"]) {
+  test(`成功响应 ${JSON.stringify(malformed)} 被明确拒绝`, async () => {
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+      ? { ok: true, status: 200, json: async () => malformed }
+      : original(url, options)));
+    render(<MemoryRouter initialEntries={["/manage"]}><Shell /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("响应格式"));
+  });
+}
 
 test("授权交换清除 fragment，保留路径和查询参数", async () => {
   window.history.replaceState(null, "", "/manage?message_id=3#token=one-use");

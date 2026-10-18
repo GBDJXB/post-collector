@@ -132,6 +132,15 @@ def test_backend_id_is_carried_for_the_database_row(tmp_path: Path) -> None:
     assert storage.backend_db_id == 7
 
 
+def test_object_key_case_matches_content_addressed_identity() -> None:
+    lower = ObjectKey("ab" * 32)
+    upper = ObjectKey("AB" * 32)
+    assert upper.sha256 == lower.sha256
+    assert upper == lower
+    assert len({lower, upper}) == 1
+    assert upper.value == lower.value == "ab/ab/" + "ab" * 32
+
+
 def test_object_key_rejects_bad_hash() -> None:
     with pytest.raises(ValueError):
         ObjectKey("not-a-hash")

@@ -232,7 +232,8 @@ def _media_summary(media: Mapping[str, Any]) -> str:
         return "（空）"
     if "width" not in media:
         return f"媒体 x{media['count']}"
-    size = f"{media['width']}x{media['height']}" if media.get("width") else "尺寸未知"
+    width, height = media.get("width"), media.get("height")
+    size = f"{width}x{height}" if width and height else "尺寸未知"
     thumb = "有缩略图" if media.get("thumb_key") else "无缩略图"
     return f"媒体 x{media['count']}（{size}，{thumb}）"
 

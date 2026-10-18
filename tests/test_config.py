@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,18 @@ class TestLoadRegistryErrors:
         with pytest.raises(cfg.SettingsRegistryError, match="下限必须小于上限"):
             spec_of(type="int", default=5, range=[20, 0])
 
+    @pytest.mark.parametrize("type_name, default", [("str", "demo"), ("enum", "off"), ("bool", False)])
+    def test_rejects_range_on_non_numeric_type(self, type_name: str, default: Any) -> None:
+        options = {"values": ["off", "on"]} if type_name == "enum" else {}
+        with pytest.raises(cfg.SettingsRegistryError, match=r"range.*type"):
+            spec_of(type=type_name, default=default, range=[0, 10], **options)
+
+    def test_direct_spec_with_invalid_range_returns_reason(self) -> None:
+        spec = replace(spec_of(type="str", default="demo"), range=(0, 10))
+        result = cfg.validate_value(spec, "demo")
+        assert result["ok"] is False
+        assert "range" in result["reason"]
+
     def test_rejects_duplicate_keys(self, tmp_path: Path) -> None:
         body = "schema_version: 1\nsettings:\n"
         for _ in range(2):
@@ -183,6 +196,15 @@ class TestCoerceAndValidate:
         )
         assert cfg.coerce_value(spec, "200GB") == 200 * 1000**3
         assert cfg.coerce_value(spec, "2 GiB") == 2 * 1024**3
+
+    def test_byte_display_preserves_decimal_and_binary_meanings(self) -> None:
+        spec = spec_of(key="retention.max_total_bytes", type="bytes", default=214748364800)
+        assert cfg.humanize_value(spec, cfg.coerce_value(spec, "200GB")) == "200 GB"
+        assert cfg.humanize_value(spec, cfg.coerce_value(spec, "200GiB")) == "200 GiB"
+        assert cfg.humanize_value(spec, cfg.coerce_value(spec, "1KB")) == "1 KB"
+        assert cfg.humanize_value(spec, cfg.coerce_value(spec, "1KiB")) == "1 KiB"
+        assert cfg.humanize_value(spec, 0) == "0 字节"
+        assert cfg.humanize_value(spec, 1025) == "1025 字节"
 
     def test_duration_normalizes_to_seconds(self) -> None:
         spec = spec_of(key="demo.wait", type="duration", default=30)

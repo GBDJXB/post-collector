@@ -91,7 +91,7 @@ post-collector 使用 Python、SQLite 和本地目录归档已授权来源的内
 
 ## 独立组合
 
-- CLI composition create/list/show/update/set-members/remove-member/delete 管理手动组合，可跨消息引用，保留顺序与重复成员；按零基位置解除一次引用，最后成员须显式 -f 才能留下空组合。迁移到 0012，39 张 STRICT 表；仅明确勾选的 Web 上传同时新建组合，其他消息不自动建组合。
+- CLI composition create/list/show/update/set-members/remove-member/delete 管理手动组合，可跨消息引用，保留顺序与重复成员；按零基位置解除一次引用，最后成员须显式 -f 才能留下空组合。当前迁移为 0013，39 张 STRICT 表；仅明确勾选的 Web 上传同时新建组合，其他消息不自动建组合。
 - 组合标签 --composition 独立关联，保留 --message 展开部件；usage_count 仍计内容项，composition_usage_count 单独返回。标签默认仅匹配自身，--match-member-tags 扩到当前可见成员；隐藏成员只返回位置及不可用状态。
 - 组合编辑与审计同事务、详情读快照；软删组合不删除成员，逐位置解除也不删除原内容或其他组合引用。CLI 为本机 root；本机 Web 的组合编辑器沿用帖级 v1 检索选内容项并创建组合，`/compositions/{id}` 可修改名称/说明、追加/移动/逐位置解除成员、管理自身标签或软删组合；最后成员须二次明确确认才能留空。隐藏旧成员只显示不可用位置，操作其他成员须保留其引用，新增成员须复查可见性。上传可明确请求组合与归档原子创建；`/manage` v2 统一搜索内容项、组合名称/说明及可见成员。不开放远程或下载。
 
