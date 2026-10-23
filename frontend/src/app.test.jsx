@@ -1,19 +1,20 @@
 import React from "react";
 import webCss from "./style.css?raw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Shell, safeId } from "./app.jsx";
 import { proposalProofs } from "./model.jsx";
 import { safeWebUrl } from "./links.jsx";
+import messagesEn from "./i18n/messages.en.js";
 
 const body = '<script>window.bad=true</script>中文正文';
 const hit = { message_id: 3, item_type: "text", text: body, tags: [], source: "manual", first_seen_at: "2026-10-04" };
 const detail = { message_id: 3, source: "manual", origin_note: "备注", parts: [{ content_id: 7, item_type: "text", text: body, media: [] }] };
 let calls, uploadHandler;
 beforeEach(() => {
-  calls = []; uploadHandler = null; window.history.replaceState(null, "", "/");
+  calls = []; uploadHandler = null; window.history.replaceState(null, "", "/"); localStorage.clear();
   vi.stubGlobal("fetch", vi.fn(async (url, options) => {
     calls.push({ url, options });
     if (url.endsWith("/uploads") && uploadHandler) return uploadHandler(url, options);
@@ -39,6 +40,145 @@ async function open(path = "/") {
   await waitFor(() => expect(screen.getByRole("status").textContent).toBe("操作完成"));
   return userEvent.setup();
 }
+
+async function renderEn(path = "/") {
+  localStorage.setItem("pc.lang", "en");
+  render(<MemoryRouter initialEntries={[path]}><Shell /></MemoryRouter>);
+  await screen.findByText(messagesEn["shell.session.ready"]);
+  return userEvent.setup();
+}
+
+test("语言切换按钮覆盖界面骨架并记住选择", async () => {
+  const user = await open("/add");
+  expect(screen.getByRole("navigation", { name: "主导航" })).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  expect(document.documentElement.lang).toBe("en");
+  expect(localStorage.getItem("pc.lang")).toBe("en");
+  expect(screen.getByRole("navigation", { name: "Main navigation" })).toBeTruthy();
+  expect(screen.getByText("Collect a page")).toBeTruthy();
+  expect(screen.getByText("Local only")).toBeTruthy();
+  expect(screen.getByText("Local session active")).toBeTruthy();
+  expect(document.title).toContain("Add new content");
+  expect(screen.getByRole("button", { name: "EN" }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("button", { name: "中" }).getAttribute("aria-pressed")).toBe("false");
+  await user.click(screen.getByRole("button", { name: "中" }));
+  expect(document.documentElement.lang).toBe("zh-CN");
+  expect(localStorage.getItem("pc.lang")).toBe("zh");
+  expect(screen.getByRole("navigation", { name: "主导航" })).toBeTruthy();
+  expect(document.title).toContain("加入新内容");
+});
+
+test("刷新后沿用已保存的英文界面", async () => {
+  await renderEn("/add");
+  expect(screen.getByText("Collect a page")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "EN" }).getAttribute("aria-pressed")).toBe("true");
+  expect(document.documentElement.lang).toBe("en");
+});
+
+test("切换语言不重新请求归档数据", async () => {
+  const user = await open("/manage");
+  const before = calls.filter(entry => entry.url.includes("/search?")).length;
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  const after = calls.filter(entry => entry.url.includes("/search?")).length;
+  expect(after).toBe(before);
+});
+
+test("英文界面下非法 ID 提示本地化", async () => {
+  const user = await open("/manage");
+  await user.type(screen.getByLabelText("ID"), "9007199254740993");
+  await user.click(within(document.querySelector(".id-lookup")).getByRole("button", { name: "查看" }));
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toBe(messagesEn["common.invalidId"]));
+});
+
+test("切换语言时已显示的错误通知随语言更新", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: false, status: 500, json: async () => { throw new SyntaxError("bad response"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/manage"]}><Shell /></MemoryRouter>);
+  await screen.findByText(/本机临时 root；/);
+  await waitFor(() => expect(screen.getByRole("status").textContent).toContain("HTTP 500"));
+  expect(screen.getByRole("status").textContent).toContain("服务请求失败");
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toContain("Service request failed"));
+  expect(screen.getByRole("status").textContent).not.toContain("服务请求失败");
+});
+
+test.each([
+  ["/", "home.title"],
+  ["/add", "add.title"],
+  ["/manage", "manage.title"],
+  ["/compositions", "compositions.title"],
+  ["/model", "model.title"],
+])("英文界面 %s 渲染英文标题与主导航", async (path, key) => {
+  await renderEn(path);
+  expect(await screen.findByRole("heading", { level: 1, name: messagesEn[key] })).toBeTruthy();
+  expect(screen.getByRole("navigation", { name: "Main navigation" })).toBeTruthy();
+});
+
+test("英文界面渲染组合编辑器标题与英文控件", async () => {
+  stubComposition([{ position: 0, content_id: 7, available: true, item_type: "text", text: "旧正文", media: [] }]);
+  await renderEn("/compositions/12");
+  expect(await screen.findByRole("heading", { level: 1, name: messagesEn["composition.title"].replace("{id}", "12") })).toBeTruthy();
+  expect(screen.getByLabelText(messagesEn["composition.nameLabel"])).toBeTruthy();
+  expect(screen.getByRole("button", { name: messagesEn["composition.addTags"] })).toBeTruthy();
+  expect(document.querySelector(".sequence-stats").textContent).toContain("1 position");
+});
+
+test("切换语言后本地校验错误重新翻译", async () => {
+  const user = await open("/add");
+  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toBe("请输入文本、链接或选择图片"));
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toBe(messagesEn["add.errorNoContent"]));
+});
+
+test("组合页首屏检索失败提示随语言更新", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: false, status: 500, json: async () => { throw new SyntaxError("bad response"); } }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/compositions"]}><Shell /></MemoryRouter>);
+  await screen.findByText(/本机临时 root；/);
+  await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("服务请求失败"));
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Service request failed"));
+  expect(screen.getByRole("alert").textContent).not.toContain("服务请求失败");
+});
+
+test("模型状态失败提示随语言更新", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.endsWith("/model/status")
+    ? { ok: false, status: 503, json: async () => ({ detail: "bad" }) }
+    : original(url, options)));
+  render(<MemoryRouter initialEntries={["/model"]}><Shell /></MemoryRouter>);
+  await screen.findByText(/本机临时 root；/);
+  expect(await screen.findByText("模型状态不可用")).toBeTruthy();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  expect(await screen.findByText(messagesEn["model.error.statusUnavailable"])).toBeTruthy();
+});
+
+test("切换语言保留加入页草稿与组合队列", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.includes("/search?")
+    ? { ok: true, status: 200, json: async () => ({ hits: [{ ...hit, parts: [{ content_id: 7, item_type: "text", text: "文案", media: { items: [] } }] }], page: 1, has_more: false }) }
+    : original(url, options)));
+  const user = await open("/add");
+  await user.type(screen.getByLabelText("文本"), "草稿不能被切换清空");
+  await user.click(screen.getByRole("button", { name: "EN" }));
+  expect(screen.getByLabelText("Text").value).toBe("草稿不能被切换清空");
+  await user.click(screen.getByRole("link", { name: "Reading paths" }));
+  await user.click(await screen.findByLabelText("Add item 7"));
+  expect(screen.getByLabelText("Add item 7").checked).toBe(true);
+  expect(document.querySelector(".queue-count").textContent).toBe("1 position");
+  await user.click(screen.getByRole("button", { name: "中" }));
+  expect(screen.getByLabelText("加入内容项 7").checked).toBe(true);
+  expect(document.querySelector(".queue-count").textContent).toBe("1 个位置");
+});
 
 test("组合目录进入即列出持久化组合且创建后刷新", async () => {
   const original = globalThis.fetch;

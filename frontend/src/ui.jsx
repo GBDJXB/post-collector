@@ -1,4 +1,5 @@
 import React from "react";
+import { useI18n } from "./i18n/index.jsx";
 
 const paths = {
   home: <><path d="M4 10.5 12 4l8 6.5"/><path d="M6.5 9.5V20h11V9.5"/><path d="M10 20v-5h4v5"/></>,
@@ -41,24 +42,35 @@ export function Icon({ name, size = 18, className = "" }) {
   return <svg className={`icon ${className}`} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] || paths.more}</svg>;
 }
 
-export const typeLabels = {
-  text: "文字", image: "图片", mixed: "图文", link: "链接", video: "视频",
-  audio: "音频", sticker: "贴纸", file: "文件", composition: "组合", message: "消息",
+export function LanguageSwitch() {
+  const { lang, setLang, t } = useI18n();
+  return <div className="lang-switch" role="group" aria-label={t("shell.language")}>
+    <button type="button" lang="zh-CN" aria-pressed={lang === "zh"} title={t("shell.languageToZh")} onClick={() => setLang("zh")}>中</button>
+    <button type="button" lang="en" aria-pressed={lang === "en"} title={t("shell.languageToEn")} onClick={() => setLang("en")}>EN</button>
+  </div>;
+}
+
+const typeKeys = {
+  text: "type.text", image: "type.image", mixed: "type.mixed", link: "type.link", video: "type.video",
+  audio: "type.audio", sticker: "type.sticker", file: "type.file", composition: "type.composition", message: "type.message",
 };
 
 export function TypeMark({ type, kind = "", compact = false }) {
-  const label = kind === "composition" || type === "composition" ? "组合" : (typeLabels[type] || "内容");
-  const icon = kind === "composition" || type === "composition" ? "layers" : type === "image" ? "image" : type === "link" ? "link" : "text";
+  const { t } = useI18n();
+  const composition = kind === "composition" || type === "composition";
+  const label = composition ? t("type.composition") : t(typeKeys[type] || "type.unknown");
+  const icon = composition ? "layers" : type === "image" ? "image" : type === "link" ? "link" : "text";
   return <span className={`type-mark type-${type || kind || "unknown"}${compact ? " is-compact" : ""}`}><Icon name={icon} size={compact ? 12 : 14} />{label}</span>;
 }
 
 export function TagPill({ tag, onRemove, removeLabel, tone = "neutral" }) {
+  const { t } = useI18n();
   const name = typeof tag === "string" ? tag : tag?.name;
   const namespace = typeof tag === "string" ? "" : tag?.namespace;
   if (!name) return null;
-  return <span className={`tag-pill tone-${tone}`} title={namespace ? `命名空间：${namespace}` : undefined}>
+  return <span className={`tag-pill tone-${tone}`} title={namespace ? t("ui.namespaceTitle", { namespace }) : undefined}>
     <span className="tag-hash">#</span>{name}
-    {onRemove && <button type="button" className="tag-remove" aria-label={removeLabel || `撤销标签 ${name}`} onClick={onRemove}><Icon name="close" size={11} /></button>}
+    {onRemove && <button type="button" className="tag-remove" aria-label={removeLabel || t("ui.removeTag", { name })} onClick={onRemove}><Icon name="close" size={11} /></button>}
   </span>;
 }
 
@@ -68,23 +80,20 @@ export function TagList({ tags = [], limit = 8, empty = null, onRemove, removeLa
   return <div className="tag-list">{items.slice(0, limit).map((tag, index) => <TagPill key={`${tag?.namespace || ""}:${tag?.name || tag}:${index}`} tag={tag} onRemove={onRemove ? () => onRemove(tag) : undefined} removeLabel={typeof removeLabel === "function" ? removeLabel(tag) : removeLabel} />)}{items.length > limit && <span className="tag-more">+{items.length - limit}</span>}</div>;
 }
 
-const dateFormatter = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
-const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-
-export function formatDate(value, withTime = false) {
-  if (!value) return "时间未记录";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  return (withTime ? dateTimeFormatter : dateFormatter).format(date);
-}
+export { formatDate } from "./i18n/index.jsx";
 
 export function compactText(value, length = 180) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   return text.length > length ? `${text.slice(0, length)}…` : text;
 }
 
-export function statusLabel(status) {
-  return ({ succeeded: "已完成", queued: "等待处理", running: "处理中", failed: "处理失败", quarantined: "已隔离", dead: "任务终止" })[status] || status || "未知状态";
+const statusKeys = {
+  succeeded: "status.succeeded", queued: "status.queued", running: "status.running",
+  failed: "status.failed", quarantined: "status.quarantined", dead: "status.dead",
+};
+
+export function statusLabel(status, t) {
+  return statusKeys[status] ? t(statusKeys[status]) : status || t("status.unknown");
 }
 
 export function PageHeader({ eyebrow, title, description, actions, meta }) {
