@@ -2,7 +2,7 @@ import React from "react";
 import { readFileSync } from "node:fs";
 const webCss = readFileSync("src/style.css", "utf8");
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { Shell, safeId } from "./app.jsx";
@@ -431,16 +431,16 @@ test("多行诗歌的检索摘要受限但详情保留全文", async () => {
 
 test("导航保留新增草稿与管理表单", async () => {
   const user = await open("/add");
-  await user.type(screen.getByLabelText("文本"), "草稿中文");
+  await enterText(user, "草稿中文");
   await user.type(screen.getByLabelText("备注"), "待提交备注");
   const file = new File(["image"], "same.png", { type: "image/png" });
   await user.upload(screen.getByLabelText("图片"), file);
   await user.click(screen.getByRole("link", { name: "检索 / 管理已有内容" }));
   await user.type(screen.getByLabelText("关键词"), "保留检索条件");
   await user.click(screen.getByRole("link", { name: "加入新内容" }));
-  expect(screen.getByLabelText("文本").value).toBe("草稿中文");
+  expect(screen.getByLabelText("条目 1 文本").value).toBe("草稿中文");
   expect(screen.getByLabelText("备注").value).toBe("待提交备注");
-  expect(screen.getByText("same.png (5 字节)")).toBeTruthy();
+  expect(screen.getByText("图片 same.png（5 字节）")).toBeTruthy();
   await user.click(screen.getByRole("link", { name: "检索 / 管理已有内容" }));
   expect(screen.getByLabelText("关键词").value).toBe("保留检索条件");
 });
@@ -467,16 +467,23 @@ test("正文 URL 可点击而脚本协议保持纯文本", async () => {
 test("有序编辑器按调整后的顺序提交文本图片和链接", async () => {
   const user = await open("/add");
   await user.click(screen.getByRole("button", { name: "添加文本条目" }));
-  await user.type(screen.getByLabelText("条目 1 文本"), "文本 A");
-  await user.upload(screen.getByLabelText("图片"), new File(["png"], "b.png", { type: "image/png" }));
+  fireEvent.change(screen.getByLabelText("条目 1 文本"), { target: { value: "文本 A".repeat(200) } });
+  await user.upload(screen.getByLabelText("图片"), [new File(["png"], "b.png", { type: "image/png" }), new File(["remove"], "remove.png", { type: "image/png" })]);
   await user.click(screen.getByRole("button", { name: "添加链接条目" }));
-  await user.type(screen.getByLabelText("条目 3 URL"), "https://example.org");
-  await user.type(screen.getByLabelText("条目 3 说明"), "人工说明");
+  await user.type(screen.getByLabelText("条目 4 URL"), "https://example.org");
+  await user.type(screen.getByLabelText("条目 4 说明"), "人工说明");
+  await user.click(screen.getByRole("button", { name: "上移条目 4" }));
   await user.click(screen.getByRole("button", { name: "上移条目 3" }));
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  expect(screen.getByLabelText("消息 1 的暂存图片").textContent).toContain("b.png（3 字节）");
+  await user.click(screen.getByRole("button", { name: "删除消息 1 的图片 2" }));
+  expect(screen.getByLabelText("消息 1 的暂存图片").textContent).not.toContain("remove.png");
+  expect(calls.filter(call => call.url.endsWith("/uploads"))).toHaveLength(0);
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
   const sent = calls.find(call => call.url.endsWith("/uploads")).options.body;
+  expect(sent.getAll("images").map(file => [file.name, file.size])).toEqual([["b.png", 3]]);
   expect(JSON.parse(sent.get("parts"))).toEqual([
-    { kind: "text", text: "文本 A" },
+    { kind: "text", text: "文本 A".repeat(200) },
     { kind: "link", url: "https://example.org", description: "人工说明" },
     { kind: "image", index: 0 },
   ]);
@@ -490,7 +497,8 @@ test("仅图片队列重排后按显示顺序上传", async () => {
     new File(["b"], "second.png", { type: "image/png" }),
   ]);
   await user.click(screen.getByRole("button", { name: "下移条目 1" }));
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
   const body = calls.find(call => call.url.endsWith("/uploads")).options.body;
   expect(body.getAll("images").map(file => file.name)).toEqual(["second.png", "first.png"]);
   expect(JSON.parse(body.get("parts"))).toEqual([{ kind: "image", index: 0 }, { kind: "image", index: 1 }]);
@@ -504,7 +512,8 @@ test("仅图片队列移除后只上传保留的图片", async () => {
     new File(["b"], "second.png", { type: "image/png" }),
   ]);
   await user.click(screen.getByRole("button", { name: "移除条目 1" }));
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
   const body = calls.find(call => call.url.endsWith("/uploads")).options.body;
   expect(body.getAll("images").map(file => file.name)).toEqual(["second.png"]);
   expect(JSON.parse(body.get("parts"))).toEqual([{ kind: "image", index: 0 }]);
@@ -513,17 +522,28 @@ test("仅图片队列移除后只上传保留的图片", async () => {
 
 test("上传使用 multipart 与 CSRF，成功清空草稿并打开详情", async () => {
   const user = await open("/add");
-  await user.type(screen.getByLabelText("文本"), "新正文");
+  expect(screen.queryByLabelText("文本", { exact: true })).toBeNull();
+  await enterText(user, "新正文");
   await user.upload(screen.getByLabelText("图片"), new File(["png"], "a.png", { type: "image/png" }));
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "分离消息 1 的图片 1" }));
+  expect(screen.queryByLabelText("消息 1 的暂存图片")).toBeNull();
+  expect(screen.getByLabelText("消息 2 的暂存图片").textContent).toContain("a.png");
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(2);
+  expect(calls.filter(x => x.url.endsWith("/uploads"))).toHaveLength(0);
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
   const call = calls.find(x => x.url.endsWith("/uploads"));
   expect(call.options.body).toBeInstanceOf(FormData);
-  expect(call.options.body.get("text")).toBe("新正文");
+  expect(call.options.body.getAll("images")).toEqual([]);
+  const imageCall = calls.filter(x => x.url.endsWith("/uploads"))[1];
+  expect(imageCall.options.body.getAll("images").map(file => [file.name, file.size])).toEqual([["a.png", 3]]);
+  expect(imageCall.options.body.get("text")).toBe("");
+  expect(uploadText(call.options.body)).toBe("新正文");
   expect(call.options.headers["X-CSRF-Token"]).toBe("test-csrf");
   expect(call.options.headers["Content-Type"]).toBeUndefined();
-  await screen.findByRole("link", { name: "查看本次消息" });
-  expect(screen.getByLabelText("文本").value).toBe("");
-  await user.click(screen.getByRole("link", { name: "查看本次消息" }));
+  await screen.findAllByRole("link", { name: "查看消息 3" });
+  expect(screen.queryByLabelText("条目 1 文本")).toBeNull();
+  await user.click(screen.getAllByRole("link", { name: "查看消息 3" })[0]);
   expect(await screen.findByText(body, { selector: "pre" })).toBeTruthy();
   expect(document.querySelector("script")).toBeNull();
   expect(window.bad).toBeUndefined();
@@ -533,23 +553,26 @@ test("提交中禁止重复操作，失败保留草稿", async () => {
   const user = await open("/add");
   let finish;
   uploadHandler = () => new Promise(resolve => { finish = resolve; });
-  await user.type(screen.getByLabelText("文本"), "保留失败草稿");
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
-  expect(screen.getByRole("button", { name: "加入内容" }).closest("fieldset").disabled).toBe(true);
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
+  await enterText(user, "保留失败草稿");
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(screen.getByRole("button", { name: "全部入库" }).closest("fieldset").disabled).toBe(true);
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
   expect(calls.filter(x => x.url.endsWith("/uploads"))).toHaveLength(1);
   finish({ ok: false, status: 413, json: async () => ({ detail: "大小超过限额" }) });
-  await screen.findByText("大小超过限额");
-  expect(screen.getByLabelText("文本").value).toBe("保留失败草稿");
+  await screen.findAllByText("大小超过限额");
+  expect(screen.getByText(/保留失败草稿.*失败/)).toBeTruthy();
 });
 
 test("隔离结果不给隐藏内容详情入口", async () => {
   const user = await open("/add");
   uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 5, duplicate: false, status: "quarantined", content_ids: [], detail: "已隔离" }) });
-  await user.type(screen.getByLabelText("文本"), "隔离样本");
-  await user.click(screen.getByRole("button", { name: "加入内容" }));
-  await screen.findByText(/消息 5：已隔离/);
-  expect(screen.queryByRole("link", { name: "查看本次消息" })).toBeNull();
+  await enterText(user, "隔离样本");
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  await screen.findByText(/隔离样本.*quarantined/);
+  expect(screen.queryByRole("link", { name: "查看消息 3" })).toBeNull();
 });
 
 test("管理页继续支持打标、建议、别名与系统动作", async () => {
@@ -840,6 +863,260 @@ test("组合软删冲突保留当前页面并提示刷新", async () => {
   expect(await screen.findByRole("alert")).toBeTruthy();
   expect(screen.getByRole("button", { name: "刷新组合详情" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "管理组合 12" })).toBeTruthy();
+});
+
+function uploadText(form) {
+  return form.get("text") ?? JSON.parse(form.get("parts")).filter(entry => entry.kind === "text").map(entry => entry.text).join(" ");
+}
+async function enterText(user, text) {
+  await user.click(screen.getByRole("button", { name: "添加文本条目" }));
+  await user.type(screen.getAllByLabelText(/条目 \d+ 文本/).at(-1), text);
+}
+async function stage(user, text) {
+  await enterText(user, text);
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+}
+async function makeGroup(user, name, text) {
+  await stage(user, text);
+  await user.type(screen.getByLabelText("新组合名称"), name);
+  await user.selectOptions(screen.getByLabelText("用哪条消息创建组合"), screen.getByRole("option", { name: text }).value);
+  await user.click(screen.getByRole("button", { name: "创建暂存组合" }));
+}
+function drag(source, target) {
+  fireEvent.dragStart(source, { dataTransfer: { setData() {}, effectAllowed: "" } });
+  fireEvent.dragOver(target); fireEvent.drop(target); fireEvent.dragEnd(source);
+}
+test("暂存多条消息后可从错误组合移入另一个或新组合", async () => {
+  const user = await open("/add");
+  for (const text of ["第一条", "第二条", "第三条"]) await stage(user, text);
+  expect(calls.filter(call => call.options.method === "POST" && !call.url.endsWith("/session"))).toHaveLength(0);
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(3);
+  await user.type(screen.getByLabelText("新组合名称"), "组合甲");
+  await user.click(screen.getByRole("button", { name: "创建暂存组合" }));
+  drag(screen.getByText(/第二条.*独立消息/).closest("li"), screen.getByText("拖到此处加入组合 组合甲 的末尾"));
+  drag(screen.getByText(/第三条.*独立消息/).closest("li"), screen.getByText(/第一条.*组合甲/).closest("li"));
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(1);
+  expect([...screen.getByLabelText("待导入消息").querySelectorAll(".summary-clamp")].map(node => node.textContent)).toEqual([expect.stringContaining("第三条"), expect.stringContaining("第一条"), expect.stringContaining("第二条")]);
+  await user.click(screen.getByRole("button", { name: "下移暂存消息 1" }));
+  await user.selectOptions(screen.getByLabelText("消息 2 所属组合"), "");
+  expect(screen.getByText(/第三条.*独立消息/)).toBeTruthy();
+  await makeGroup(user, "组合乙", "第四条");
+  drag(screen.getByText(/第三条.*独立消息/).closest("li"), screen.getByText("拖到此处加入组合 组合乙 的末尾"));
+  await user.click(screen.getByRole("button", { name: "上移组合 组合乙" }));
+  expect(screen.getByLabelText("待导入消息").firstElementChild.textContent).toContain("组合乙");
+  expect(calls.filter(call => call.url.endsWith("/uploads"))).toHaveLength(0);
+  cleanup(); await open("/add");
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(0);
+});
+
+test("分组消息按列表顺序上传并立即建组，全部成功后清空暂存", async () => {
+  let next = 0;
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: ++next, content_ids: next === 1 ? [11, 12] : [21], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({ composition_id: 30 + calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST").length }) }; }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  for (const [name, text] of [["组一", "第一条"], ["组二", "第二条"]]) {
+    await makeGroup(user, name, text);
+  }
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  await waitFor(() => expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST")).toHaveLength(2));
+  const uploads = calls.filter(x => x.url.endsWith("/uploads"));
+  expect(uploads).toHaveLength(2);
+  expect(uploads.map(x => uploadText(x.options.body))).toEqual(["第一条", "第二条"]);
+  expect(uploads.every(x => !x.options.body.has("create_composition"))).toBe(true);
+  expect(calls.filter(x => x.options.method === "POST" && (x.url.endsWith("/uploads") || x.url.endsWith("/compositions"))).map(x => x.url.split("/").pop())).toEqual(["uploads", "compositions", "uploads", "compositions"]);
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(0);
+  expect(screen.getByLabelText("入库结果").querySelectorAll("a")).toHaveLength(4);
+  expect(calls.filter(x => x.url.includes("/search?")).length).toBeGreaterThan(1);
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST").map(x => JSON.parse(x.options.body))).toEqual([
+    { name: "组一", description: "", content_ids: [11, 12] }, { name: "组二", description: "", content_ids: [21] },
+  ]);
+});
+
+test("组合成员未成功归档时保留待处理项且不创建组合", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 7, content_ids: [], status: "quarantined" }) });
+  const user = await open("/add");
+  await makeGroup(user, "失败组", "测试失败");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("quarantined");
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST")).toHaveLength(0);
+});
+
+test("上传中断后不重发已成功或未知消息，保留核对结果", async () => {
+  let attempt = 0;
+  uploadHandler = async () => {
+    attempt++;
+    if (attempt === 2) throw new Error("网络中断");
+    return { ok: true, status: 200, json: async () => ({ message_id: attempt, content_ids: [attempt * 10], status: "succeeded" }) };
+  };
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({ composition_id: 35 }) }; }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  await makeGroup(user, "重试组", "第一条");
+  await stage(user, "第二条");
+  await user.selectOptions(screen.getByLabelText("消息 2 所属组合"), screen.getAllByRole("option", { name: "重试组" })[0].value);
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(calls.filter(x => x.url.endsWith("/uploads")).map(x => uploadText(x.options.body))).toEqual(["第一条", "第二条"]);
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST")).toHaveLength(0);
+  expect(screen.getByText(/第二条.*结果不确定/)).toBeTruthy();
+});
+
+test("已创建组合不能再接收新的暂存消息", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 3, content_ids: [7], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.endsWith("/compositions") && options?.method === "POST"
+    ? { ok: true, status: 200, json: async () => ({ composition_id: 30 }) } : original(url, options)));
+  const user = await open("/add");
+  await makeGroup(user, "已创建", "先存");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  await screen.findByRole("link", { name: "组合 30" });
+  expect(screen.getByLabelText("待导入消息").children).toHaveLength(0);
+});
+
+test("暂存是唯一入口，单消息组可填写名称说明并在详情添加标签", async () => {
+  const user = await open("/add");
+  expect(screen.queryByLabelText("同时创建组合")).toBeNull();
+  expect(screen.queryByRole("button", { name: "加入内容", exact: true })).toBeNull();
+  await makeGroup(user, "单条组合", "需要组合");
+  expect(screen.getByText(/需要组合.*单条组合/)).toBeTruthy();
+  expect(calls.filter(call => call.url.endsWith("/uploads"))).toHaveLength(0);
+});
+
+test("组合创建响应丢失后禁止自动重建并展示核对提示", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 7, content_ids: [9], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") { calls.push({ url, options }); throw new Error("响应丢失"); }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  await makeGroup(user, "核对组", "消息");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByText(/创建结果不确定，请到组合目录核对/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST")).toHaveLength(1);
+});
+
+test("组合接口缺少确认 ID 不会自动重复建组", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 7, content_ids: [9], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({}) }; }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  await makeGroup(user, "未确认组", "消息");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByText(/创建结果不确定，请到组合目录核对/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST")).toHaveLength(1);
+});
+
+test("上传明确失败可移除且不阻断其他组合归档", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/uploads")) {
+      calls.push({ url, options });
+      if (uploadText(options.body) === "坏消息") return { ok: false, status: 400, json: async () => ({ detail: "无效条目" }) };
+      return { ok: true, status: 200, json: async () => ({ message_id: 8, content_ids: [12], status: "succeeded" }) };
+    }
+    if (url.endsWith("/compositions") && options?.method === "POST") { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({ composition_id: 22 }) }; }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  for (const [group, text] of [["失败组", "坏消息"], ["正常组", "正常消息"]]) {
+    await makeGroup(user, group, text);
+  }
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByRole("link", { name: "组合 22" })).toBeTruthy();
+  expect(calls.filter(x => x.url.endsWith("/uploads")).map(x => uploadText(x.options.body))).toEqual(["坏消息", "正常消息"]);
+  expect(JSON.parse(calls.find(x => x.url.endsWith("/compositions") && x.options.method === "POST").options.body).name).toBe("正常组");
+  expect(screen.getByText(/坏消息.*失败/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "移除失败消息 1" }));
+  expect(screen.getByText(/可能已经归档/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "确认移除失败消息 1" }));
+  expect(screen.queryByText(/坏消息.*失败/)).toBeNull();
+});
+
+test("建组明确拒绝保留可重试组而非标为未知", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 7, content_ids: [9], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  let fails = true;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") {
+      calls.push({ url, options });
+      if (fails) return { ok: false, status: 400, json: async () => ({ detail: "组合已变化" }) };
+      return { ok: true, status: 200, json: async () => ({ composition_id: 23 }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  await makeGroup(user, "重试组合", "正文");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  expect(screen.queryByText(/创建结果不确定，请到组合目录核对/)).toBeNull();
+  fails = false;
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByRole("link", { name: "组合 23" })).toBeTruthy();
+  expect(calls.filter(x => x.url.endsWith("/uploads"))).toHaveLength(1);
+});
+
+test("建组明确拒绝后能修改说明再提交同一组", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 7, content_ids: [9], status: "succeeded" }) });
+  const original = globalThis.fetch;
+  let attempt = 0;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => {
+    if (url.endsWith("/compositions") && options?.method === "POST") {
+      calls.push({ url, options });
+      return ++attempt === 1 ? { ok: false, status: 400, json: async () => ({ detail: "说明过长" }) }
+        : { ok: true, status: 200, json: async () => ({ composition_id: 24 }) };
+    }
+    return original(url, options);
+  }));
+  const user = await open("/add");
+  await makeGroup(user, "待修正组", "正文");
+  await user.type(screen.getByLabelText("待修正组的说明"), "旧说明");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  await screen.findByRole("alert");
+  await user.clear(screen.getByLabelText("待修正组的说明"));
+  await user.type(screen.getByLabelText("待修正组的说明"), "修正后说明");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByRole("link", { name: "组合 24" })).toBeTruthy();
+  expect(calls.filter(x => x.url.endsWith("/compositions") && x.options.method === "POST").map(x => JSON.parse(x.options.body).description)).toEqual(["旧说明", "修正后说明"]);
+});
+
+test("隔离与死信等终态不会在再次提交时重复上传", async () => {
+  uploadHandler = async () => ({ ok: true, status: 200, json: async () => ({ message_id: 3, content_ids: [], status: "quarantined" }) });
+  const user = await open("/add");
+  await enterText(user, "隔离条目");
+  await user.click(screen.getByRole("button", { name: "暂存当前消息" }));
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(await screen.findByText(/隔离条目.*quarantined/)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect(calls.filter(x => x.url.endsWith("/uploads"))).toHaveLength(1);
+  expect(screen.getByRole("alert").textContent).toContain("无法自动完成");
+});
+
+test("单条组合使用普通上传，结果链接提供标签编辑入口", async () => {
+  const original = globalThis.fetch;
+  vi.stubGlobal("fetch", vi.fn(async (url, options) => url.endsWith("/compositions") && options?.method === "POST"
+    ? { ok: true, status: 200, json: async () => ({ composition_id: 30 }) } : original(url, options)));
+  const user = await open("/add");
+  await makeGroup(user, "单条组合", "单条正文");
+  await user.type(screen.getByLabelText("单条组合的说明"), "说明");
+  await user.click(screen.getByRole("button", { name: "全部入库" }));
+  expect((await screen.findByRole("link", { name: "组合 30" })).getAttribute("href")).toBe("/compositions/30");
+  const form = calls.find(x => x.url.endsWith("/uploads")).options.body;
+  expect(form.get("create_composition")).toBeNull();
+  expect(screen.getByText(/在详情页添加组合标签/)).toBeTruthy();
 });
 
 test("组合目录提供单组合入口", async () => {

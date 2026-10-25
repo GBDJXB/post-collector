@@ -4,6 +4,8 @@ import { ModelPage, proposalProofs } from "./model.jsx";
 import { CompositionsPage } from "./compositions.jsx";
 import { CompositionDetailPage } from "./composition_detail.jsx";
 import { LinkedText, safeWebUrl } from "./links.jsx";
+import { buildUploadForm, queueMessage } from "./import_queue.js";
+import { ImportQueue } from "./import_queue.jsx";
 
 const lines = value => value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
 const emptyDraft = { text: "", note: "", images: [], entries: [], orderTouched: false, createComposition: false, compositionName: "", compositionDescription: "", compositionTags: "" };
@@ -39,8 +41,10 @@ export function Shell() {
   const started = useRef(false);
   const csrfRef = useRef("");
   const [draft, setDraft] = useState(emptyDraft);
-  const [upload, setUpload] = useState(null);
+  const [importResults, setImportResults] = useState([]);
   const [fileKey, setFileKey] = useState(0);
+  const [importQueue, setImportQueue] = useState([]);
+  function resetDraft() { setDraft(emptyDraft); setFileKey(x => x + 1); }
   const api = useCallback(async (path, body) => {
     const form = body instanceof FormData;
     const response = await fetch(`/api/v1/${path}`, {
@@ -90,53 +94,31 @@ export function Shell() {
   function moveEntry(from, to) {
     setDraft(current => { const entries = [...current.entries]; const [entry] = entries.splice(from, 1); entries.splice(to, 0, entry); return { ...current, entries, orderTouched: true }; });
   }
-  async function submit() {
-    const orderMode = draft.orderTouched || draft.entries.some(entry => entry.kind !== "image");
-    const images = orderMode ? draft.entries.filter(entry => entry.kind === "image").map(entry => entry.file) : draft.images;
-    if (!draft.text.trim() && !images.length && !draft.entries.some(entry => entry.kind === "text" && entry.text.trim() || entry.kind === "link" && entry.url.trim())) throw new Error("请输入文本、链接或选择图片");
-    if (images.length > 19) throw new Error("一次最多上传 19 张图片");
-    const body = new FormData();
-    if (orderMode) {
-      const entries = draft.text.trim() ? [{ kind: "text", text: draft.text }, ...draft.entries] : draft.entries;
-      let imageIndex = 0;
-      body.append("parts", JSON.stringify(entries.map(entry => entry.kind === "image" ? { kind: "image", index: imageIndex++ } : entry)));
-    } else body.append("text", draft.text);
-    body.append("note", draft.note);
-    images.forEach(file => body.append("images", file));
-    if (draft.createComposition) {
-      body.append("create_composition", "true"); body.append("composition_name", draft.compositionName);
-      body.append("composition_description", draft.compositionDescription);
-      body.append("composition_tags", draft.compositionTags);
-    }
-    const result = await api("uploads", body);
-    setUpload(result);
-    setDraft(emptyDraft); setFileKey(x => x + 1);
-    await manage.find(false);
+  function submit() {
+    buildUploadForm(draft);
+    setImportQueue(current => queueMessage(current, draft));
+    resetDraft();
   }
   return <><h1>post-collector</h1><p id="session-status">{session}</p><p id="notice" role="status" aria-live="polite">{notice}</p>
     {csrf && <main id="workspace"><nav><Link to="/">入口</Link> | <Link to="/add">加入新内容</Link> | <Link to="/manage">检索 / 管理已有内容</Link> | <Link to="/compositions">整理组合</Link> | <Link to="/model">模型标签建议</Link></nav>
       <button disabled={busy} onClick={() => run(async () => { await api("logout", {}); setCsrf(""); csrfRef.current = ""; setSession("已退出，请重启服务获取新授权链接。"); })}>退出本机会话</button>
       <fieldset className="workspace" disabled={busy}><Routes>
         <Route path="/" element={<section><h2>内容归档</h2><p><Link to="/add">加入新内容</Link></p><p><Link to="/manage">检索 / 管理已有内容</Link></p></section>} />
-        <Route path="/add" element={<section><h2>加入新内容</h2><form onSubmit={e => { e.preventDefault(); run(submit); }}>
-          <label>文本 <textarea name="text" rows="8" value={draft.text} onChange={e => setDraft({ ...draft, text: e.target.value })} /></label>
+        <Route path="/add" element={<section><h2>加入新内容</h2><h3>1. 暂存</h3><form onSubmit={e => { e.preventDefault(); run(submit); }}>
           <label>图片 <input key={fileKey} name="images" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.avif,.heic,.heif" onChange={e => { const files = Array.from(e.target.files); setDraft(current => ({ ...current, images: [...current.images, ...files], entries: [...current.entries, ...files.map(file => ({ kind: "image", file }))] })); }} /></label>
-          <ul>{(draft.orderTouched ? draft.entries.filter(entry => entry.kind === "image").map(entry => entry.file) : draft.images).map((file, i) => <li key={i}>{file.name} ({file.size} 字节)</li>)}</ul>
           <button type="button" onClick={() => addEntry({ kind: "text", text: "" })}>添加文本条目</button>
           <button type="button" onClick={() => addEntry({ kind: "link", url: "", description: "" })}>添加链接条目</button>
           <ol>{draft.entries.map((entry, index) => <li key={index}>
             {entry.kind === "text" && <label>条目 {index + 1} 文本 <textarea value={entry.text} onChange={e => updateEntry(index, { text: e.target.value })} /></label>}
             {entry.kind === "link" && <><label>条目 {index + 1} URL <input value={entry.url} onChange={e => updateEntry(index, { url: e.target.value })} /></label><label>条目 {index + 1} 说明 <textarea value={entry.description} onChange={e => updateEntry(index, { description: e.target.value })} /></label></>}
-            {entry.kind === "image" && <span>图片 {entry.file.name}</span>}
+            {entry.kind === "image" && <span>图片 {entry.file.name}（{entry.file.size} 字节）</span>}
             <button type="button" aria-label={`上移条目 ${index + 1}`} disabled={index === 0} onClick={() => moveEntry(index, index - 1)}>上移</button>
             <button type="button" aria-label={`下移条目 ${index + 1}`} disabled={index === draft.entries.length - 1} onClick={() => moveEntry(index, index + 1)}>下移</button>
             <button type="button" aria-label={`移除条目 ${index + 1}`} onClick={() => setDraft(current => ({ ...current, entries: current.entries.filter((_, position) => position !== index), orderTouched: true }))}>移除</button>
           </li>)}</ol>
-          <label><input type="checkbox" checked={draft.createComposition} onChange={e => setDraft({ ...draft, createComposition: e.target.checked })} />同时创建组合</label>
-          {draft.createComposition && <><label>上传组合名称 <input value={draft.compositionName} maxLength="255" onChange={e => setDraft({ ...draft, compositionName: e.target.value })} /></label><label>上传组合说明 <textarea value={draft.compositionDescription} onChange={e => setDraft({ ...draft, compositionDescription: e.target.value })} /></label><label>上传组合标签（每行一个） <textarea value={draft.compositionTags} onChange={e => setDraft({ ...draft, compositionTags: e.target.value })} /></label></>}
           <label>备注 <textarea name="note" rows="2" maxLength="4096" value={draft.note} onChange={e => setDraft({ ...draft, note: e.target.value })} /></label>
-          <p>一次提交组成一条消息，最多 19 张图片。提交后自动扫描、去重并入库。</p><button type="submit">加入内容</button></form>
-          {upload && <p role="status">消息 {upload.message_id}：{upload.duplicate ? "已存在；" : ""}{upload.detail} ({upload.status}) {upload.content_ids.length > 0 && <Link to={`/manage?message_id=${upload.message_id}`}>查看本次消息</Link>}</p>}
+          <p>每条消息最多 19 张图片。暂存不写入数据库；刷新或关闭页面会丢失。</p><button type="submit">暂存当前消息</button></form>
+          <ImportQueue api={api} run={run} busy={busy} queue={importQueue} setQueue={setImportQueue} results={importResults} setResults={setImportResults} refresh={() => manage.find(false)} />
         </section>} />
         <Route path="/manage" element={<Manage state={manage} run={run} api={api} />} />
         <Route path="/compositions" element={<CompositionsPage api={api} run={run} parseId={safeId} />} />
